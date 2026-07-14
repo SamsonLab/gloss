@@ -139,6 +139,148 @@ public actor TranslationBroker {
         }
     }
 
+    public nonisolated func translationStream(
+        _ request: TranslationBatchRequest
+    ) -> AsyncThrowingStream<TranslationOutput, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    _ = try await self.translateStreaming(request) { output in
+                        continuation.yield(output)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func translateStreaming(
+        _ request: TranslationBatchRequest,
+        onOutput: @escaping @Sendable (TranslationOutput) -> Void
+    ) async throws -> [TranslationOutput] {
+        try validate(request)
+
+        let cacheContext = request.contentKind == .webpage ? nil : request.context
+        var keyByID: [String: CacheKey] = [:]
+        var translatedByID: [String: String] = [:]
+        var representativeByKey: [CacheKey: TranslationItem] = [:]
+        var originalsByRepresentativeID: [String: [TranslationItem]] = [:]
+        var entries: [TranslationItem] = []
+        var waiting: [(item: TranslationItem, key: CacheKey, task: Task<String, Error>)] = []
+
+        for item in request.items {
+            let key = CacheKey(
+                text: item.text,
+                targetLanguage: request.targetLanguage,
+                profile: request.profile,
+                contentKind: request.contentKind,
+                context: cacheContext
+            )
+            keyByID[item.id] = key
+            if let value = cachedValue(for: key) {
+                translatedByID[item.id] = value
+                onOutput(TranslationOutput(id: item.id, text: value))
+            } else if let task = inFlight[key] {
+                waiting.append((item: item, key: key, task: task))
+            } else if let representative = representativeByKey[key] {
+                originalsByRepresentativeID[representative.id, default: []].append(item)
+            } else {
+                representativeByKey[key] = item
+                originalsByRepresentativeID[item.id] = [item]
+                entries.append(item)
+            }
+        }
+
+        let newKeys = Set(representativeByKey.keys)
+        var batchTask: Task<[String: String], Error>?
+        if !entries.isEmpty {
+            let backendRequest = TranslationBatchRequest(
+                items: entries,
+                targetLanguage: request.targetLanguage,
+                profile: request.profile,
+                contentKind: request.contentKind,
+                context: request.context,
+                priority: request.priority
+            )
+            let originals = originalsByRepresentativeID
+            let backend = self.backend
+            let task = Task<[String: String], Error> {
+                let outputs = try await backend.translate(backendRequest) { output in
+                    for item in originals[output.id] ?? [] {
+                        onOutput(TranslationOutput(id: item.id, text: output.text))
+                    }
+                }
+                var outputMap: [String: String] = [:]
+                for output in outputs {
+                    guard !output.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw TranslationError.invalidResponse("后端返回了空译文：\(output.id)")
+                    }
+                    guard outputMap.updateValue(output.text, forKey: output.id) == nil else {
+                        throw TranslationError.invalidResponse("后端返回了重复 id：\(output.id)")
+                    }
+                }
+                guard outputMap.count == entries.count else {
+                    throw TranslationError.invalidResponse("返回数量与请求数量不一致。")
+                }
+                return outputMap
+            }
+            batchTask = task
+            for entry in entries {
+                guard let key = keyByID[entry.id] else { continue }
+                inFlight[key] = Task<String, Error> {
+                    let outputMap = try await task.value
+                    guard let value = outputMap[entry.id] else {
+                        throw TranslationError.invalidResponse("缺少项目 \(entry.id)。")
+                    }
+                    return value
+                }
+            }
+        }
+
+        do {
+            for (item, key, task) in waiting {
+                let value = try await task.value
+                translatedByID[item.id] = value
+                remember(value, for: key)
+                onOutput(TranslationOutput(id: item.id, text: value))
+            }
+
+            if let batchTask {
+                let outputMap = try await batchTask.value
+                for representative in entries {
+                    guard let value = outputMap[representative.id],
+                        let originals = originalsByRepresentativeID[representative.id]
+                    else {
+                        throw TranslationError.invalidResponse("缺少项目 \(representative.id)。")
+                    }
+                    for item in originals {
+                        translatedByID[item.id] = value
+                        if let key = keyByID[item.id] {
+                            remember(value, for: key)
+                        }
+                    }
+                }
+            }
+            for key in newKeys {
+                inFlight.removeValue(forKey: key)
+            }
+        } catch {
+            for key in newKeys {
+                inFlight.removeValue(forKey: key)
+            }
+            throw error
+        }
+
+        return try request.items.map { item in
+            guard let value = translatedByID[item.id] else {
+                throw TranslationError.invalidResponse("缺少项目 \(item.id)。")
+            }
+            return TranslationOutput(id: item.id, text: value)
+        }
+    }
+
     public func clearCache() {
         cache.removeAll(keepingCapacity: true)
         cacheOrder.removeAll(keepingCapacity: true)

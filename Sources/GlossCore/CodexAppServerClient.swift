@@ -94,6 +94,16 @@ public actor CodexAppServerClient: TranslationBackend {
         let continuation: CheckedContinuation<Int, Error>
     }
 
+    private struct TurnStreamState {
+        var parser = TranslationDeltaParser()
+        let request: TranslationBatchRequest
+        let onOutput: (@Sendable (TranslationOutput) -> Void)?
+        let acceptedAt: UInt64
+        var emittedIDs: Set<String> = []
+        var loggedFirstDelta = false
+        var loggedFirstItem = false
+    }
+
     private let logger = Logger(subsystem: "com.samsoncj.gloss", category: "Codex")
     private let runtimeLog = GlossRuntimeLog.shared
     private let environment: [String: String]
@@ -108,6 +118,7 @@ public actor CodexAppServerClient: TranslationBackend {
     private var pendingRequests: [Int: PendingRequest] = [:]
     private var turnContinuations: [String: CheckedContinuation<String, Error>] = [:]
     private var turnBuffers: [String: String] = [:]
+    private var turnStreams: [String: TurnStreamState] = [:]
     private var earlyTurnResults: [String: Result<String, Error>] = [:]
     private var threadIDs: [String] = []
     private var availableThreadIndices: [Int] = []
@@ -134,6 +145,20 @@ public actor CodexAppServerClient: TranslationBackend {
     }
 
     public func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput] {
+        try await translate(request, onOutput: nil)
+    }
+
+    public func translate(
+        _ request: TranslationBatchRequest,
+        onOutput: @escaping @Sendable (TranslationOutput) -> Void
+    ) async throws -> [TranslationOutput] {
+        try await translate(request, onOutput: Optional(onOutput))
+    }
+
+    private func translate(
+        _ request: TranslationBatchRequest,
+        onOutput: (@Sendable (TranslationOutput) -> Void)?
+    ) async throws -> [TranslationOutput] {
         let startedAt = DispatchTime.now().uptimeNanoseconds
         let characterCount = request.items.reduce(0) { $0 + $1.text.count }
         runtimeLog.write(
@@ -192,19 +217,29 @@ public actor CodexAppServerClient: TranslationBackend {
                 throw TranslationError.invalidResponse("Codex 没有返回 turn id。")
             }
             turnID = startedTurnID
+            beginTurnStream(
+                turnID: startedTurnID,
+                request: request,
+                acceptedAt: turnAcceptedAt,
+                onOutput: onOutput
+            )
 
             let output = try await waitForTurn(startedTurnID)
             let turnCompletedAt = DispatchTime.now().uptimeNanoseconds
             let translations = try validateModelOutput(output, request: request)
+            finishTurnStream(turnID: startedTurnID, outputs: translations)
             let parsedAt = DispatchTime.now().uptimeNanoseconds
             await rollbackThread(thread.id)
             let rolledBackAt = DispatchTime.now().uptimeNanoseconds
             runtimeLog.write(
                 "codex",
-                "translation_complete items=\(translations.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) priority=\(request.priority.rawValue) prepare_ms=\(Self.elapsedMilliseconds(from: startedAt, to: preparedAt)) queue_wait_ms=\(queueWaitMilliseconds) turn_start_ms=\(Self.elapsedMilliseconds(from: turnStartedAt, to: turnAcceptedAt)) turn_wait_ms=\(Self.elapsedMilliseconds(from: turnAcceptedAt, to: turnCompletedAt)) parse_ms=\(Self.elapsedMilliseconds(from: turnCompletedAt, to: parsedAt)) rollback_ms=\(Self.elapsedMilliseconds(from: parsedAt, to: rolledBackAt))"
+                "translation_complete items=\(translations.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) priority=\(request.priority.rawValue) turn_id=\(startedTurnID) prepare_ms=\(Self.elapsedMilliseconds(from: startedAt, to: preparedAt)) queue_wait_ms=\(queueWaitMilliseconds) turn_start_ms=\(Self.elapsedMilliseconds(from: turnStartedAt, to: turnAcceptedAt)) turn_wait_ms=\(Self.elapsedMilliseconds(from: turnAcceptedAt, to: turnCompletedAt)) turn_complete_ms=\(Self.elapsedMilliseconds(from: turnAcceptedAt, to: turnCompletedAt)) parse_ms=\(Self.elapsedMilliseconds(from: turnCompletedAt, to: parsedAt)) rollback_ms=\(Self.elapsedMilliseconds(from: parsedAt, to: rolledBackAt))"
             )
             return translations
         } catch {
+            if let turnID {
+                turnStreams.removeValue(forKey: turnID)
+            }
             await resetFailedTurn(threadID: thread.id, turnID: turnID)
             runtimeLog.write(
                 "codex",
@@ -701,7 +736,67 @@ public actor CodexAppServerClient: TranslationBackend {
     private func expireTurn(_ turnID: String) {
         guard let continuation = turnContinuations.removeValue(forKey: turnID) else { return }
         turnBuffers.removeValue(forKey: turnID)
+        turnStreams.removeValue(forKey: turnID)
         continuation.resume(throwing: TranslationError.timedOut("turn/start"))
+    }
+
+    private func beginTurnStream(
+        turnID: String,
+        request: TranslationBatchRequest,
+        acceptedAt: UInt64,
+        onOutput: (@Sendable (TranslationOutput) -> Void)?
+    ) {
+        turnStreams[turnID] = TurnStreamState(
+            request: request,
+            onOutput: onOutput,
+            acceptedAt: acceptedAt
+        )
+        if let buffered = turnBuffers[turnID], !buffered.isEmpty {
+            consumeTurnDelta(buffered, turnID: turnID)
+        }
+    }
+
+    private func consumeTurnDelta(_ delta: String, turnID: String) {
+        guard !delta.isEmpty, var state = turnStreams[turnID] else { return }
+        if !state.loggedFirstDelta {
+            state.loggedFirstDelta = true
+            runtimeLog.write(
+                "codex",
+                "translation_first_delta turn_id=\(turnID) first_delta_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: DispatchTime.now().uptimeNanoseconds))"
+            )
+        }
+
+        let items = state.parser.append(delta)
+        for item in items {
+            guard state.request.items.indices.contains(item.index),
+                state.request.items[item.index].id == item.id,
+                !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                state.emittedIDs.insert(item.id).inserted
+            else { continue }
+
+            if !state.loggedFirstItem {
+                state.loggedFirstItem = true
+                runtimeLog.write(
+                    "codex",
+                    "translation_first_item turn_id=\(turnID) first_item_complete_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: DispatchTime.now().uptimeNanoseconds))"
+                )
+            }
+            state.onOutput?(TranslationOutput(id: item.id, text: item.text))
+        }
+        turnStreams[turnID] = state
+    }
+
+    private func finishTurnStream(turnID: String, outputs: [TranslationOutput]) {
+        guard let state = turnStreams.removeValue(forKey: turnID) else { return }
+        if !state.loggedFirstItem, !outputs.isEmpty {
+            runtimeLog.write(
+                "codex",
+                "translation_first_item turn_id=\(turnID) first_item_complete_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: DispatchTime.now().uptimeNanoseconds))"
+            )
+        }
+        for output in outputs where !state.emittedIDs.contains(output.id) {
+            state.onOutput?(output)
+        }
     }
 
     private func receiveStdout(_ data: Data, generation: UUID) {
@@ -751,7 +846,9 @@ public actor CodexAppServerClient: TranslationBackend {
         switch method {
         case "item/agentMessage/delta":
             guard let turnID = message["params"]?["turnId"]?.stringValue else { return }
-            turnBuffers[turnID, default: ""] += message["params"]?["delta"]?.stringValue ?? ""
+            let delta = message["params"]?["delta"]?.stringValue ?? ""
+            turnBuffers[turnID, default: ""] += delta
+            consumeTurnDelta(delta, turnID: turnID)
 
         case "item/completed":
             guard let turnID = message["params"]?["turnId"]?.stringValue,
@@ -759,6 +856,7 @@ public actor CodexAppServerClient: TranslationBackend {
                 turnBuffers[turnID, default: ""].isEmpty
             else { return }
             turnBuffers[turnID] = message["params"]?["item"]?["text"]?.stringValue ?? ""
+            consumeTurnDelta(turnBuffers[turnID] ?? "", turnID: turnID)
 
         case "turn/completed":
             guard let turnID = message["params"]?["turn"]?["id"]?.stringValue else { return }
@@ -819,6 +917,7 @@ public actor CodexAppServerClient: TranslationBackend {
         }
         turnContinuations.removeAll()
         turnBuffers.removeAll()
+        turnStreams.removeAll()
         earlyTurnResults.removeAll()
 
         for waiter in threadWaiters {

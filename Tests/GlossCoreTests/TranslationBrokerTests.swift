@@ -146,6 +146,67 @@ final class TranslationBrokerTests: XCTestCase {
         let priorities = await backend.receivedPriorities()
         XCTAssertEqual(priorities, [.background])
     }
+
+    func testStreamFansOutDeduplicatedItemsAndCachesThem() async throws {
+        let backend = FakeBackend()
+        let broker = TranslationBroker(backend: backend)
+        let request = TranslationBatchRequest(
+            items: [
+                TranslationItem(id: "first", text: "same"),
+                TranslationItem(id: "second", text: "same"),
+            ],
+            targetLanguage: "Chinese (Simplified)",
+            contentKind: .webpage
+        )
+
+        var streamed: [TranslationOutput] = []
+        for try await output in broker.translationStream(request) {
+            streamed.append(output)
+        }
+
+        XCTAssertEqual(
+            Set(streamed.map(\.id)),
+            Set(["first", "second"])
+        )
+        let receivedItemCount = await backend.receivedItemCount()
+        let cacheCount = await broker.cacheCount()
+        XCTAssertEqual(receivedItemCount, 1)
+        XCTAssertEqual(cacheCount, 1)
+    }
+
+    func testConcurrentStreamsCoalesceEqualText() async throws {
+        let backend = FakeBackend(delayNanoseconds: 100_000_000)
+        let broker = TranslationBroker(backend: backend)
+        let first = TranslationBatchRequest(
+            items: [TranslationItem(id: "first", text: "shared stream")],
+            targetLanguage: "English"
+        )
+        let second = TranslationBatchRequest(
+            items: [TranslationItem(id: "second", text: "shared stream")],
+            targetLanguage: "English"
+        )
+
+        async let firstOutputs = collectOutputs(broker.translationStream(first))
+        try await Task.sleep(for: .milliseconds(10))
+        async let secondOutputs = collectOutputs(broker.translationStream(second))
+        let outputs = try await (firstOutputs, secondOutputs)
+
+        XCTAssertEqual(outputs.0, [TranslationOutput(id: "first", text: "translated:shared stream")])
+        XCTAssertEqual(outputs.1, [TranslationOutput(id: "second", text: "translated:shared stream")])
+        let callCount = await backend.callCount()
+        XCTAssertEqual(callCount, 1)
+    }
+
+}
+
+private func collectOutputs(
+    _ stream: AsyncThrowingStream<TranslationOutput, Error>
+) async throws -> [TranslationOutput] {
+    var outputs: [TranslationOutput] = []
+    for try await output in stream {
+        outputs.append(output)
+    }
+    return outputs
 }
 
 private actor FakeBackend: TranslationBackend {

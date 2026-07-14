@@ -85,6 +85,50 @@ final class LoopbackServerTests: XCTestCase {
         let translations = try XCTUnwrap(translationJSON["translations"] as? [[String: String]])
         XCTAssertEqual(translations, [["id": "first", "text": "translated:Hello"]])
 
+        let stream = try await send(
+            request(
+                path: "/translate/stream",
+                method: "POST",
+                headers: [
+                    "Content-Type": "application/json",
+                    "X-Gloss-Token": token,
+                    "Origin": origin,
+                ],
+                body: body
+            )
+        )
+        XCTAssertEqual(stream.response.statusCode, 200)
+        XCTAssertEqual(
+            stream.response.value(forHTTPHeaderField: "Content-Type"),
+            "application/x-ndjson; charset=utf-8"
+        )
+        let events = try XCTUnwrap(String(data: stream.data, encoding: .utf8))
+            .split(separator: "\n")
+            .map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]) }
+        XCTAssertEqual(events.first?["type"] as? String, "translation")
+        XCTAssertEqual(events.first?["id"] as? String, "first")
+        XCTAssertEqual(events.last?["type"] as? String, "done")
+
+        let metricBody = try JSONSerialization.data(withJSONObject: [
+            "event": "item_rendered",
+            "requestId": "browser-request-1",
+            "durationMs": 321,
+        ])
+        let metric = try await send(
+            request(
+                path: "/metrics",
+                method: "POST",
+                headers: ["X-Gloss-Token": token, "Origin": origin],
+                body: metricBody
+            )
+        )
+        XCTAssertEqual(metric.response.statusCode, 204)
+        let log = try String(
+            contentsOf: logDirectory.appendingPathComponent("gloss.log"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(log.contains("request_id=browser-request-1 item_rendered_ms=321"))
+
         let invalidPriorityBody = try JSONSerialization.data(withJSONObject: [
             "items": [["id": "invalid-priority", "text": "Hello"]],
             "priority": "urgent",

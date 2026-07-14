@@ -102,6 +102,21 @@ public struct TranslationOutput: Codable, Equatable, Sendable {
 
 public protocol TranslationBackend: Sendable {
     func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput]
+    func translate(
+        _ request: TranslationBatchRequest,
+        onOutput: @escaping @Sendable (TranslationOutput) -> Void
+    ) async throws -> [TranslationOutput]
+}
+
+extension TranslationBackend {
+    public func translate(
+        _ request: TranslationBatchRequest,
+        onOutput: @escaping @Sendable (TranslationOutput) -> Void
+    ) async throws -> [TranslationOutput] {
+        let outputs = try await translate(request)
+        outputs.forEach(onOutput)
+        return outputs
+    }
 }
 
 public enum TranslationError: LocalizedError, Equatable, Sendable {

@@ -34,6 +34,13 @@ package final class LoopbackServer: @unchecked Sendable {
         let profile: String?
         let sourceUrl: String?
         let priority: String?
+        let requestId: String?
+    }
+
+    private struct BrowserMetricBody: Decodable {
+        let event: String
+        let requestId: String?
+        let durationMs: Int
     }
 
     private struct TranslationResponse: Encodable {
@@ -55,6 +62,28 @@ package final class LoopbackServer: @unchecked Sendable {
 
     private struct ErrorResponse: Encodable {
         let error: String
+    }
+
+    private struct StreamEvent: Encodable {
+        let type: String
+        let id: String?
+        let text: String?
+        let count: Int?
+        let error: String?
+
+        init(
+            type: String,
+            id: String? = nil,
+            text: String? = nil,
+            count: Int? = nil,
+            error: String? = nil
+        ) {
+            self.type = type
+            self.id = id
+            self.text = text
+            self.count = count
+            self.error = error
+        }
     }
 
     private static let maximumRequestSize = 1_100_000
@@ -253,7 +282,14 @@ package final class LoopbackServer: @unchecked Sendable {
             return
         }
 
-        guard request.method == "POST", request.path == "/translate" else {
+        if request.method == "POST", request.path == "/metrics" {
+            recordBrowserMetric(request, origin: origin, connection: connection)
+            return
+        }
+
+        guard request.method == "POST",
+            request.path == "/translate" || request.path == "/translate/stream"
+        else {
             sendJSON(ErrorResponse(error: "Not found."), status: 404, origin: origin, to: connection)
             return
         }
@@ -330,10 +366,22 @@ package final class LoopbackServer: @unchecked Sendable {
             context: sourceContext(from: body.sourceUrl),
             priority: priority
         )
+        let requestID = safeRequestID(body.requestId)
         runtimeLog.write(
             "bridge",
-            "translation_start items=\(items.count) chars=\(totalCharacters) profile=\(profile.rawValue) priority=\(priority.rawValue)"
+            "translation_start items=\(items.count) chars=\(totalCharacters) profile=\(profile.rawValue) priority=\(priority.rawValue) request_id=\(requestID)"
         )
+
+        if request.path == "/translate/stream" {
+            streamTranslation(
+                translationRequest,
+                requestID: requestID,
+                startedAt: startedAt,
+                origin: origin,
+                connection: connection
+            )
+            return
+        }
 
         Task {
             do {
@@ -363,6 +411,89 @@ package final class LoopbackServer: @unchecked Sendable {
                 )
             }
         }
+    }
+
+    private func streamTranslation(
+        _ request: TranslationBatchRequest,
+        requestID: String,
+        startedAt: UInt64,
+        origin: String?,
+        connection: NWConnection
+    ) {
+        Task {
+            var headersSent = false
+            var count = 0
+            var firstItemMilliseconds: Int?
+            do {
+                try await sendStreamHeaders(origin: origin, to: connection)
+                headersSent = true
+                for try await output in broker.translationStream(request) {
+                    let elapsed = Self.elapsedMilliseconds(since: startedAt)
+                    if firstItemMilliseconds == nil {
+                        firstItemMilliseconds = elapsed
+                        runtimeLog.write(
+                            "bridge",
+                            "translation_first_item request_id=\(requestID) first_item_complete_ms=\(elapsed)"
+                        )
+                    }
+                    try await sendStreamEvent(
+                        StreamEvent(type: "translation", id: output.id, text: output.text),
+                        to: connection
+                    )
+                    count += 1
+                }
+                try await sendStreamEvent(StreamEvent(type: "done", count: count), to: connection)
+                try await finishStream(connection)
+                runtimeLog.write(
+                    "bridge",
+                    "translation_complete items=\(count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) first_item_complete_ms=\(firstItemMilliseconds ?? -1) request_id=\(requestID)"
+                )
+            } catch {
+                runtimeLog.write(
+                    "bridge",
+                    "translation_failed duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error))) request_id=\(requestID)"
+                )
+                if headersSent {
+                    try? await sendStreamEvent(
+                        StreamEvent(type: "error", error: error.localizedDescription),
+                        to: connection
+                    )
+                    try? await finishStream(connection)
+                } else {
+                    sendJSON(
+                        ErrorResponse(error: error.localizedDescription),
+                        status: 500,
+                        origin: origin,
+                        to: connection
+                    )
+                }
+            }
+        }
+    }
+
+    private func recordBrowserMetric(
+        _ request: HTTPRequest,
+        origin: String?,
+        connection: NWConnection
+    ) {
+        guard let metric = try? JSONDecoder().decode(BrowserMetricBody.self, from: request.body),
+            metric.event == "item_rendered",
+            (0...300_000).contains(metric.durationMs)
+        else {
+            sendJSON(ErrorResponse(error: "Invalid metric."), status: 422, origin: origin, to: connection)
+            return
+        }
+        runtimeLog.write(
+            "bridge",
+            "item_rendered request_id=\(safeRequestID(metric.requestId)) item_rendered_ms=\(metric.durationMs)"
+        )
+        send(data: Data(), status: 204, origin: origin, to: connection)
+    }
+
+    private func safeRequestID(_ value: String?) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let filtered = String((value ?? "none").unicodeScalars.filter(allowed.contains).prefix(100))
+        return filtered.isEmpty ? "none" : filtered
     }
 
     private func sourceContext(from sourceURL: String?) -> String? {
@@ -398,6 +529,61 @@ package final class LoopbackServer: @unchecked Sendable {
             send(data: try encoder.encode(value), status: status, origin: origin, to: connection)
         } catch {
             send(data: Data("{\"error\":\"Encoding failed.\"}".utf8), status: 500, origin: origin, to: connection)
+        }
+    }
+
+    private func sendStreamHeaders(origin: String?, to connection: NWConnection) async throws {
+        var headers = [
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/x-ndjson; charset=utf-8",
+            "Transfer-Encoding: chunked",
+            "Cache-Control: no-store",
+            "X-Content-Type-Options: nosniff",
+            "Connection: close",
+        ]
+        if let origin {
+            headers.append("Access-Control-Allow-Origin: \(origin)")
+            headers.append("Vary: Origin")
+        }
+        headers.append("Access-Control-Allow-Methods: GET,POST,OPTIONS")
+        headers.append("Access-Control-Allow-Headers: Content-Type,X-Gloss-Token,X-PIT-Token")
+        headers.append("Access-Control-Allow-Private-Network: true")
+        try await sendContent(
+            Data((headers.joined(separator: "\r\n") + "\r\n\r\n").utf8),
+            to: connection
+        )
+    }
+
+    private func sendStreamEvent(_ event: StreamEvent, to connection: NWConnection) async throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        var line = try encoder.encode(event)
+        line.append(0x0A)
+        var chunk = Data(String(line.count, radix: 16).utf8)
+        chunk.append(Data("\r\n".utf8))
+        chunk.append(line)
+        chunk.append(Data("\r\n".utf8))
+        try await sendContent(chunk, to: connection)
+    }
+
+    private func finishStream(_ connection: NWConnection) async throws {
+        try await sendContent(Data("0\r\n\r\n".utf8), to: connection)
+        connection.cancel()
+    }
+
+    private func sendContent(_ data: Data, to connection: NWConnection) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(
+                content: data,
+                completion: .contentProcessed { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            )
         }
     }
 
