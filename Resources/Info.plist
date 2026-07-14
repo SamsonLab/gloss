@@ -10,9 +10,11 @@
     <string>Gloss</string>
     <key>CFBundleIdentifier</key>
     <string>com.samsoncj.gloss</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>Gloss.icns</string>
+	<key>CFBundleName</key>
     <string>Gloss</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>

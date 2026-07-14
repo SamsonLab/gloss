@@ -5,6 +5,7 @@ import GlossCore
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     var onRequestAccessibility: (() -> Void)?
     var onVerifyCodex: (() -> Void)?
+    var onLoginChatGPT: (() -> Void)?
     var onTranslateClipboard: (() -> Void)?
     var onTranslateClipboardImage: (() -> Void)?
     var onTranslateScreenshot: (() -> Void)?
@@ -18,11 +19,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private let window: NSWindow
     private let accessibilityStatus = NSTextField(labelWithString: "")
-    private let codexStatus = NSTextField(labelWithString: "按需启动，复用当前 Codex 登录")
+    private let codexStatus = NSTextField(labelWithString: "Gloss 使用独立的 ChatGPT 登录")
     private let browserStatus = NSTextField(labelWithString: "正在启动本地浏览器桥接")
     private let shortcutStatus = NSTextField(labelWithString: "手动翻译当前选区")
     private let launchAtLoginStatus = NSTextField(labelWithString: "关闭")
     private let verifyButton = NSButton(title: "验证 Codex", target: nil, action: nil)
+    private let loginButton = NSButton(title: "登录 ChatGPT", target: nil, action: nil)
     private let accessibilityButton = NSButton(title: "启用辅助功能", target: nil, action: nil)
     private let servicesButton = NSButton(title: "打开设置", target: nil, action: nil)
     private let shortcutButton = ShortcutRecorderButton(shortcut: .defaultValue)
@@ -59,14 +61,25 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     func setCodexVerifying() {
         verifyButton.isEnabled = false
+        loginButton.isEnabled = false
         verifyButton.title = "正在验证…"
         codexStatus.stringValue = "正在启动 Codex app-server"
         codexStatus.textColor = .secondaryLabelColor
     }
 
+    func setCodexLoginInProgress() {
+        verifyButton.isEnabled = false
+        loginButton.isEnabled = false
+        loginButton.title = "等待登录…"
+        codexStatus.stringValue = "请在浏览器中完成 ChatGPT 登录"
+        codexStatus.textColor = .secondaryLabelColor
+    }
+
     func showCodexResult(_ message: String, succeeded: Bool) {
         verifyButton.isEnabled = true
+        loginButton.isEnabled = true
         verifyButton.title = "重新验证"
+        loginButton.title = succeeded ? "切换账号" : "登录 ChatGPT"
         codexStatus.stringValue = message
         codexStatus.textColor = succeeded ? .systemGreen : .systemRed
     }
@@ -99,12 +112,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         window.contentView = content
 
         let icon = NSImageView()
-        icon.image = NSImage(
-            systemSymbolName: "character.book.closed.fill",
-            accessibilityDescription: "Gloss"
-        )
+        icon.image = GlossBrand.markImage(pointSize: 36)
         icon.contentTintColor = .controlAccentColor
-        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 36, weight: .semibold)
         icon.translatesAutoresizingMaskIntoConstraints = false
 
         let title = NSTextField(labelWithString: "Gloss")
@@ -156,7 +165,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         servicesButton.action = #selector(openServicesSettings)
 
         let logsButton = NSButton(title: "查看日志", target: self, action: #selector(revealLogs))
-        let codexButtons = NSStackView(views: [verifyButton, logsButton])
+        let codexButtons = NSStackView(views: [loginButton, verifyButton, logsButton])
         codexButtons.orientation = .horizontal
         codexButtons.alignment = .centerY
         codexButtons.spacing = 6
@@ -168,6 +177,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         )
         verifyButton.target = self
         verifyButton.action = #selector(verifyCodex)
+        loginButton.target = self
+        loginButton.action = #selector(loginChatGPT)
 
         let revealExtensionButton = NSButton(
             title: "显示扩展",
@@ -348,6 +359,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     @objc private func verifyCodex() {
         onVerifyCodex?()
+    }
+
+    @objc private func loginChatGPT() {
+        onLoginChatGPT?()
     }
 
     @objc private func revealLogs() {

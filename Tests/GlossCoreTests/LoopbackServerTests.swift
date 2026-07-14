@@ -85,6 +85,21 @@ final class LoopbackServerTests: XCTestCase {
         let translations = try XCTUnwrap(translationJSON["translations"] as? [[String: String]])
         XCTAssertEqual(translations, [["id": "first", "text": "translated:Hello"]])
 
+        let invalidPriorityBody = try JSONSerialization.data(withJSONObject: [
+            "items": [["id": "invalid-priority", "text": "Hello"]],
+            "priority": "urgent",
+            "targetLanguage": "Chinese (Simplified)",
+        ])
+        let invalidPriority = try await send(
+            request(
+                path: "/translate",
+                method: "POST",
+                headers: ["Content-Type": "application/json", "X-Gloss-Token": token, "Origin": origin],
+                body: invalidPriorityBody
+            )
+        )
+        XCTAssertEqual(invalidPriority.response.statusCode, 422)
+
         let invalidBody = try JSONSerialization.data(withJSONObject: [
             "items": [
                 ["id": "duplicate", "text": "one"],

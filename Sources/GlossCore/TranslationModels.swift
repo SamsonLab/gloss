@@ -41,6 +41,20 @@ public enum TranslationContentKind: String, Codable, Sendable {
     case ocr
 }
 
+public enum TranslationPriority: String, Codable, CaseIterable, Sendable {
+    case interactive
+    case visible
+    case background
+
+    var rank: Int {
+        switch self {
+        case .interactive: 2
+        case .visible: 1
+        case .background: 0
+        }
+    }
+}
+
 public struct TranslationItem: Codable, Hashable, Sendable {
     public let id: String
     public let text: String
@@ -57,19 +71,22 @@ public struct TranslationBatchRequest: Codable, Sendable {
     public let profile: TranslationProfile
     public let contentKind: TranslationContentKind
     public let context: String?
+    public let priority: TranslationPriority
 
     public init(
         items: [TranslationItem],
         targetLanguage: String,
         profile: TranslationProfile = .natural,
         contentKind: TranslationContentKind = .selection,
-        context: String? = nil
+        context: String? = nil,
+        priority: TranslationPriority = .interactive
     ) {
         self.items = items
         self.targetLanguage = targetLanguage
         self.profile = profile
         self.contentKind = contentKind
         self.context = context
+        self.priority = priority
     }
 }
 

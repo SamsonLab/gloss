@@ -81,10 +81,7 @@ final class GlossBarController: NSObject {
         panel.contentView = effect
 
         let icon = NSImageView()
-        icon.image = NSImage(
-            systemSymbolName: "character.book.closed.fill",
-            accessibilityDescription: "Gloss"
-        )
+        icon.image = GlossBrand.markImage(pointSize: 18)
         icon.contentTintColor = .controlAccentColor
         icon.translatesAutoresizingMaskIntoConstraints = false
 

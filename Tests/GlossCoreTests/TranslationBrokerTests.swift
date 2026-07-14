@@ -129,6 +129,23 @@ final class TranslationBrokerTests: XCTestCase {
         let batches = await backend.receivedBatches()
         XCTAssertEqual(batches, [["two", "one"]])
     }
+
+    func testPreservesRequestPriorityForBackendWork() async throws {
+        let backend = FakeBackend()
+        let broker = TranslationBroker(backend: backend)
+
+        _ = try await broker.translate(
+            TranslationBatchRequest(
+                items: [TranslationItem(id: "background", text: "prefetch")],
+                targetLanguage: "Chinese (Simplified)",
+                contentKind: .webpage,
+                priority: .background
+            )
+        )
+
+        let priorities = await backend.receivedPriorities()
+        XCTAssertEqual(priorities, [.background])
+    }
 }
 
 private actor FakeBackend: TranslationBackend {
@@ -136,6 +153,7 @@ private actor FakeBackend: TranslationBackend {
     private var calls = 0
     private var itemCount = 0
     private var batches: [[String]] = []
+    private var priorities: [TranslationPriority] = []
 
     init(delayNanoseconds: UInt64 = 0) {
         self.delayNanoseconds = delayNanoseconds
@@ -145,6 +163,7 @@ private actor FakeBackend: TranslationBackend {
         calls += 1
         itemCount += request.items.count
         batches.append(request.items.map(\.text))
+        priorities.append(request.priority)
         if delayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: delayNanoseconds)
         }
@@ -163,5 +182,9 @@ private actor FakeBackend: TranslationBackend {
 
     func receivedBatches() -> [[String]] {
         batches
+    }
+
+    func receivedPriorities() -> [TranslationPriority] {
+        priorities
     }
 }

@@ -75,7 +75,8 @@ public actor TranslationBroker {
                 targetLanguage: request.targetLanguage,
                 profile: request.profile,
                 contentKind: request.contentKind,
-                context: request.context
+                context: request.context,
+                priority: request.priority
             )
             let backend = self.backend
             let batchTask = Task<[String: String], Error> {

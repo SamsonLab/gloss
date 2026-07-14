@@ -33,6 +33,7 @@ package final class LoopbackServer: @unchecked Sendable {
         let targetLanguage: String?
         let profile: String?
         let sourceUrl: String?
+        let priority: String?
     }
 
     private struct TranslationResponse: Encodable {
@@ -309,16 +310,29 @@ package final class LoopbackServer: @unchecked Sendable {
         } else {
             profile = .natural
         }
+        let priority: TranslationPriority
+        if let rawPriority = body.priority {
+            guard let parsed = TranslationPriority(rawValue: rawPriority) else {
+                sendJSON(
+                    ErrorResponse(error: "Unknown translation priority."), status: 422, origin: origin,
+                    to: connection)
+                return
+            }
+            priority = parsed
+        } else {
+            priority = .visible
+        }
         let translationRequest = TranslationBatchRequest(
             items: items,
             targetLanguage: targetLanguage,
             profile: profile,
             contentKind: .webpage,
-            context: sourceContext(from: body.sourceUrl)
+            context: sourceContext(from: body.sourceUrl),
+            priority: priority
         )
         runtimeLog.write(
             "bridge",
-            "translation_start items=\(items.count) chars=\(totalCharacters) profile=\(profile.rawValue)"
+            "translation_start items=\(items.count) chars=\(totalCharacters) profile=\(profile.rawValue) priority=\(priority.rawValue)"
         )
 
         Task {

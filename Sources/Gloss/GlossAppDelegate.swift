@@ -48,6 +48,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastExternalApplication: NSRunningApplication?
     private var browserStatus = (message: "正在启动本地浏览器桥接", succeeded: true)
     private var codexStatus = (message: "正在后台连接 Codex", succeeded: Optional<Bool>.none)
+    private var codexAccountAuthenticated = false
+    private var codexLoginInProgress = false
 
     private var glossBar: GlossBarController {
         if let glossBarController { return glossBarController }
@@ -85,6 +87,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         controller.onVerifyCodex = { [weak self] in
             self?.verifyCodex()
+        }
+        controller.onLoginChatGPT = { [weak self] in
+            self?.loginChatGPT()
         }
         controller.onTranslateClipboard = { [weak self] in
             self?.translateClipboard()
@@ -319,11 +324,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func configureStatusItem() {
         if let button = statusItem.button {
-            button.image = NSImage(
-                systemSymbolName: "character.book.closed.fill",
-                accessibilityDescription: "Gloss"
-            )
-            button.image?.isTemplate = true
+            button.image = GlossBrand.markImage(pointSize: 18)
+            button.image?.accessibilityDescription = "Gloss"
             button.toolTip = "Gloss · 选中，即懂"
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
@@ -675,8 +677,21 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateLaunchAtLoginMenuItem(loginItem)
         menu.addItem(loginItem)
 
-        let backend = NSMenuItem(title: codexStatus.message, action: nil, keyEquivalent: "")
-        backend.isEnabled = false
+        let backend: NSMenuItem
+        if codexLoginInProgress {
+            backend = NSMenuItem(title: "等待 ChatGPT 登录…", action: nil, keyEquivalent: "")
+            backend.isEnabled = false
+        } else if codexAccountAuthenticated {
+            backend = NSMenuItem(title: codexStatus.message, action: nil, keyEquivalent: "")
+            backend.isEnabled = false
+        } else {
+            backend = NSMenuItem(
+                title: "登录 ChatGPT…",
+                action: #selector(loginChatGPT),
+                keyEquivalent: ""
+            )
+            backend.target = self
+        }
         menu.addItem(backend)
         menu.addItem(.separator())
 
@@ -1051,8 +1066,15 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { [weak self] in
             guard let self else { return }
             do {
+                let account = try await codex.accountStatus(refreshToken: true)
+                guard account.isAuthenticated else {
+                    codexAccountAuthenticated = false
+                    updateCodexStatus("尚未登录 ChatGPT", succeeded: false)
+                    return
+                }
                 try await codex.prewarm()
-                updateCodexStatus("Codex 已连接，翻译引擎可用", succeeded: true)
+                codexAccountAuthenticated = true
+                updateCodexStatus(accountSummary(account), succeeded: true)
             } catch {
                 updateCodexStatus(error.localizedDescription, succeeded: false)
             }
@@ -1063,12 +1085,67 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { [weak self] in
             guard let self else { return }
             do {
+                let account = try await codex.accountStatus()
+                guard account.isAuthenticated else {
+                    codexAccountAuthenticated = false
+                    updateCodexStatus("尚未登录 ChatGPT · 点击登录", succeeded: false)
+                    settingsWindow.show()
+                    return
+                }
                 try await codex.prewarm()
-                updateCodexStatus("Codex 已预热，首次翻译无需等待连接", succeeded: true)
+                codexAccountAuthenticated = true
+                updateCodexStatus(accountSummary(account), succeeded: true)
             } catch {
                 updateCodexStatus(error.localizedDescription, succeeded: false)
             }
         }
+    }
+
+    @objc private func loginChatGPT() {
+        guard !codexLoginInProgress else { return }
+        codexLoginInProgress = true
+        settingsWindow.setCodexLoginInProgress()
+        codexStatus = ("等待 ChatGPT 登录", nil)
+        statusItem.menu = buildMenu()
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let login = try await codex.startChatGPTLogin()
+                runtimeLog.write("codex", "login_start id=\(login.id)")
+                guard NSWorkspace.shared.open(login.authorizationURL) else {
+                    throw TranslationError.backendUnavailable("无法打开 ChatGPT 登录页面。")
+                }
+                let account = try await codex.waitForAuthentication()
+                try await codex.prewarm()
+                codexLoginInProgress = false
+                codexAccountAuthenticated = true
+                runtimeLog.write("codex", "login_complete mode=\(account.authMode ?? "unknown")")
+                updateCodexStatus(accountSummary(account), succeeded: true)
+            } catch {
+                codexLoginInProgress = false
+                codexAccountAuthenticated = false
+                runtimeLog.write(
+                    "codex",
+                    "login_failed error_type=\(String(reflecting: type(of: error)))"
+                )
+                updateCodexStatus(error.localizedDescription, succeeded: false)
+            }
+        }
+    }
+
+    private func accountSummary(_ account: CodexAccountStatus) -> String {
+        let plan = account.planType?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let email = account.email?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let plan, !plan.isEmpty, let email, !email.isEmpty {
+            return "ChatGPT \(plan.capitalized) · \(email) · 已就绪"
+        }
+        if let plan, !plan.isEmpty {
+            return "ChatGPT \(plan.capitalized) · 翻译引擎已就绪"
+        }
+        if let email, !email.isEmpty {
+            return "\(email) · 翻译引擎已就绪"
+        }
+        return "ChatGPT 已登录 · 翻译引擎已就绪"
     }
 
     private func updateCodexStatus(_ message: String, succeeded: Bool) {

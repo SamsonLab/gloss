@@ -9,7 +9,8 @@ Gloss 是一款 macOS 原生、上下文感知的系统级翻译工具：选中�
 - 提供 App 例外列表，可查看、添加或移除自动出现规则
 - 支持登录时启动；辅助功能权限撤销或重新授予后会自动收敛到正确状态
 - 在选区附近显示轻量 GlossBar 与不抢焦点的自适应结果卡片；可用 `Esc` 收起
-- 启动后在后台并行预建 Codex 翻译 thread 池，复用本机 Codex 登录状态
+- 内置固定版本的原生 Rust Codex app-server，不依赖 Node、Homebrew、系统 PATH 或外部 Codex CLI
+- 使用 Gloss 独立的 Codex 数据目录与 ChatGPT 登录；登录后在后台并行预建翻译 thread 池
 - 使用结构化输出、只读沙盒和禁用工具的临时线程
 - 译文与原文在同一结果卡片中直接对照，并支持复制译文、替换原文和追加双语
 - 提供分开的 macOS 文本与图片“服务”入口，避免被系统归入错误分类
@@ -47,11 +48,12 @@ tail -f ~/Library/Logs/Gloss/gloss.log
 
 ## 前置条件
 
-1. 安装 Codex CLI。
-2. 运行 `codex login`，完成 ChatGPT/Codex 登录。
-3. 首次使用选区翻译时，在系统设置中允许 Gloss 使用“辅助功能”。
-4. Chrome：在 Gloss 设置中点“显示扩展”，从 `chrome://extensions` 加载这个已自动配对的目录。
-5. Safari：在 Gloss 设置中点“Safari 设置”，启用随 App 内置的 Gloss Extension。
+1. 首次启动时，在 Gloss 设置中点击“登录 ChatGPT”。不需要单独安装 Codex CLI 或 Node.js。
+2. 首次使用选区翻译时，在系统设置中允许 Gloss 使用“辅助功能”。
+3. Chrome：在 Gloss 设置中点“显示扩展”，从 `chrome://extensions` 加载这个已自动配对的目录。
+4. Safari：在 Gloss 设置中点“Safari 设置”，启用随 App 内置的 Gloss Extension。
+
+Gloss 的登录状态和 Codex 配置保存在 `~/Library/Application Support/Gloss/Codex/`，不会修改系统 Codex CLI 的数据。
 
 系统“服务”入口默认由 macOS 管理。可在 Gloss 设置中打开“键盘快捷键”，再到“服务”里启用文本或图片翻译入口。
 
@@ -70,14 +72,17 @@ printf 'Translate stdin.\n' | swift run gloss-cli --target Japanese
 swift run gloss-cli --kind ocr 'Text recognized from an image.'
 ```
 
-可以通过环境变量覆盖 Codex：
+开发时可以覆盖原生 app-server 和独立数据目录：
 
 ```bash
-GLOSS_CODEX_BIN=/opt/homebrew/bin/codex \
-GLOSS_CODEX_MODEL=gpt-5.4 \
+GLOSS_CODEX_APP_SERVER_BIN=/path/to/codex-app-server \
+GLOSS_CODEX_HOME="$HOME/Library/Application Support/Gloss/Codex" \
+GLOSS_CODEX_MODEL=gpt-5.3-codex-spark \
 GLOSS_CODEX_MAX_CONCURRENCY=3 \
 swift run gloss-cli 'Hello from Gloss.'
 ```
+
+`GLOSS_CODEX_BIN` 仍保留为外部 Codex CLI 的开发兼容选项；产品构建始终优先使用 App 内置 runtime。
 
 未设置时使用 `gpt-5.3-codex-spark`；并发数默认 3，可配置范围为 1–8。
 
@@ -88,7 +93,7 @@ swift run gloss-cli 'Hello from Gloss.'
 open dist/Gloss.app
 ```
 
-构建脚本会先在相邻的 `personal-immersive-translator` 仓库中生成 Chrome/Safari 产物，再把 Chrome 资源与 Safari `.appex` 嵌入 App。结果位于 `dist/Gloss.app`。脚本会优先使用钥匙串中的第一个 Apple Development 身份；没有可用证书时退回临时签名，此时 Safari 配对不可用。正式分发前需要换成 Developer ID 签名和公证。
+构建脚本会按 `CodexRuntime.lock` 下载并校验固定版本的官方 Rust app-server，把它与许可证一起嵌入 App；随后在相邻的 `personal-immersive-translator` 仓库中生成 Chrome/Safari 产物，并把 Chrome 资源与 Safari `.appex` 嵌入 App。结果位于 `dist/Gloss.app`。脚本会优先使用钥匙串中的第一个 Apple Development 身份；没有可用证书时退回临时签名，此时 Safari 配对不可用。正式分发前需要换成 Developer ID 签名和公证。
 
 需要稳定的本机开发签名时，可显式传入钥匙串中的证书：
 
