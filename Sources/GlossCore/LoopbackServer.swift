@@ -1,0 +1,433 @@
+import Foundation
+import Network
+
+package final class LoopbackServer: @unchecked Sendable {
+    package enum State: Sendable, Equatable {
+        case starting
+        case ready
+        case failed(String)
+        case stopped
+    }
+
+    private struct HTTPRequest: Sendable {
+        let method: String
+        let path: String
+        let headers: [String: String]
+        let body: Data
+    }
+
+    private enum ParseResult {
+        case incomplete
+        case complete(HTTPRequest)
+        case invalid(String)
+    }
+
+    private struct TranslationBody: Decodable {
+        struct Item: Decodable {
+            let id: String
+            let text: String
+        }
+
+        let items: [Item]?
+        let texts: [String]?
+        let targetLanguage: String?
+        let profile: String?
+        let sourceUrl: String?
+    }
+
+    private struct TranslationResponse: Encodable {
+        struct Item: Encodable {
+            let id: String
+            let text: String
+        }
+
+        let translations: [Item]
+    }
+
+    private struct HealthResponse: Encodable {
+        let ok: Bool
+        let name: String
+        let version: String
+        let backend: String
+        let cacheSize: Int
+    }
+
+    private struct ErrorResponse: Encodable {
+        let error: String
+    }
+
+    private static let maximumRequestSize = 1_100_000
+    private static let maximumItems = 40
+    private static let maximumTotalCharacters = 100_000
+
+    private let queue = DispatchQueue(label: "com.samsoncj.gloss.loopback", qos: .userInitiated)
+    private let broker: TranslationBroker
+    private let runtimeLog: GlossRuntimeLog
+    private let token: String
+    private let port: NWEndpoint.Port
+    private var listener: NWListener?
+    package var onStateChange: (@Sendable (State) -> Void)?
+
+    package init(
+        broker: TranslationBroker,
+        token: String,
+        port: UInt16 = 8787,
+        runtimeLog: GlossRuntimeLog = .shared
+    ) {
+        self.broker = broker
+        self.token = token
+        self.port = NWEndpoint.Port(rawValue: port)!
+        self.runtimeLog = runtimeLog
+    }
+
+    package func start() throws {
+        guard listener == nil else { return }
+        runtimeLog.write("bridge", "start address=127.0.0.1 port=\(port.rawValue)")
+        onStateChange?(.starting)
+
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port)
+        let listener = try NWListener(using: parameters)
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.runtimeLog.write("bridge", "ready address=127.0.0.1 port=\(self.port.rawValue)")
+                self.onStateChange?(.ready)
+            case .failed(let error):
+                self.runtimeLog.write("bridge", "failed error=\(error.localizedDescription)")
+                self.onStateChange?(.failed(error.localizedDescription))
+                self.stop()
+            case .cancelled:
+                self.onStateChange?(.stopped)
+            default:
+                break
+            }
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.accept(connection)
+        }
+        self.listener = listener
+        listener.start(queue: queue)
+    }
+
+    package func stop() {
+        runtimeLog.write("bridge", "stop")
+        listener?.cancel()
+        listener = nil
+    }
+
+    private func accept(_ connection: NWConnection) {
+        let endpoint = connection.endpoint
+        guard case .hostPort(let host, _) = endpoint,
+            host == "127.0.0.1" || host == "::1"
+        else {
+            connection.cancel()
+            return
+        }
+        connection.start(queue: queue)
+        receive(on: connection, buffer: Data())
+    }
+
+    private func receive(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1_024) {
+            [weak self] data, _, isComplete, error in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            if error != nil {
+                connection.cancel()
+                return
+            }
+
+            var nextBuffer = buffer
+            if let data {
+                nextBuffer.append(data)
+            }
+            guard nextBuffer.count <= Self.maximumRequestSize else {
+                self.sendJSON(ErrorResponse(error: "Request too large."), status: 413, to: connection)
+                return
+            }
+
+            switch self.parse(nextBuffer) {
+            case .incomplete where !isComplete:
+                self.receive(on: connection, buffer: nextBuffer)
+            case .incomplete:
+                self.sendJSON(ErrorResponse(error: "Incomplete request."), status: 400, to: connection)
+            case .invalid(let message):
+                self.sendJSON(ErrorResponse(error: message), status: 400, to: connection)
+            case .complete(let request):
+                self.route(request, connection: connection)
+            }
+        }
+    }
+
+    private func parse(_ data: Data) -> ParseResult {
+        let separator = Data("\r\n\r\n".utf8)
+        guard let headerRange = data.range(of: separator) else { return .incomplete }
+        guard let headerText = String(data: data[..<headerRange.lowerBound], encoding: .utf8) else {
+            return .invalid("Invalid HTTP headers.")
+        }
+
+        let lines = headerText.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else { return .invalid("Missing request line.") }
+        let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count == 3 else { return .invalid("Invalid request line.") }
+
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { return .invalid("Invalid header.") }
+            let key = line[..<colon].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            headers[key] = value
+        }
+
+        let contentLength = Int(headers["content-length"] ?? "0") ?? -1
+        guard contentLength >= 0, contentLength <= Self.maximumRequestSize else {
+            return .invalid("Invalid Content-Length.")
+        }
+        let bodyStart = headerRange.upperBound
+        guard data.count >= bodyStart + contentLength else { return .incomplete }
+        let body = data.subdata(in: bodyStart..<(bodyStart + contentLength))
+        let rawPath = String(parts[1])
+        let path = rawPath.split(separator: "?", maxSplits: 1).first.map(String.init) ?? rawPath
+
+        return .complete(
+            HTTPRequest(
+                method: String(parts[0]).uppercased(),
+                path: path,
+                headers: headers,
+                body: body
+            )
+        )
+    }
+
+    private func route(_ request: HTTPRequest, connection: NWConnection) {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let origin = request.headers["origin"]
+        if let origin, !isAllowedOrigin(origin) {
+            runtimeLog.write("bridge", "request_rejected reason=origin path=\(request.path)")
+            sendJSON(ErrorResponse(error: "Origin not allowed."), status: 403, to: connection)
+            return
+        }
+
+        if request.method == "OPTIONS" {
+            send(data: Data(), status: 204, origin: origin, to: connection)
+            return
+        }
+
+        let suppliedToken = request.headers["x-gloss-token"] ?? request.headers["x-pit-token"]
+        guard suppliedToken == token else {
+            runtimeLog.write("bridge", "request_rejected reason=auth path=\(request.path)")
+            sendJSON(
+                ErrorResponse(error: "Gloss browser pairing required."),
+                status: 401,
+                origin: origin,
+                to: connection
+            )
+            return
+        }
+
+        if request.method == "GET", request.path == "/health" {
+            Task {
+                let cacheSize = await broker.cacheCount()
+                runtimeLog.write(
+                    "bridge",
+                    "health status=200 duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) cache=\(cacheSize)"
+                )
+                sendJSON(
+                    HealthResponse(
+                        ok: true,
+                        name: "Gloss",
+                        version: "0.1.0",
+                        backend: "codex-app-server",
+                        cacheSize: cacheSize
+                    ),
+                    status: 200,
+                    origin: origin,
+                    to: connection
+                )
+            }
+            return
+        }
+
+        guard request.method == "POST", request.path == "/translate" else {
+            sendJSON(ErrorResponse(error: "Not found."), status: 404, origin: origin, to: connection)
+            return
+        }
+
+        let body: TranslationBody
+        do {
+            body = try JSONDecoder().decode(TranslationBody.self, from: request.body)
+        } catch {
+            sendJSON(
+                ErrorResponse(error: "Invalid JSON: \(error.localizedDescription)"), status: 400, origin: origin,
+                to: connection)
+            return
+        }
+
+        let items: [TranslationItem]
+        if let suppliedItems = body.items {
+            items = suppliedItems.map { TranslationItem(id: $0.id, text: $0.text) }
+        } else {
+            items = (body.texts ?? []).enumerated().map {
+                TranslationItem(id: "gloss-\($0.offset)", text: $0.element)
+            }
+        }
+        let totalCharacters = items.reduce(0) { $0 + $1.text.count }
+        var itemIDs: Set<String> = []
+        let validItems = items.allSatisfy {
+            !$0.id.isEmpty
+                && $0.id.count <= 256
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && $0.text.count <= 20_000
+                && itemIDs.insert($0.id).inserted
+        }
+        let targetLanguage = (body.targetLanguage ?? "Chinese (Simplified)")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !items.isEmpty,
+            items.count <= Self.maximumItems,
+            totalCharacters <= Self.maximumTotalCharacters,
+            validItems,
+            TranslationLanguages.isValidTargetName(targetLanguage)
+        else {
+            sendJSON(
+                ErrorResponse(error: "Translation payload is invalid or too large."), status: 422, origin: origin,
+                to: connection)
+            return
+        }
+
+        let profile: TranslationProfile
+        if let rawProfile = body.profile {
+            guard let parsedProfile = TranslationProfile(rawValue: rawProfile) else {
+                sendJSON(
+                    ErrorResponse(error: "Unknown translation profile."), status: 422, origin: origin, to: connection)
+                return
+            }
+            profile = parsedProfile
+        } else {
+            profile = .natural
+        }
+        let translationRequest = TranslationBatchRequest(
+            items: items,
+            targetLanguage: targetLanguage,
+            profile: profile,
+            contentKind: .webpage,
+            context: sourceContext(from: body.sourceUrl)
+        )
+        runtimeLog.write(
+            "bridge",
+            "translation_start items=\(items.count) chars=\(totalCharacters) profile=\(profile.rawValue)"
+        )
+
+        Task {
+            do {
+                let outputs = try await broker.translate(translationRequest)
+                runtimeLog.write(
+                    "bridge",
+                    "translation_complete items=\(outputs.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt))"
+                )
+                sendJSON(
+                    TranslationResponse(
+                        translations: outputs.map { TranslationResponse.Item(id: $0.id, text: $0.text) }
+                    ),
+                    status: 200,
+                    origin: origin,
+                    to: connection
+                )
+            } catch {
+                runtimeLog.write(
+                    "bridge",
+                    "translation_failed duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error)))"
+                )
+                sendJSON(
+                    ErrorResponse(error: error.localizedDescription),
+                    status: 500,
+                    origin: origin,
+                    to: connection
+                )
+            }
+        }
+    }
+
+    private func sourceContext(from sourceURL: String?) -> String? {
+        guard let sourceURL,
+            let components = URLComponents(string: sourceURL),
+            ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+            let host = components.host,
+            !host.isEmpty
+        else { return nil }
+        return "Website: \(host.lowercased())"
+    }
+
+    private static func elapsedMilliseconds(since startedAt: UInt64) -> Int {
+        let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+        return Int(elapsed / 1_000_000)
+    }
+
+    private func isAllowedOrigin(_ origin: String) -> Bool {
+        guard let components = URLComponents(string: origin) else { return false }
+        let allowedSchemes = Set(["chrome-extension", "safari-web-extension"])
+        return allowedSchemes.contains(components.scheme ?? "") && !(components.host ?? "").isEmpty
+    }
+
+    private func sendJSON<T: Encodable>(
+        _ value: T,
+        status: Int,
+        origin: String? = nil,
+        to connection: NWConnection
+    ) {
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            send(data: try encoder.encode(value), status: status, origin: origin, to: connection)
+        } catch {
+            send(data: Data("{\"error\":\"Encoding failed.\"}".utf8), status: 500, origin: origin, to: connection)
+        }
+    }
+
+    private func send(
+        data: Data,
+        status: Int,
+        origin: String?,
+        to connection: NWConnection
+    ) {
+        let reason: String =
+            switch status {
+            case 200: "OK"
+            case 204: "No Content"
+            case 400: "Bad Request"
+            case 401: "Unauthorized"
+            case 403: "Forbidden"
+            case 404: "Not Found"
+            case 413: "Payload Too Large"
+            case 422: "Unprocessable Content"
+            default: "Internal Server Error"
+            }
+        var headers = [
+            "HTTP/1.1 \(status) \(reason)",
+            "Content-Type: application/json; charset=utf-8",
+            "Content-Length: \(data.count)",
+            "Cache-Control: no-store",
+            "X-Content-Type-Options: nosniff",
+            "Connection: close",
+        ]
+        if let origin {
+            headers.append("Access-Control-Allow-Origin: \(origin)")
+            headers.append("Vary: Origin")
+        }
+        headers.append("Access-Control-Allow-Methods: GET,POST,OPTIONS")
+        headers.append("Access-Control-Allow-Headers: Content-Type,X-Gloss-Token,X-PIT-Token")
+        headers.append("Access-Control-Allow-Private-Network: true")
+        headers.append("Access-Control-Max-Age: 600")
+
+        var response = Data((headers.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+        response.append(data)
+        connection.send(
+            content: response,
+            completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+    }
+}
