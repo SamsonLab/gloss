@@ -4,11 +4,18 @@ import OSLog
 public struct CodexBackendStatus: Sendable {
     public let isRunning: Bool
     public let model: String?
+    public let reasoningEffort: CodexReasoningEffort
     public let lastError: String?
 
-    public init(isRunning: Bool, model: String?, lastError: String?) {
+    public init(
+        isRunning: Bool,
+        model: String?,
+        reasoningEffort: CodexReasoningEffort,
+        lastError: String?
+    ) {
         self.isRunning = isRunning
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.lastError = lastError
     }
 }
@@ -49,7 +56,6 @@ struct CodexRuntimeLaunch: Equatable, Sendable {
 }
 
 public actor CodexAppServerClient: TranslationBackend {
-    private static let defaultModel = "gpt-5.3-codex-spark"
     private static let defaultMaximumConcurrentTurns = 3
 
     private struct PendingRequest {
@@ -136,6 +142,7 @@ public actor CodexAppServerClient: TranslationBackend {
     private let environment: [String: String]
     private let timeoutNanoseconds: UInt64
     private let model: String?
+    private let reasoningEffort: CodexReasoningEffort
     private let maximumConcurrentTurns: Int
     private let glossaryStore: GlossaryStore
     private var process: Process?
@@ -163,11 +170,21 @@ public actor CodexAppServerClient: TranslationBackend {
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         timeoutSeconds: TimeInterval = 120,
-        glossaryStore: GlossaryStore = GlossaryStore()
+        glossaryStore: GlossaryStore = GlossaryStore(),
+        model: String? = nil,
+        reasoningEffort: CodexReasoningEffort? = nil
     ) {
         self.environment = environment
         self.timeoutNanoseconds = UInt64(max(1, timeoutSeconds) * 1_000_000_000)
-        self.model = environment["GLOSS_CODEX_MODEL"]?.nilIfBlank ?? Self.defaultModel
+        self.model =
+            environment["GLOSS_CODEX_MODEL"]?.nilIfBlank
+            ?? model?.nilIfBlank
+            ?? TranslationProviderConfiguration.defaultCodexModel
+        self.reasoningEffort =
+            environment["GLOSS_CODEX_REASONING_EFFORT"]
+            .flatMap(CodexReasoningEffort.init(rawValue:))
+            ?? reasoningEffort
+            ?? .low
         self.maximumConcurrentTurns = Self.readMaximumConcurrentTurns(environment)
         self.glossaryStore = glossaryStore
     }
@@ -226,7 +243,7 @@ public actor CodexAppServerClient: TranslationBackend {
                         "text_elements": .array([]),
                     ])
                 ]),
-                "effort": .string("low"),
+                "effort": .string(reasoningEffort.rawValue),
                 "summary": .string("none"),
                 "outputSchema": Self.translationSchema,
             ]
@@ -355,6 +372,7 @@ public actor CodexAppServerClient: TranslationBackend {
         CodexBackendStatus(
             isRunning: process?.isRunning == true && initialized,
             model: model,
+            reasoningEffort: reasoningEffort,
             lastError: lastError
         )
     }
@@ -445,7 +463,7 @@ public actor CodexAppServerClient: TranslationBackend {
         process.arguments = runtime.argumentPrefix + [
             "--listen", "stdio://",
             "-c", "model_reasoning_summary=\"none\"",
-            "-c", "model_reasoning_effort=\"low\"",
+            "-c", "model_reasoning_effort=\"\(reasoningEffort.rawValue)\"",
             "-c", "web_search=\"disabled\"",
             "-c", "features.shell_tool=false",
             "-c", "features.unified_exec=false",

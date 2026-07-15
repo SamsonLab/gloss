@@ -21,6 +21,19 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(status.model, "custom-model")
     }
 
+    func testReasoningEffortCanBeConfigured() async {
+        let client = CodexAppServerClient(
+            environment: [:],
+            model: "gpt-test",
+            reasoningEffort: .xhigh
+        )
+
+        let status = await client.status()
+
+        XCTAssertEqual(status.model, "gpt-test")
+        XCTAssertEqual(status.reasoningEffort, .xhigh)
+    }
+
     func testProcessEnvironmentMakesCodexInterpreterDiscoverableFromGUIApp() {
         let codexHome = URL(fileURLWithPath: "/tmp/gloss-codex-home")
         let environment = CodexAppServerClient.makeProcessEnvironment(

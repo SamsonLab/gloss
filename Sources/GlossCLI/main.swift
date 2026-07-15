@@ -8,17 +8,39 @@ struct GlossCommand {
         do {
             let arguments = try Arguments(CommandLine.arguments.dropFirst())
             let source = try arguments.sourceText()
-            let codex = CodexAppServerClient()
-            let broker = TranslationBroker(backend: codex)
+            let backend: any TranslationBackend
+            let stop: @Sendable () async -> Void
+            switch arguments.provider {
+            case .codex:
+                let codex = CodexAppServerClient(
+                    model: arguments.model,
+                    reasoningEffort: arguments.reasoningEffort
+                )
+                backend = codex
+                stop = { await codex.stop() }
+            case .llama:
+                let llama = LlamaServerClient(
+                    model: arguments.model
+                        ?? TranslationProviderConfiguration.defaultLlamaModel
+                )
+                backend = llama
+                stop = { await llama.stop() }
+            }
+            let broker = TranslationBroker(backend: backend)
 
-            let result = try await broker.translateText(
-                source,
-                targetLanguage: arguments.targetLanguage,
-                profile: arguments.profile,
-                contentKind: arguments.contentKind
-            )
-            print(result)
-            await codex.stop()
+            do {
+                let result = try await broker.translateText(
+                    source,
+                    targetLanguage: arguments.targetLanguage,
+                    profile: arguments.profile,
+                    contentKind: arguments.contentKind
+                )
+                print(result)
+                await stop()
+            } catch {
+                await stop()
+                throw error
+            }
         } catch {
             FileHandle.standardError.write(Data("gloss: \(error.localizedDescription)\n".utf8))
             exit(1)
@@ -30,12 +52,18 @@ private struct Arguments {
     let targetLanguage: String
     let profile: TranslationProfile
     let contentKind: TranslationContentKind
+    let provider: TranslationProvider
+    let model: String?
+    let reasoningEffort: CodexReasoningEffort
     let textParts: [String]
 
     init(_ rawArguments: ArraySlice<String>) throws {
         var targetLanguage = "Chinese (Simplified)"
         var profile: TranslationProfile = .natural
         var contentKind: TranslationContentKind = .selection
+        var provider: TranslationProvider = .codex
+        var model: String?
+        var reasoningEffort: CodexReasoningEffort = .low
         var textParts: [String] = []
         var iterator = rawArguments.makeIterator()
 
@@ -60,6 +88,27 @@ private struct Arguments {
                     )
                 }
                 contentKind = parsed
+            case "--provider":
+                guard let value = iterator.next(),
+                    let parsed = TranslationProvider(rawValue: value)
+                else {
+                    throw UsageError("--provider 可选 codex 或 llama。")
+                }
+                provider = parsed
+            case "--model":
+                guard let value = iterator.next(), !value.isEmpty else {
+                    throw UsageError("--model 需要模型名称或 GGUF 路径。")
+                }
+                model = value
+            case "--reasoning":
+                guard let value = iterator.next(),
+                    let parsed = CodexReasoningEffort(rawValue: value)
+                else {
+                    throw UsageError(
+                        "--reasoning 可选 minimal、low、medium、high 或 xhigh。"
+                    )
+                }
+                reasoningEffort = parsed
             case "--help", "-h":
                 print(Self.help)
                 exit(0)
@@ -71,6 +120,9 @@ private struct Arguments {
         self.targetLanguage = targetLanguage
         self.profile = profile
         self.contentKind = contentKind
+        self.provider = provider
+        self.model = model
+        self.reasoningEffort = reasoningEffort
         self.textParts = textParts
     }
 
@@ -93,6 +145,9 @@ private struct Arguments {
           -t, --target LANGUAGE   Target language (default: Chinese (Simplified))
           -p, --profile PROFILE  faithful | natural | technical | academic | subtitle
           -k, --kind KIND        selection | webpage | document | subtitle | ocr
+              --provider NAME    codex | llama (default: codex)
+              --model MODEL      Codex model, Hugging Face GGUF repo, or local GGUF path
+              --reasoning LEVEL  minimal | low | medium | high | xhigh (Codex only)
 
         If text is omitted, gloss-cli reads from stdin.
         """

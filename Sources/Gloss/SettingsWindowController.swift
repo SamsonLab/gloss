@@ -2,9 +2,10 @@ import AppKit
 import GlossCore
 
 @MainActor
-final class SettingsWindowController: NSObject, NSWindowDelegate {
+final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     var onRequestAccessibility: (() -> Void)?
-    var onVerifyCodex: (() -> Void)?
+    var onVerifyProvider: (() -> Void)?
+    var onProviderConfigurationChange: ((TranslationProviderConfiguration) -> Void)?
     var onLoginChatGPT: (() -> Void)?
     var onTranslateClipboard: (() -> Void)?
     var onTranslateClipboardImage: (() -> Void)?
@@ -19,12 +20,19 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private let window: NSWindow
     private let accessibilityStatus = NSTextField(labelWithString: "")
-    private let codexStatus = NSTextField(labelWithString: "Gloss 使用独立的 ChatGPT 登录")
+    private let providerStatus = NSTextField(labelWithString: "正在启动翻译引擎")
     private let browserStatus = NSTextField(labelWithString: "正在启动本地浏览器桥接")
     private let shortcutStatus = NSTextField(labelWithString: "手动翻译当前选区")
     private let launchAtLoginStatus = NSTextField(labelWithString: "关闭")
-    private let verifyButton = NSButton(title: "验证 Codex", target: nil, action: nil)
+    private let verifyButton = NSButton(title: "验证", target: nil, action: nil)
     private let loginButton = NSButton(title: "登录 ChatGPT", target: nil, action: nil)
+    private let providerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let codexModelField = NSTextField(
+        string: TranslationProviderConfiguration.defaultCodexModel
+    )
+    private let reasoningPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let codexOptions = NSStackView()
+    private let localOptions = NSStackView()
     private let accessibilityButton = NSButton(title: "启用辅助功能", target: nil, action: nil)
     private let servicesButton = NSButton(title: "打开设置", target: nil, action: nil)
     private let shortcutButton = ShortcutRecorderButton(shortcut: .defaultValue)
@@ -32,7 +40,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     override init() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 706),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 790),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: true
@@ -59,29 +67,39 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         accessibilityButton.isEnabled = !trusted
     }
 
-    func setCodexVerifying() {
+    func showProviderConfiguration(_ configuration: TranslationProviderConfiguration) {
+        select(configuration.provider, in: providerPopup)
+        codexModelField.stringValue = configuration.codexModel
+        select(configuration.codexReasoningEffort, in: reasoningPopup)
+        updateProviderControls()
+    }
+
+    func setProviderVerifying() {
         verifyButton.isEnabled = false
         loginButton.isEnabled = false
         verifyButton.title = "正在验证…"
-        codexStatus.stringValue = "正在启动 Codex app-server"
-        codexStatus.textColor = .secondaryLabelColor
+        providerStatus.stringValue =
+            selectedProvider == .llama
+            ? "正在启动本地 llama-server；首次使用会下载模型"
+            : "正在启动 Codex app-server"
+        providerStatus.textColor = .secondaryLabelColor
     }
 
     func setCodexLoginInProgress() {
         verifyButton.isEnabled = false
         loginButton.isEnabled = false
         loginButton.title = "等待登录…"
-        codexStatus.stringValue = "请在浏览器中完成 ChatGPT 登录"
-        codexStatus.textColor = .secondaryLabelColor
+        providerStatus.stringValue = "请在浏览器中完成 ChatGPT 登录"
+        providerStatus.textColor = .secondaryLabelColor
     }
 
-    func showCodexResult(_ message: String, succeeded: Bool) {
+    func showProviderResult(_ message: String, succeeded: Bool) {
         verifyButton.isEnabled = true
-        loginButton.isEnabled = true
+        loginButton.isEnabled = selectedProvider == .codex
         verifyButton.title = "重新验证"
         loginButton.title = succeeded ? "切换账号" : "登录 ChatGPT"
-        codexStatus.stringValue = message
-        codexStatus.textColor = succeeded ? .systemGreen : .systemRed
+        providerStatus.stringValue = message
+        providerStatus.textColor = succeeded ? .systemGreen : .systemRed
     }
 
     func showLaunchAtLoginStatus(enabled: Bool, requiresApproval: Bool) {
@@ -106,7 +124,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         window.title = "Gloss"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.minSize = NSSize(width: 520, height: 680)
+        window.minSize = NSSize(width: 520, height: 760)
 
         let content = NSView()
         window.contentView = content
@@ -164,21 +182,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         servicesButton.target = self
         servicesButton.action = #selector(openServicesSettings)
 
-        let logsButton = NSButton(title: "查看日志", target: self, action: #selector(revealLogs))
-        let codexButtons = NSStackView(views: [loginButton, verifyButton, logsButton])
-        codexButtons.orientation = .horizontal
-        codexButtons.alignment = .centerY
-        codexButtons.spacing = 6
-        let codexCard = makeStatusCard(
-            symbol: "bolt.horizontal.circle",
-            title: "翻译引擎",
-            status: codexStatus,
-            accessory: codexButtons
-        )
-        verifyButton.target = self
-        verifyButton.action = #selector(verifyCodex)
-        loginButton.target = self
-        loginButton.action = #selector(loginChatGPT)
+        let providerCard = makeProviderCard()
 
         let revealExtensionButton = NSButton(
             title: "显示扩展",
@@ -240,7 +244,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
         let hint = NSTextField(
             wrappingLabelWithString:
-                "选择文本或长按已有选区后 GlossBar 会自动出现；也可以使用全局快捷键，翻译剪贴板图片或截图。图片在本机完成 OCR，只有文字会发送给 Codex。"
+                "选择文本或长按已有选区后 GlossBar 会自动出现；也可以使用全局快捷键，翻译剪贴板图片或截图。图片始终在本机完成 OCR；使用本地模型时，文字也不会离开设备。"
         )
         hint.font = .systemFont(ofSize: 12)
         hint.textColor = .tertiaryLabelColor
@@ -252,7 +256,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             accessibilityCard,
             shortcutCard,
             servicesCard,
-            codexCard,
+            providerCard,
             browserCard,
             launchAtLoginCard,
             actionButtons,
@@ -280,13 +284,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             servicesCard.leadingAnchor.constraint(equalTo: accessibilityCard.leadingAnchor),
             servicesCard.trailingAnchor.constraint(equalTo: accessibilityCard.trailingAnchor),
 
-            codexCard.topAnchor.constraint(equalTo: servicesCard.bottomAnchor, constant: 10),
-            codexCard.leadingAnchor.constraint(equalTo: servicesCard.leadingAnchor),
-            codexCard.trailingAnchor.constraint(equalTo: servicesCard.trailingAnchor),
+            providerCard.topAnchor.constraint(equalTo: servicesCard.bottomAnchor, constant: 10),
+            providerCard.leadingAnchor.constraint(equalTo: servicesCard.leadingAnchor),
+            providerCard.trailingAnchor.constraint(equalTo: servicesCard.trailingAnchor),
 
-            browserCard.topAnchor.constraint(equalTo: codexCard.bottomAnchor, constant: 10),
-            browserCard.leadingAnchor.constraint(equalTo: codexCard.leadingAnchor),
-            browserCard.trailingAnchor.constraint(equalTo: codexCard.trailingAnchor),
+            browserCard.topAnchor.constraint(equalTo: providerCard.bottomAnchor, constant: 10),
+            browserCard.leadingAnchor.constraint(equalTo: providerCard.leadingAnchor),
+            browserCard.trailingAnchor.constraint(equalTo: providerCard.trailingAnchor),
 
             launchAtLoginCard.topAnchor.constraint(equalTo: browserCard.bottomAnchor, constant: 10),
             launchAtLoginCard.leadingAnchor.constraint(equalTo: browserCard.leadingAnchor),
@@ -300,6 +304,131 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -44),
             hint.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -20),
         ])
+    }
+
+    private func makeProviderCard() -> NSView {
+        let card = NSVisualEffectView()
+        card.material = .contentBackground
+        card.blendingMode = .withinWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.image = NSImage(
+            systemSymbolName: "bolt.horizontal.circle",
+            accessibilityDescription: "翻译引擎"
+        )
+        icon.contentTintColor = .secondaryLabelColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        providerPopup.removeAllItems()
+        for provider in TranslationProvider.allCases {
+            providerPopup.addItem(withTitle: provider.displayName)
+            providerPopup.lastItem?.representedObject = provider.rawValue
+        }
+        providerPopup.target = self
+        providerPopup.action = #selector(providerChanged)
+
+        reasoningPopup.removeAllItems()
+        for effort in CodexReasoningEffort.allCases {
+            reasoningPopup.addItem(withTitle: effort.displayName)
+            reasoningPopup.lastItem?.representedObject = effort.rawValue
+        }
+        reasoningPopup.target = self
+        reasoningPopup.action = #selector(providerOptionChanged)
+
+        codexModelField.placeholderString = TranslationProviderConfiguration.defaultCodexModel
+        codexModelField.delegate = self
+        codexModelField.lineBreakMode = .byTruncatingMiddle
+
+        codexOptions.orientation = .horizontal
+        codexOptions.alignment = .centerY
+        codexOptions.spacing = 8
+        codexOptions.addArrangedSubview(codexModelField)
+        let reasoningLabel = makeFieldLabel("推理")
+        codexOptions.addArrangedSubview(reasoningLabel)
+        codexOptions.addArrangedSubview(reasoningPopup)
+
+        let localDescription = NSTextField(
+            labelWithString: "llama.cpp · Hy-MT2-1.8B · Q4_K_M · Metal"
+        )
+        localDescription.font = .systemFont(ofSize: 12, weight: .medium)
+        localDescription.textColor = .secondaryLabelColor
+        localOptions.orientation = .horizontal
+        localOptions.alignment = .centerY
+        localOptions.addArrangedSubview(localDescription)
+
+        let options = NSStackView(views: [codexOptions, localOptions])
+        options.orientation = .vertical
+        options.alignment = .leading
+        options.spacing = 0
+
+        let fields = NSGridView(views: [
+            [makeFieldLabel("Provider"), providerPopup],
+            [makeFieldLabel("配置"), options],
+        ])
+        fields.rowSpacing = 8
+        fields.columnSpacing = 10
+        fields.column(at: 0).xPlacement = .leading
+        fields.column(at: 1).xPlacement = .fill
+
+        providerStatus.font = .systemFont(ofSize: 12)
+        providerStatus.textColor = .secondaryLabelColor
+        providerStatus.lineBreakMode = .byTruncatingTail
+        providerStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let logsButton = NSButton(title: "日志", target: self, action: #selector(revealLogs))
+        let buttons = NSStackView(views: [loginButton, verifyButton, logsButton])
+        buttons.orientation = .horizontal
+        buttons.alignment = .centerY
+        buttons.spacing = 6
+        loginButton.target = self
+        loginButton.action = #selector(loginChatGPT)
+        verifyButton.target = self
+        verifyButton.action = #selector(verifyProvider)
+
+        let statusRow = NSStackView(views: [providerStatus, buttons])
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.spacing = 10
+        statusRow.distribution = .fill
+
+        let content = NSStackView(views: [fields, statusRow])
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 10
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(icon)
+        card.addSubview(content)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 152),
+            icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            icon.topAnchor.constraint(equalTo: card.topAnchor, constant: 19),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
+            content.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -13),
+            fields.widthAnchor.constraint(equalTo: content.widthAnchor),
+            statusRow.widthAnchor.constraint(equalTo: content.widthAnchor),
+            providerPopup.widthAnchor.constraint(equalToConstant: 330),
+            codexModelField.widthAnchor.constraint(equalToConstant: 180),
+            reasoningPopup.widthAnchor.constraint(equalToConstant: 112),
+        ])
+
+        updateProviderControls()
+        return card
+    }
+
+    private func makeFieldLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        return label
     }
 
     private func makeStatusCard(
@@ -357,8 +486,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         onRequestAccessibility?()
     }
 
-    @objc private func verifyCodex() {
-        onVerifyCodex?()
+    @objc private func providerChanged() {
+        updateProviderControls()
+        notifyProviderConfigurationChange()
+    }
+
+    @objc private func providerOptionChanged() {
+        notifyProviderConfigurationChange()
+    }
+
+    @objc private func verifyProvider() {
+        onVerifyProvider?()
     }
 
     @objc private func loginChatGPT() {
@@ -406,5 +544,56 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     func showBrowserStatus(_ message: String, succeeded: Bool) {
         browserStatus.stringValue = message
         browserStatus.textColor = succeeded ? .systemGreen : .systemRed
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard notification.object as? NSTextField === codexModelField else { return }
+        notifyProviderConfigurationChange()
+    }
+
+    private var selectedProvider: TranslationProvider {
+        guard let rawValue = providerPopup.selectedItem?.representedObject as? String else {
+            return .codex
+        }
+        return TranslationProvider(rawValue: rawValue) ?? .codex
+    }
+
+    private var selectedReasoningEffort: CodexReasoningEffort {
+        guard let rawValue = reasoningPopup.selectedItem?.representedObject as? String else {
+            return .low
+        }
+        return CodexReasoningEffort(rawValue: rawValue) ?? .low
+    }
+
+    private func updateProviderControls() {
+        let usesCodex = selectedProvider == .codex
+        codexOptions.isHidden = !usesCodex
+        localOptions.isHidden = usesCodex
+        loginButton.isHidden = !usesCodex
+        loginButton.isEnabled = usesCodex
+        verifyButton.title = usesCodex ? "验证 GPT" : "验证本地"
+    }
+
+    private func notifyProviderConfigurationChange() {
+        let model = codexModelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        onProviderConfigurationChange?(
+            TranslationProviderConfiguration(
+                provider: selectedProvider,
+                codexModel: model.isEmpty
+                    ? TranslationProviderConfiguration.defaultCodexModel
+                    : model,
+                codexReasoningEffort: selectedReasoningEffort
+            )
+        )
+    }
+
+    private func select<Value: RawRepresentable>(_ value: Value, in popup: NSPopUpButton)
+    where Value.RawValue == String {
+        guard
+            let index = popup.itemArray.firstIndex(where: {
+                $0.representedObject as? String == value.rawValue
+            })
+        else { return }
+        popup.selectItem(at: index)
     }
 }

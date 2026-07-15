@@ -11,6 +11,8 @@ Gloss 是一款 macOS 原生、上下文感知的系统级翻译工具：选中�
 - 在选区附近显示轻量 GlossBar 与不抢焦点的自适应结果卡片；可用 `Esc` 收起
 - 内置固定版本的原生 Rust Codex app-server，不依赖 Node、Homebrew、系统 PATH 或外部 Codex CLI
 - 使用 Gloss 独立的 Codex 数据目录与 ChatGPT 登录；登录后在后台并行预建翻译 thread 池
+- 可在设置中即时切换 GPT 订阅与本地 `llama.cpp` provider；GPT 可配置 model 和 reasoning
+- 本地选项使用 `Hy-MT2-1.8B-GGUF:Q4_K_M`，通过 Metal 运行，原文和译文都留在设备上
 - 使用结构化输出、只读沙盒和禁用工具的临时线程
 - 译文与原文在同一结果卡片中直接对照，并支持复制译文、替换原文和追加双语
 - 提供分开的 macOS 文本与图片“服务”入口，避免被系统归入错误分类
@@ -48,10 +50,11 @@ tail -f ~/Library/Logs/Gloss/gloss.log
 
 ## 前置条件
 
-1. 首次启动时，在 Gloss 设置中点击“登录 ChatGPT”。不需要单独安装 Codex CLI 或 Node.js。
-2. 首次使用选区翻译时，在系统设置中允许 Gloss 使用“辅助功能”。
-3. Chrome：在 Gloss 设置中点“显示扩展”，从 `chrome://extensions` 加载这个已自动配对的目录。
-4. Safari：在 Gloss 设置中点“Safari 设置”，启用随 App 内置的 Gloss Extension。
+1. GPT 订阅：首次启动时，在 Gloss 设置中点击“登录 ChatGPT”。不需要单独安装 Codex CLI 或 Node.js。
+2. 本地模型：安装 `llama.cpp`（`brew install llama.cpp`），然后在翻译引擎中选择“本地模型”。首次启动会从 Hugging Face 下载约 1.1 GB 的 Q4 模型。
+3. 首次使用选区翻译时，在系统设置中允许 Gloss 使用“辅助功能”。
+4. Chrome：在 Gloss 设置中点“显示扩展”，从 `chrome://extensions` 加载这个已自动配对的目录。
+5. Safari：在 Gloss 设置中点“Safari 设置”，启用随 App 内置的 Gloss Extension。
 
 Gloss 的登录状态和 Codex 配置保存在 `~/Library/Application Support/Gloss/Codex/`，不会修改系统 Codex CLI 的数据。
 
@@ -68,6 +71,8 @@ swift run Gloss
 
 ```bash
 swift run gloss-cli --target 'Chinese (Simplified)' 'Translate this text.'
+swift run gloss-cli --provider llama --target 'Chinese (Simplified)' 'Translate locally.'
+swift run gloss-cli --provider codex --model gpt-5.3-codex-spark --reasoning low 'Translate quickly.'
 printf 'Translate stdin.\n' | swift run gloss-cli --target Japanese
 swift run gloss-cli --kind ocr 'Text recognized from an image.'
 ```
@@ -78,6 +83,7 @@ swift run gloss-cli --kind ocr 'Text recognized from an image.'
 GLOSS_CODEX_APP_SERVER_BIN=/path/to/codex-app-server \
 GLOSS_CODEX_HOME="$HOME/Library/Application Support/Gloss/Codex" \
 GLOSS_CODEX_MODEL=gpt-5.3-codex-spark \
+GLOSS_CODEX_REASONING_EFFORT=low \
 GLOSS_CODEX_MAX_CONCURRENCY=3 \
 swift run gloss-cli 'Hello from Gloss.'
 ```
@@ -86,6 +92,14 @@ swift run gloss-cli 'Hello from Gloss.'
 
 未设置时使用 `gpt-5.3-codex-spark`；并发数默认 3，可配置范围为 1–8。
 
+本地 provider 默认查找 App 内的 `llama-server` helper、`GLOSS_LLAMA_SERVER_BIN`、`PATH`，以及 Homebrew 常用路径。模型可通过 `GLOSS_LLAMA_MODEL` 覆盖为 Hugging Face GGUF repo 或本地 `.gguf` 文件：
+
+```bash
+GLOSS_LLAMA_SERVER_BIN=/opt/homebrew/bin/llama-server \
+GLOSS_LLAMA_MODEL=tencent/Hy-MT2-1.8B-GGUF:Q4_K_M \
+swift run gloss-cli --provider llama 'Hello from local Gloss.'
+```
+
 ## 打包
 
 ```bash
@@ -93,7 +107,7 @@ swift run gloss-cli 'Hello from Gloss.'
 open dist/Gloss.app
 ```
 
-构建脚本会按 `CodexRuntime.lock` 下载并校验固定版本的官方 Rust app-server，把它与许可证一起嵌入 App；随后在相邻的 `personal-immersive-translator` 仓库中生成 Chrome/Safari 产物，并把 Chrome 资源与 Safari `.appex` 嵌入 App。结果位于 `dist/Gloss.app`。脚本会优先使用钥匙串中的第一个 Apple Development 身份；没有可用证书时退回临时签名，此时 Safari 配对不可用。正式分发前需要换成 Developer ID 签名和公证。
+构建脚本会按 `CodexRuntime.lock` 下载并校验固定版本的官方 Rust app-server，把它与许可证一起嵌入 App；本地 provider 当前复用系统安装的 `llama-server`。随后脚本在相邻的 `personal-immersive-translator` 仓库中生成 Chrome/Safari 产物，并把 Chrome 资源与 Safari `.appex` 嵌入 App。结果位于 `dist/Gloss.app`。脚本会优先使用钥匙串中的第一个 Apple Development 身份；没有可用证书时退回临时签名，此时 Safari 配对不可用。正式分发前需要换成 Developer ID 签名和公证。
 
 需要稳定的本机开发签名时，可显式传入钥匙串中的证书：
 
@@ -106,7 +120,7 @@ GLOSS_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./Scripts/build_app.
 ## 代码结构
 
 ```text
-Sources/GlossCore/   Codex 客户端、翻译模型、缓存与并发合并
+Sources/GlossCore/   Codex/llama 客户端、provider 路由、翻译模型、缓存与并发合并
 Sources/GlossOCR/    本地 Vision OCR 与版面阅读顺序恢复
 Sources/Gloss/       macOS 选区、图片、截图、结果面板、文本替换与浏览器桥接
 Sources/GlossCLI/    薄命令行入口

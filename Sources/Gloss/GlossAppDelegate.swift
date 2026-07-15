@@ -20,11 +20,18 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let automaticSelectionKey = "automaticSelectionEnabled"
     private let excludedApplicationsKey = "excludedApplicationBundleIdentifiers"
     private let profileKey = "translationProfile"
+    private let providerKey = "translationProvider"
+    private let codexModelKey = "codexModel"
+    private let codexReasoningEffortKey = "codexReasoningEffort"
     private let welcomeVersionKey = "welcomeVersion"
     private let glossaryStore = GlossaryStore()
     private let runtimeLog = GlossRuntimeLog.shared
-    private lazy var codex = CodexAppServerClient(glossaryStore: glossaryStore)
-    private lazy var broker = TranslationBroker(backend: codex)
+    private lazy var codex = makeCodexClient(configuration: providerConfiguration)
+    private lazy var llama = LlamaServerClient(glossaryStore: glossaryStore)
+    private lazy var backendRouter = TranslationBackendRouter(
+        backend: backend(for: providerConfiguration.provider)
+    )
+    private lazy var broker = TranslationBroker(backend: backendRouter)
     private let historyStore = TranslationHistoryStore()
     private var globalShortcut = GlobalShortcut.load()
     private lazy var statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -47,9 +54,11 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var terminationInProgress = false
     private var lastExternalApplication: NSRunningApplication?
     private var browserStatus = (message: "正在启动本地浏览器桥接", succeeded: true)
-    private var codexStatus = (message: "正在后台连接 Codex", succeeded: Optional<Bool>.none)
+    private var engineStatus = (message: "正在启动翻译引擎", succeeded: Optional<Bool>.none)
     private var codexAccountAuthenticated = false
     private var codexLoginInProgress = false
+    private var providerConfigurationGeneration = UUID()
+    private var providerTransitionTask: Task<Void, Never>?
 
     private var glossBar: GlossBarController {
         if let glossBarController { return glossBarController }
@@ -85,8 +94,11 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.onRequestAccessibility = { [weak self] in
             self?.requestAccessibility()
         }
-        controller.onVerifyCodex = { [weak self] in
-            self?.verifyCodex()
+        controller.onVerifyProvider = { [weak self] in
+            self?.verifyProvider()
+        }
+        controller.onProviderConfigurationChange = { [weak self] configuration in
+            self?.applyProviderConfiguration(configuration)
         }
         controller.onLoginChatGPT = { [weak self] in
             self?.loginChatGPT()
@@ -122,10 +134,11 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.setGlobalShortcut(shortcut)
         }
         controller.showBrowserStatus(browserStatus.message, succeeded: browserStatus.succeeded)
-        if let succeeded = codexStatus.succeeded {
-            controller.showCodexResult(codexStatus.message, succeeded: succeeded)
+        controller.showProviderConfiguration(providerConfiguration)
+        if let succeeded = engineStatus.succeeded {
+            controller.showProviderResult(engineStatus.message, succeeded: succeeded)
         } else {
-            controller.setCodexVerifying()
+            controller.setProviderVerifying()
         }
         controller.showGlobalShortcut(globalShortcut)
         updateLaunchAtLoginStatus(in: controller)
@@ -236,6 +249,29 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private var providerConfiguration: TranslationProviderConfiguration {
+        get {
+            let defaults = UserDefaults.standard
+            let provider = defaults.string(forKey: providerKey)
+                .flatMap(TranslationProvider.init(rawValue:)) ?? .codex
+            let model = defaults.string(forKey: codexModelKey)
+                ?? TranslationProviderConfiguration.defaultCodexModel
+            let effort = defaults.string(forKey: codexReasoningEffortKey)
+                .flatMap(CodexReasoningEffort.init(rawValue:)) ?? .low
+            return TranslationProviderConfiguration(
+                provider: provider,
+                codexModel: model,
+                codexReasoningEffort: effort
+            )
+        }
+        set {
+            let defaults = UserDefaults.standard
+            defaults.set(newValue.provider.rawValue, forKey: providerKey)
+            defaults.set(newValue.codexModel, forKey: codexModelKey)
+            defaults.set(newValue.codexReasoningEffort.rawValue, forKey: codexReasoningEffortKey)
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? runtimeLog.prepare()
         let version =
@@ -250,7 +286,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configureSelectionMonitor()
         configureWorkspaceObservation()
         startBrowserBridge()
-        prewarmCodex()
+        prewarmProvider()
 
         if !reconcileAccessibility() {
             startAccessibilityPolling()
@@ -315,8 +351,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminationInProgress else { return .terminateLater }
         terminationInProgress = true
-        Task { [codex] in
+        Task { [codex, llama] in
             await codex.stop()
+            await llama.stop()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -678,11 +715,18 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(loginItem)
 
         let backend: NSMenuItem
-        if codexLoginInProgress {
+        if providerConfiguration.provider == .llama {
+            backend = NSMenuItem(
+                title: "本地 · \(engineStatus.message)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            backend.isEnabled = false
+        } else if codexLoginInProgress {
             backend = NSMenuItem(title: "等待 ChatGPT 登录…", action: nil, keyEquivalent: "")
             backend.isEnabled = false
         } else if codexAccountAuthenticated {
-            backend = NSMenuItem(title: codexStatus.message, action: nil, keyEquivalent: "")
+            backend = NSMenuItem(title: engineStatus.message, action: nil, keyEquivalent: "")
             backend.isEnabled = false
         } else {
             backend = NSMenuItem(
@@ -1060,43 +1104,173 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startAccessibilityPolling()
     }
 
-    @objc private func verifyCodex() {
-        codexStatus = ("正在验证 Codex", nil)
-        settingsWindow.setCodexVerifying()
+    private func makeCodexClient(
+        configuration: TranslationProviderConfiguration
+    ) -> CodexAppServerClient {
+        CodexAppServerClient(
+            glossaryStore: glossaryStore,
+            model: configuration.codexModel,
+            reasoningEffort: configuration.codexReasoningEffort
+        )
+    }
+
+    private func backend(for provider: TranslationProvider) -> any TranslationBackend {
+        switch provider {
+        case .codex:
+            codex
+        case .llama:
+            llama
+        }
+    }
+
+    private func applyProviderConfiguration(
+        _ requestedConfiguration: TranslationProviderConfiguration
+    ) {
+        let configuration = TranslationProviderConfiguration(
+            provider: requestedConfiguration.provider,
+            codexModel: requestedConfiguration.codexModel.isEmpty
+                ? TranslationProviderConfiguration.defaultCodexModel
+                : requestedConfiguration.codexModel,
+            codexReasoningEffort: requestedConfiguration.codexReasoningEffort
+        )
+        let previousConfiguration = providerConfiguration
+        guard configuration != previousConfiguration else { return }
+
+        let previousCodex = codex
+        providerConfiguration = configuration
+        let generation = UUID()
+        providerConfigurationGeneration = generation
+        if configuration.codexModel != previousConfiguration.codexModel
+            || configuration.codexReasoningEffort != previousConfiguration.codexReasoningEffort
+        {
+            codex = makeCodexClient(configuration: configuration)
+        }
+
+        engineStatus = (
+            configuration.provider == .llama
+                ? "正在启动 Hy-MT2；首次使用会下载模型"
+                : "正在连接 \(configuration.codexModel)",
+            nil
+        )
+        settingsWindowController?.showProviderConfiguration(configuration)
+        settingsWindowController?.setProviderVerifying()
+        statusItem.menu = buildMenu()
+
+        let selectedBackend = backend(for: configuration.provider)
+        let selectedCodex = codex
+        let selectedLlama = llama
+        let previousTransition = providerTransitionTask
+        let transition = Task { [weak self] in
+            guard let self else { return }
+            await previousTransition?.value
+            guard providerConfigurationGeneration == generation else { return }
+            if previousCodex !== selectedCodex {
+                await previousCodex.stop()
+            }
+            switch configuration.provider {
+            case .codex:
+                await selectedLlama.stop()
+            case .llama:
+                await selectedCodex.stop()
+            }
+            guard providerConfigurationGeneration == generation else { return }
+            await backendRouter.use(selectedBackend)
+            await broker.clearCache()
+            guard providerConfigurationGeneration == generation else { return }
+            prewarmProvider(configuration: configuration, generation: generation)
+        }
+        providerTransitionTask = transition
+    }
+
+    @objc private func verifyProvider() {
+        let configuration = providerConfiguration
+        let generation = providerConfigurationGeneration
+        engineStatus = (
+            configuration.provider == .llama ? "正在验证本地模型" : "正在验证 GPT 订阅",
+            nil
+        )
+        settingsWindow.setProviderVerifying()
         Task { [weak self] in
             guard let self else { return }
             do {
-                let account = try await codex.accountStatus(refreshToken: true)
-                guard account.isAuthenticated else {
-                    codexAccountAuthenticated = false
-                    updateCodexStatus("尚未登录 ChatGPT", succeeded: false)
-                    return
+                switch configuration.provider {
+                case .codex:
+                    let account = try await codex.accountStatus(refreshToken: true)
+                    guard providerConfigurationGeneration == generation else { return }
+                    guard account.isAuthenticated else {
+                        codexAccountAuthenticated = false
+                        updateEngineStatus("尚未登录 ChatGPT", succeeded: false)
+                        return
+                    }
+                    try await codex.prewarm()
+                    guard providerConfigurationGeneration == generation else { return }
+                    codexAccountAuthenticated = true
+                    updateEngineStatus(accountSummary(account), succeeded: true)
+                case .llama:
+                    let output = try await llama.translate(
+                        TranslationBatchRequest(
+                            items: [
+                                TranslationItem(
+                                    id: "provider-check",
+                                    text: "Gloss local translation is ready."
+                                )
+                            ],
+                            targetLanguage: "Chinese (Simplified)",
+                            profile: .natural,
+                            contentKind: .selection
+                        )
+                    )
+                    guard providerConfigurationGeneration == generation else { return }
+                    guard output.first?.text.isEmpty == false else {
+                        throw TranslationError.invalidResponse("本地模型验证返回了空译文。")
+                    }
+                    updateEngineStatus("Hy-MT2-1.8B Q4 · 本地翻译已就绪", succeeded: true)
                 }
-                try await codex.prewarm()
-                codexAccountAuthenticated = true
-                updateCodexStatus(accountSummary(account), succeeded: true)
             } catch {
-                updateCodexStatus(error.localizedDescription, succeeded: false)
+                guard providerConfigurationGeneration == generation else { return }
+                if configuration.provider == .codex {
+                    codexAccountAuthenticated = false
+                }
+                updateEngineStatus(error.localizedDescription, succeeded: false)
             }
         }
     }
 
-    private func prewarmCodex() {
+    private func prewarmProvider() {
+        let configuration = providerConfiguration
+        let generation = providerConfigurationGeneration
+        prewarmProvider(configuration: configuration, generation: generation)
+    }
+
+    private func prewarmProvider(
+        configuration: TranslationProviderConfiguration,
+        generation: UUID
+    ) {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let account = try await codex.accountStatus()
-                guard account.isAuthenticated else {
-                    codexAccountAuthenticated = false
-                    updateCodexStatus("尚未登录 ChatGPT · 点击登录", succeeded: false)
-                    settingsWindow.show()
-                    return
+                switch configuration.provider {
+                case .codex:
+                    let account = try await codex.accountStatus()
+                    guard providerConfigurationGeneration == generation else { return }
+                    guard account.isAuthenticated else {
+                        codexAccountAuthenticated = false
+                        updateEngineStatus("尚未登录 ChatGPT · 点击登录", succeeded: false)
+                        settingsWindow.show()
+                        return
+                    }
+                    try await codex.prewarm()
+                    guard providerConfigurationGeneration == generation else { return }
+                    codexAccountAuthenticated = true
+                    updateEngineStatus(accountSummary(account), succeeded: true)
+                case .llama:
+                    try await llama.prewarm()
+                    guard providerConfigurationGeneration == generation else { return }
+                    updateEngineStatus("Hy-MT2-1.8B Q4 · 本地引擎已就绪", succeeded: true)
                 }
-                try await codex.prewarm()
-                codexAccountAuthenticated = true
-                updateCodexStatus(accountSummary(account), succeeded: true)
             } catch {
-                updateCodexStatus(error.localizedDescription, succeeded: false)
+                guard providerConfigurationGeneration == generation else { return }
+                updateEngineStatus(error.localizedDescription, succeeded: false)
             }
         }
     }
@@ -1105,7 +1279,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !codexLoginInProgress else { return }
         codexLoginInProgress = true
         settingsWindow.setCodexLoginInProgress()
-        codexStatus = ("等待 ChatGPT 登录", nil)
+        engineStatus = ("等待 ChatGPT 登录", nil)
         statusItem.menu = buildMenu()
         Task { [weak self] in
             guard let self else { return }
@@ -1120,7 +1294,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 codexLoginInProgress = false
                 codexAccountAuthenticated = true
                 runtimeLog.write("codex", "login_complete mode=\(account.authMode ?? "unknown")")
-                updateCodexStatus(accountSummary(account), succeeded: true)
+                updateEngineStatus(accountSummary(account), succeeded: true)
             } catch {
                 codexLoginInProgress = false
                 codexAccountAuthenticated = false
@@ -1128,7 +1302,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     "codex",
                     "login_failed error_type=\(String(reflecting: type(of: error)))"
                 )
-                updateCodexStatus(error.localizedDescription, succeeded: false)
+                updateEngineStatus(error.localizedDescription, succeeded: false)
             }
         }
     }
@@ -1148,9 +1322,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "ChatGPT 已登录 · 翻译引擎已就绪"
     }
 
-    private func updateCodexStatus(_ message: String, succeeded: Bool) {
-        codexStatus = (message, succeeded)
-        settingsWindowController?.showCodexResult(message, succeeded: succeeded)
+    private func updateEngineStatus(_ message: String, succeeded: Bool) {
+        engineStatus = (message, succeeded)
+        settingsWindowController?.showProviderResult(message, succeeded: succeeded)
         statusItem.menu = buildMenu()
     }
 
