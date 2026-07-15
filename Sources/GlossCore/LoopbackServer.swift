@@ -451,7 +451,7 @@ package final class LoopbackServer: @unchecked Sendable {
             } catch {
                 runtimeLog.write(
                     "bridge",
-                    "translation_failed duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error))) request_id=\(requestID)"
+                    "translation_failed duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error))) reason=\(error.localizedDescription) request_id=\(requestID)"
                 )
                 if headersSent {
                     try? await sendStreamEvent(

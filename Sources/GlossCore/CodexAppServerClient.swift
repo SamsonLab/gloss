@@ -243,7 +243,7 @@ public actor CodexAppServerClient: TranslationBackend {
             await resetFailedTurn(threadID: thread.id, turnID: turnID)
             runtimeLog.write(
                 "codex",
-                "translation_failed stage=turn duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error)))"
+                "translation_failed stage=turn duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error))) reason=\(error.localizedDescription)"
             )
             throw error
         }
