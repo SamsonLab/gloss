@@ -43,6 +43,10 @@ package final class LoopbackServer: @unchecked Sendable {
         let durationMs: Int
     }
 
+    private struct CancellationBody: Decodable {
+        let requestIds: [String]
+    }
+
     private struct TranslationResponse: Encodable {
         struct Item: Encodable {
             let id: String
@@ -67,6 +71,15 @@ package final class LoopbackServer: @unchecked Sendable {
 
     private struct ErrorResponse: Encodable {
         let error: String
+    }
+
+    private struct CancellationResponse: Encodable {
+        let cancelled: Int
+    }
+
+    private struct ActiveTranslationTask {
+        let token: UUID
+        var task: Task<Void, Never>?
     }
 
     private struct StreamEvent: Encodable {
@@ -101,6 +114,8 @@ package final class LoopbackServer: @unchecked Sendable {
     private let runtimeLog: GlossRuntimeLog
     private let token: String
     private let port: NWEndpoint.Port
+    private let activeTasksLock = NSLock()
+    private var activeTranslationTasks: [String: ActiveTranslationTask] = [:]
     private var listener: NWListener?
     package var onStateChange: (@Sendable (State) -> Void)?
 
@@ -159,6 +174,7 @@ package final class LoopbackServer: @unchecked Sendable {
 
     package func stop() {
         runtimeLog.write("bridge", "stop")
+        cancelAllTranslationTasks()
         listener?.cancel()
         listener = nil
     }
@@ -272,6 +288,11 @@ package final class LoopbackServer: @unchecked Sendable {
                 origin: origin,
                 to: connection
             )
+            return
+        }
+
+        if request.method == "POST", request.path == "/cancel" {
+            cancelTranslations(request, origin: origin, connection: connection)
             return
         }
 
@@ -405,7 +426,8 @@ package final class LoopbackServer: @unchecked Sendable {
             return
         }
 
-        Task {
+        startTranslationTask(requestID: requestID) { [weak self] in
+            guard let self else { return }
             do {
                 let outputs = try await broker.translate(translationRequest)
                 runtimeLog.write(
@@ -442,7 +464,8 @@ package final class LoopbackServer: @unchecked Sendable {
         origin: String?,
         connection: NWConnection
     ) {
-        Task {
+        startTranslationTask(requestID: requestID) { [weak self] in
+            guard let self else { return }
             var headersSent = false
             var count = 0
             var firstItemMilliseconds: Int?
@@ -464,12 +487,19 @@ package final class LoopbackServer: @unchecked Sendable {
                     )
                     count += 1
                 }
+                try Task.checkCancellation()
                 try await sendStreamEvent(StreamEvent(type: "done", count: count), to: connection)
                 try await finishStream(connection)
                 runtimeLog.write(
                     "bridge",
                     "translation_complete items=\(count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) first_item_complete_ms=\(firstItemMilliseconds ?? -1) request_id=\(requestID)"
                 )
+            } catch is CancellationError {
+                runtimeLog.write(
+                    "bridge",
+                    "translation_cancelled duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) request_id=\(requestID)"
+                )
+                connection.cancel()
             } catch {
                 runtimeLog.write(
                     "bridge",
@@ -491,6 +521,82 @@ package final class LoopbackServer: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    private func cancelTranslations(
+        _ request: HTTPRequest,
+        origin: String?,
+        connection: NWConnection
+    ) {
+        guard let body = try? JSONDecoder().decode(CancellationBody.self, from: request.body) else {
+            sendJSON(ErrorResponse(error: "Invalid cancellation payload."), status: 400, origin: origin, to: connection)
+            return
+        }
+        let requestIDs = Array(Set(body.requestIds.map(safeRequestID).filter { $0 != "none" }))
+        guard !requestIDs.isEmpty, requestIDs.count <= Self.maximumItems else {
+            sendJSON(ErrorResponse(error: "Invalid cancellation payload."), status: 422, origin: origin, to: connection)
+            return
+        }
+        let cancelled = cancelTranslationTasks(requestIDs)
+        runtimeLog.write("bridge", "translation_cancel requested=\(requestIDs.count) cancelled=\(cancelled)")
+        sendJSON(
+            CancellationResponse(cancelled: cancelled),
+            status: 200,
+            origin: origin,
+            to: connection
+        )
+    }
+
+    private func startTranslationTask(
+        requestID: String,
+        operation: @escaping @Sendable () async -> Void
+    ) {
+        let taskID = requestID == "none" ? "anonymous-\(UUID().uuidString)" : requestID
+        let token = UUID()
+        activeTasksLock.lock()
+        let previousTask = activeTranslationTasks.updateValue(
+            ActiveTranslationTask(token: token, task: nil),
+            forKey: taskID
+        )?.task
+        activeTasksLock.unlock()
+        previousTask?.cancel()
+
+        let task = Task { [weak self] in
+            await operation()
+            self?.finishTranslationTask(taskID, token: token)
+        }
+        activeTasksLock.lock()
+        if activeTranslationTasks[taskID]?.token == token {
+            activeTranslationTasks[taskID]?.task = task
+            activeTasksLock.unlock()
+        } else {
+            activeTasksLock.unlock()
+            task.cancel()
+        }
+    }
+
+    private func finishTranslationTask(_ requestID: String, token: UUID) {
+        activeTasksLock.lock()
+        if activeTranslationTasks[requestID]?.token == token {
+            activeTranslationTasks.removeValue(forKey: requestID)
+        }
+        activeTasksLock.unlock()
+    }
+
+    private func cancelTranslationTasks(_ requestIDs: [String]) -> Int {
+        activeTasksLock.lock()
+        let entries = requestIDs.compactMap { activeTranslationTasks.removeValue(forKey: $0) }
+        activeTasksLock.unlock()
+        entries.forEach { $0.task?.cancel() }
+        return entries.count
+    }
+
+    private func cancelAllTranslationTasks() {
+        activeTasksLock.lock()
+        let entries = Array(activeTranslationTasks.values)
+        activeTranslationTasks.removeAll(keepingCapacity: false)
+        activeTasksLock.unlock()
+        entries.forEach { $0.task?.cancel() }
     }
 
     private func recordBrowserMetric(

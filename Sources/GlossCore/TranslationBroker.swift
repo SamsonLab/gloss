@@ -1,5 +1,23 @@
 import Foundation
 
+private final class TranslationBatchCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<[String: String], Error>?
+
+    func setTask(_ task: Task<[String: String], Error>) {
+        lock.lock()
+        self.task = task
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        let task = task
+        lock.unlock()
+        task?.cancel()
+    }
+}
+
 public actor TranslationBroker {
     private struct CacheKey: Hashable, Sendable {
         let text: String
@@ -143,7 +161,7 @@ public actor TranslationBroker {
         _ request: TranslationBatchRequest
     ) -> AsyncThrowingStream<TranslationOutput, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     _ = try await self.translateStreaming(request) { output in
                         continuation.yield(output)
@@ -152,6 +170,9 @@ public actor TranslationBroker {
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
             }
         }
     }
@@ -194,6 +215,7 @@ public actor TranslationBroker {
         }
 
         let newKeys = Set(representativeByKey.keys)
+        let cancellation = TranslationBatchCancellation()
         var batchTask: Task<[String: String], Error>?
         if !entries.isEmpty {
             let backendRequest = TranslationBatchRequest(
@@ -205,6 +227,7 @@ public actor TranslationBroker {
                 priority: request.priority
             )
             let originals = originalsByRepresentativeID
+            let expectedOutputCount = entries.count
             let backend = self.backend
             let task = Task<[String: String], Error> {
                 let outputs = try await backend.translate(backendRequest) { output in
@@ -221,12 +244,13 @@ public actor TranslationBroker {
                         throw TranslationError.invalidResponse("后端返回了重复 id：\(output.id)")
                     }
                 }
-                guard outputMap.count == entries.count else {
+                guard outputMap.count == expectedOutputCount else {
                     throw TranslationError.invalidResponse("返回数量与请求数量不一致。")
                 }
                 return outputMap
             }
             batchTask = task
+            cancellation.setTask(task)
             for entry in entries {
                 guard let key = keyByID[entry.id] else { continue }
                 inFlight[key] = Task<String, Error> {
@@ -239,45 +263,49 @@ public actor TranslationBroker {
             }
         }
 
-        do {
-            for (item, key, task) in waiting {
-                let value = try await task.value
-                translatedByID[item.id] = value
-                remember(value, for: key)
-                onOutput(TranslationOutput(id: item.id, text: value))
-            }
+        return try await withTaskCancellationHandler {
+            do {
+                for (item, key, task) in waiting {
+                    let value = try await task.value
+                    translatedByID[item.id] = value
+                    remember(value, for: key)
+                    onOutput(TranslationOutput(id: item.id, text: value))
+                }
 
-            if let batchTask {
-                let outputMap = try await batchTask.value
-                for representative in entries {
-                    guard let value = outputMap[representative.id],
-                        let originals = originalsByRepresentativeID[representative.id]
-                    else {
-                        throw TranslationError.invalidResponse("缺少项目 \(representative.id)。")
-                    }
-                    for item in originals {
-                        translatedByID[item.id] = value
-                        if let key = keyByID[item.id] {
-                            remember(value, for: key)
+                if let batchTask {
+                    let outputMap = try await batchTask.value
+                    for representative in entries {
+                        guard let value = outputMap[representative.id],
+                            let originals = originalsByRepresentativeID[representative.id]
+                        else {
+                            throw TranslationError.invalidResponse("缺少项目 \(representative.id)。")
+                        }
+                        for item in originals {
+                            translatedByID[item.id] = value
+                            if let key = keyByID[item.id] {
+                                remember(value, for: key)
+                            }
                         }
                     }
                 }
+                for key in newKeys {
+                    inFlight.removeValue(forKey: key)
+                }
+            } catch {
+                for key in newKeys {
+                    inFlight.removeValue(forKey: key)
+                }
+                throw error
             }
-            for key in newKeys {
-                inFlight.removeValue(forKey: key)
-            }
-        } catch {
-            for key in newKeys {
-                inFlight.removeValue(forKey: key)
-            }
-            throw error
-        }
 
-        return try request.items.map { item in
-            guard let value = translatedByID[item.id] else {
-                throw TranslationError.invalidResponse("缺少项目 \(item.id)。")
+            return try request.items.map { item in
+                guard let value = translatedByID[item.id] else {
+                    throw TranslationError.invalidResponse("缺少项目 \(item.id)。")
+                }
+                return TranslationOutput(id: item.id, text: value)
             }
-            return TranslationOutput(id: item.id, text: value)
+        } onCancel: {
+            cancellation.cancel()
         }
     }
 

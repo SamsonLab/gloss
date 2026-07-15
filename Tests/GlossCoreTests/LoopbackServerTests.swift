@@ -192,13 +192,74 @@ final class LoopbackServerTests: XCTestCase {
         XCTAssertEqual(injectedTarget.response.statusCode, 422)
     }
 
+    func testCancelEndpointStopsAnActiveTranslationTask() async throws {
+        let backend = CancellableBridgeBackend()
+        let cancelBaseURL = URL(string: "http://127.0.0.1:18788")!
+        let server = LoopbackServer(
+            broker: TranslationBroker(backend: backend),
+            token: token,
+            port: 18_788
+        )
+        try server.start()
+        defer { server.stop() }
+        _ = try await send(
+            request(
+                path: "/health",
+                headers: ["X-Gloss-Token": token, "Origin": origin],
+                baseURL: cancelBaseURL
+            ),
+            retryingConnection: true
+        )
+
+        let translationBody = try JSONSerialization.data(withJSONObject: [
+            "items": [["id": "slow", "text": "Wait for cancellation"]],
+            "targetLanguage": "Chinese (Simplified)",
+            "requestId": "cancel-me",
+        ])
+        let translationRequest = request(
+            path: "/translate/stream",
+            method: "POST",
+            headers: ["X-Gloss-Token": token, "Origin": origin],
+            body: translationBody,
+            baseURL: cancelBaseURL
+        )
+        let streamTask = Task {
+            try await URLSession.shared.data(for: translationRequest)
+        }
+        await waitForBackendState { await backend.hasStarted }
+
+        let cancelBody = try JSONSerialization.data(withJSONObject: [
+            "requestIds": ["cancel-me"]
+        ])
+        let cancellation = try await send(
+            request(
+                path: "/cancel",
+                method: "POST",
+                headers: ["X-Gloss-Token": token, "Origin": origin],
+                body: cancelBody,
+                baseURL: cancelBaseURL
+            )
+        )
+        XCTAssertEqual(cancellation.response.statusCode, 200)
+        let cancellationJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: cancellation.data) as? [String: Any]
+        )
+        XCTAssertEqual(cancellationJSON["cancelled"] as? Int, 1)
+        await waitForBackendState { await backend.wasCancelled }
+        let wasCancelled = await backend.wasCancelled
+        XCTAssertTrue(wasCancelled)
+        streamTask.cancel()
+        _ = try? await streamTask.value
+    }
+
     private func request(
         path: String,
         method: String = "GET",
         headers: [String: String] = [:],
-        body: Data? = nil
+        body: Data? = nil,
+        baseURL: URL? = nil
     ) -> URLRequest {
-        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        var request = URLRequest(url: (baseURL ?? self.baseURL).appendingPathComponent(path))
         request.httpMethod = method
         request.httpBody = body
         request.timeoutInterval = 2
@@ -227,10 +288,39 @@ final class LoopbackServerTests: XCTestCase {
         }
         throw try XCTUnwrap(lastError)
     }
+
+    private func waitForBackendState(
+        _ predicate: @escaping @Sendable () async -> Bool
+    ) async {
+        for _ in 0..<200 {
+            if await predicate() { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Timed out waiting for backend state.")
+    }
 }
 
 private actor BridgeBackend: TranslationBackend {
     func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput] {
         request.items.map { TranslationOutput(id: $0.id, text: "translated:\($0.text)") }
+    }
+}
+
+private actor CancellableBridgeBackend: TranslationBackend {
+    private(set) var hasStarted = false
+    private(set) var wasCancelled = false
+
+    func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput] {
+        hasStarted = true
+        return try await withTaskCancellationHandler {
+            try await Task.sleep(for: .seconds(30))
+            return request.items.map { TranslationOutput(id: $0.id, text: "late") }
+        } onCancel: {
+            Task { await self.markCancelled() }
+        }
+    }
+
+    private func markCancelled() {
+        wasCancelled = true
     }
 }

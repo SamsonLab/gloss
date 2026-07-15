@@ -118,6 +118,26 @@ final class LlamaRequestSchedulerTests: XCTestCase {
         await scheduler.release(occupiedTwo)
     }
 
+    func testCancellingQueuedWorkRemovesItsWaiter() async throws {
+        let scheduler = LlamaRequestScheduler()
+        let occupied = try await scheduler.acquire(priority: .background)
+        let queued = Task {
+            try await scheduler.acquire(priority: .background)
+        }
+        await waitForPendingCount(1, scheduler: scheduler)
+
+        queued.cancel()
+        do {
+            _ = try await queued.value
+            XCTFail("Cancelled scheduler work unexpectedly acquired a permit.")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let pendingCount = await scheduler.pendingCount()
+        XCTAssertEqual(pendingCount, 0)
+        await scheduler.release(occupied)
+    }
+
     private func recordAcquisition(
         _ label: String,
         priority: TranslationPriority,
