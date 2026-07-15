@@ -94,6 +94,67 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(launch.source, "external-cli")
     }
 
+    func testFastLaunchArgumentsDisableUnusedCodexSubsystems() {
+        let arguments = CodexAppServerClient.fastLaunchArguments(
+            reasoningEffort: .low,
+            modelCatalog: URL(fileURLWithPath: "/tmp/catalog with spaces.json")
+        )
+
+        XCTAssertTrue(arguments.contains("--session-source"))
+        XCTAssertTrue(arguments.contains("exec"))
+        XCTAssertTrue(arguments.contains("model_catalog_json=\"/tmp/catalog with spaces.json\""))
+        for feature in CodexAppServerClient.disabledCodexFeatures {
+            XCTAssertTrue(arguments.contains("features.\(feature)=false"))
+        }
+        XCTAssertTrue(arguments.contains("orchestrator.mcp.enabled=false"))
+        XCTAssertTrue(arguments.contains("skills.bundled.enabled=false"))
+        XCTAssertTrue(arguments.contains("mcp_servers={}"))
+    }
+
+    func testFastThreadStartUsesReusableThreadsAndHasNoToolsOrMCP() {
+        let params = CodexAppServerClient.fastThreadStartParameters(
+            workingDirectory: URL(fileURLWithPath: "/tmp/gloss-codex"),
+            model: "gpt-test"
+        )
+
+        XCTAssertEqual(params["ephemeral"], .bool(false))
+        XCTAssertEqual(params["dynamicTools"], .array([]))
+        XCTAssertEqual(params["model"], .string("gpt-test"))
+        let config = params["config"]
+        XCTAssertEqual(config?["mcp_servers"], .object([:]))
+        for feature in CodexAppServerClient.disabledCodexFeatures {
+            XCTAssertEqual(config?["features"]?[feature], .bool(false))
+        }
+        XCTAssertEqual(config?["orchestrator"]?["mcp"]?["enabled"], .bool(false))
+        XCTAssertEqual(config?["skills"]?["bundled"]?["enabled"], .bool(false))
+    }
+
+    func testPreparesMinimalStaticCatalogForSelectedModel() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let catalogURL = try CodexAppServerClient.prepareModelCatalog(
+            in: directory,
+            model: "gpt-test",
+            reasoningEffort: .minimal
+        )
+        let catalog = try JSONDecoder().decode(
+            JSONValue.self,
+            from: Data(contentsOf: catalogURL)
+        )
+
+        guard case .array(let models) = catalog["models"] else {
+            return XCTFail("Expected a model catalog array")
+        }
+        XCTAssertEqual(models.count, 1)
+        XCTAssertEqual(models[0]["slug"], .string("gpt-test"))
+        XCTAssertEqual(models[0]["default_reasoning_level"], .string("minimal"))
+        let attributes = try FileManager.default.attributesOfItem(atPath: catalogURL.path)
+        XCTAssertEqual(attributes[.posixPermissions] as? NSNumber, NSNumber(value: 0o600))
+    }
+
     func testParsesSignedOutAndChatGPTAccountStates() throws {
         let signedOut = try CodexAppServerClient.parseAccountStatus(
             .object([
