@@ -79,6 +79,82 @@ final class LlamaServerClientTests: XCTestCase {
     }
 }
 
+final class LlamaRequestSchedulerTests: XCTestCase {
+    func testBackgroundWorkKeepsOneSlotAvailableForInteractiveRequests() async throws {
+        let scheduler = LlamaRequestScheduler()
+        let firstBackground = try await scheduler.acquire(priority: .background)
+        let secondBackground = Task {
+            try await scheduler.acquire(priority: .background)
+        }
+
+        await waitForPendingCount(1, scheduler: scheduler)
+        let interactive = try await scheduler.acquire(priority: .interactive)
+        let pendingCount = await scheduler.pendingCount()
+        XCTAssertEqual(pendingCount, 1)
+
+        await scheduler.release(interactive)
+        await scheduler.release(firstBackground)
+        let finalBackground = try await secondBackground.value
+        await scheduler.release(finalBackground)
+    }
+
+    func testQueuedWorkRunsByPriorityThenFIFO() async throws {
+        let scheduler = LlamaRequestScheduler()
+        let occupiedOne = try await scheduler.acquire(priority: .interactive)
+        let occupiedTwo = try await scheduler.acquire(priority: .interactive)
+        let order = AcquisitionOrder()
+
+        let background = recordAcquisition("background", priority: .background, scheduler: scheduler, order: order)
+        await waitForPendingCount(1, scheduler: scheduler)
+        let visible = recordAcquisition("visible", priority: .visible, scheduler: scheduler, order: order)
+        await waitForPendingCount(2, scheduler: scheduler)
+        let interactive = recordAcquisition("interactive", priority: .interactive, scheduler: scheduler, order: order)
+        await waitForPendingCount(3, scheduler: scheduler)
+
+        await scheduler.release(occupiedOne)
+        _ = try await (interactive.value, visible.value, background.value)
+        let recordedOrder = await order.values()
+        XCTAssertEqual(recordedOrder, ["interactive", "visible", "background"])
+        await scheduler.release(occupiedTwo)
+    }
+
+    private func recordAcquisition(
+        _ label: String,
+        priority: TranslationPriority,
+        scheduler: LlamaRequestScheduler,
+        order: AcquisitionOrder
+    ) -> Task<Void, Error> {
+        Task {
+            let permit = try await scheduler.acquire(priority: priority)
+            await order.append(label)
+            await scheduler.release(permit)
+        }
+    }
+
+    private func waitForPendingCount(
+        _ expected: Int,
+        scheduler: LlamaRequestScheduler
+    ) async {
+        for _ in 0..<100 {
+            if await scheduler.pendingCount() == expected { return }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        XCTFail("Scheduler did not reach pending count \(expected).")
+    }
+}
+
+private actor AcquisitionOrder {
+    private var recorded: [String] = []
+
+    func append(_ value: String) {
+        recorded.append(value)
+    }
+
+    func values() -> [String] {
+        recorded
+    }
+}
+
 final class TranslationBackendRouterTests: XCTestCase {
     func testSwitchesBackendWithoutReplacingBroker() async throws {
         let first = RoutedBackend(prefix: "first")

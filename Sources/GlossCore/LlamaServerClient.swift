@@ -18,6 +18,107 @@ struct LlamaRuntimeLaunch: Equatable, Sendable {
     let source: String
 }
 
+actor LlamaRequestScheduler {
+    struct Permit: Hashable, Sendable {
+        fileprivate let id: UUID
+    }
+
+    private struct Waiter {
+        let id: UUID
+        let priority: TranslationPriority
+        let sequence: Int
+        let enqueuedAt: UInt64
+        let continuation: CheckedContinuation<Permit, Error>
+    }
+
+    private let capacity: Int
+    private let backgroundCapacity: Int
+    private let agingIntervalNanoseconds: UInt64
+    private var active: [UUID: TranslationPriority] = [:]
+    private var waiters: [Waiter] = []
+    private var nextSequence = 0
+
+    init(
+        capacity: Int = 2,
+        reservedForegroundSlots: Int = 1,
+        agingIntervalNanoseconds: UInt64 = 2_000_000_000
+    ) {
+        self.capacity = max(1, capacity)
+        self.backgroundCapacity = max(0, capacity - max(0, reservedForegroundSlots))
+        self.agingIntervalNanoseconds = max(1, agingIntervalNanoseconds)
+    }
+
+    func acquire(priority: TranslationPriority) async throws -> Permit {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                let waiter = Waiter(
+                    id: id,
+                    priority: priority,
+                    sequence: nextSequence,
+                    enqueuedAt: DispatchTime.now().uptimeNanoseconds,
+                    continuation: continuation
+                )
+                nextSequence += 1
+                waiters.append(waiter)
+                drain()
+            }
+        } onCancel: {
+            Task { await self.cancelWaiting(id) }
+        }
+    }
+
+    func release(_ permit: Permit) {
+        guard active.removeValue(forKey: permit.id) != nil else { return }
+        drain()
+    }
+
+    func pendingCount() -> Int {
+        waiters.count
+    }
+
+    private func cancelWaiting(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func drain() {
+        while active.count < capacity {
+            guard let index = nextEligibleWaiterIndex() else { return }
+            let waiter = waiters.remove(at: index)
+            active[waiter.id] = waiter.priority
+            waiter.continuation.resume(returning: Permit(id: waiter.id))
+        }
+    }
+
+    private func nextEligibleWaiterIndex() -> Int? {
+        let backgroundActive = active.values.filter { $0 == .background }.count
+        let now = DispatchTime.now().uptimeNanoseconds
+        return waiters.indices
+            .filter { index in
+                waiters[index].priority != .background || backgroundActive < backgroundCapacity
+            }
+            .max { leftIndex, rightIndex in
+                let left = waiters[leftIndex]
+                let right = waiters[rightIndex]
+                let leftScore = effectiveRank(left, now: now)
+                let rightScore = effectiveRank(right, now: now)
+                if leftScore == rightScore {
+                    return left.sequence > right.sequence
+                }
+                return leftScore < rightScore
+            }
+    }
+
+    private func effectiveRank(_ waiter: Waiter, now: UInt64) -> Int {
+        let age = now >= waiter.enqueuedAt ? now - waiter.enqueuedAt : 0
+        let promotion = min(2, Int(age / agingIntervalNanoseconds))
+        return min(TranslationPriority.interactive.rank, waiter.priority.rank + promotion)
+    }
+}
+
 public actor LlamaServerClient: TranslationBackend {
     private struct ChatRequest: Encodable {
         struct Message: Encodable {
@@ -69,6 +170,7 @@ public actor LlamaServerClient: TranslationBackend {
     private let startupTimeout: Duration
     private let requestTimeout: TimeInterval
     private let session: URLSession
+    private let requestScheduler = LlamaRequestScheduler()
     private var process: Process?
     private var endpoint: URL?
     private var apiKey = ""
@@ -123,12 +225,20 @@ public actor LlamaServerClient: TranslationBackend {
             let outputs = try await withThrowingTaskGroup(of: TranslationOutput.self) { group in
                 for item in request.items {
                     group.addTask { [self] in
-                        let text = try await translateItem(
-                            item,
-                            request: request,
-                            glossary: glossary
-                        )
-                        return TranslationOutput(id: item.id, text: text)
+                        let permit = try await requestScheduler.acquire(priority: request.priority)
+                        do {
+                            try Task.checkCancellation()
+                            let text = try await translateItem(
+                                item,
+                                request: request,
+                                glossary: glossary
+                            )
+                            await requestScheduler.release(permit)
+                            return TranslationOutput(id: item.id, text: text)
+                        } catch {
+                            await requestScheduler.release(permit)
+                            throw error
+                        }
                     }
                 }
 
