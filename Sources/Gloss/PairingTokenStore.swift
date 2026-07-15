@@ -5,6 +5,10 @@ enum PairingTokenStore {
     private static let directoryName = "Gloss"
     private static let fileName = "browser-pairing-token"
     private static let safariAppGroup = "group.com.samsoncj.gloss"
+    private static let safariSharingQueue = DispatchQueue(
+        label: "com.samsoncj.gloss.safari-pairing",
+        qos: .utility
+    )
 
     static func loadOrCreate() throws -> String {
         let fileManager = FileManager.default
@@ -40,7 +44,9 @@ enum PairingTokenStore {
     }
 
     private static func shareWithSafari(_ token: String) {
-        UserDefaults(suiteName: safariAppGroup)?.set(token, forKey: fileName)
+        safariSharingQueue.async {
+            UserDefaults(suiteName: safariAppGroup)?.set(token, forKey: fileName)
+        }
     }
 
     private static func applicationSupportDirectory() throws -> URL {
