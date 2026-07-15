@@ -50,7 +50,7 @@ tail -f ~/Library/Logs/Gloss/gloss.log
 
 ## 前置条件
 
-1. GPT 订阅：首次启动时，在 Gloss 设置中点击“登录 ChatGPT”。不需要单独安装 Codex CLI 或 Node.js。
+1. GPT 订阅：首次启动时，在 Gloss 设置中点击“登录 ChatGPT”。默认构建不需要单独安装 Codex CLI 或 Node.js；CLI 构建需要用户已安装支持 `app-server` 的 Codex CLI。
 2. 本地模型：安装 `llama.cpp`（`brew install llama.cpp`），然后在翻译引擎中选择“本地模型”。首次启动会从 Hugging Face 下载约 1.1 GB 的 Q4 模型。
 3. 首次使用选区翻译时，在系统设置中允许 Gloss 使用“辅助功能”。
 4. Chrome：在 Gloss 设置中点“显示扩展”，从 `chrome://extensions` 加载这个已自动配对的目录。
@@ -88,7 +88,7 @@ GLOSS_CODEX_MAX_CONCURRENCY=3 \
 swift run gloss-cli 'Hello from Gloss.'
 ```
 
-`GLOSS_CODEX_BIN` 仍保留为外部 Codex CLI 的开发兼容选项；产品构建始终优先使用 App 内置 runtime。
+`GLOSS_CODEX_BIN` 可覆盖外部 Codex CLI 路径。默认构建优先使用 App 内置 runtime；CLI 构建只使用用户安装的 Codex CLI。
 
 未设置时使用 `gpt-5.3-codex-spark`；并发数默认 3，可配置范围为 1–8。
 
@@ -108,6 +108,14 @@ open dist/Gloss.app
 ```
 
 构建脚本会按 `CodexRuntime.lock` 下载并校验固定版本的官方 Rust app-server，把它与许可证一起嵌入 App；本地 provider 当前复用系统安装的 `llama-server`。随后脚本在相邻的 `personal-immersive-translator` 仓库中生成 Chrome/Safari 产物，并把 Chrome 资源与 Safari `.appex` 嵌入 App。结果位于 `dist/Gloss.app`。脚本会优先使用钥匙串中的第一个 Apple Development 身份；没有可用证书时退回临时签名，此时 Safari 配对不可用。正式分发前需要换成 Developer ID 签名和公证。
+
+如果不希望下载或嵌入固定 Rust app-server，可构建依赖用户 Codex CLI 的轻量版本：
+
+```bash
+./Scripts/build_app_with_codex_cli.sh
+```
+
+该脚本会先确认当前环境中的 `codex app-server` 可用，但不会把 Codex runtime、许可证或版本锁文件放入 App。运行时 Gloss 会查找 `GLOSS_CODEX_BIN`、`PATH`、Homebrew 与常用本地安装路径，并执行 `codex app-server --listen stdio://`。进程与 thread 仍统一经过 `CodexAppServerClient`，因此会复用相同的静态模型目录、隔离工作目录和 MCP/skills/tools 禁用配置，不会退回较慢的默认启动方式。
 
 需要稳定的本机开发签名时，可显式传入钥匙串中的证书：
 

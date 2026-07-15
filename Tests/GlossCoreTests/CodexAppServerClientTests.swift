@@ -100,8 +100,7 @@ final class CodexAppServerClientTests: XCTestCase {
             modelCatalog: URL(fileURLWithPath: "/tmp/catalog with spaces.json")
         )
 
-        XCTAssertTrue(arguments.contains("--session-source"))
-        XCTAssertTrue(arguments.contains("exec"))
+        XCTAssertFalse(arguments.contains("--session-source"))
         XCTAssertTrue(arguments.contains("model_catalog_json=\"/tmp/catalog with spaces.json\""))
         for feature in CodexAppServerClient.disabledCodexFeatures {
             XCTAssertTrue(arguments.contains("features.\(feature)=false"))

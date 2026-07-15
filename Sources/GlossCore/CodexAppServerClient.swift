@@ -1355,7 +1355,6 @@ public actor CodexAppServerClient: TranslationBackend {
     ) -> [String] {
         var arguments = [
             "--listen", "stdio://",
-            "--session-source", "exec",
             "-c", "model_catalog_json=\(tomlString(modelCatalog.path))",
             "-c", "model_reasoning_summary=\"none\"",
             "-c", "model_reasoning_effort=\"\(reasoningEffort.rawValue)\"",
