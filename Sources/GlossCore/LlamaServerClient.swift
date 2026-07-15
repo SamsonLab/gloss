@@ -32,7 +32,7 @@ actor LlamaRequestScheduler {
     }
 
     private let capacity: Int
-    private let backgroundCapacity: Int
+    private let nonInteractiveCapacity: Int
     private let agingIntervalNanoseconds: UInt64
     private var active: [UUID: TranslationPriority] = [:]
     private var waiters: [Waiter] = []
@@ -40,11 +40,16 @@ actor LlamaRequestScheduler {
 
     init(
         capacity: Int = 2,
-        reservedForegroundSlots: Int = 1,
+        reservedInteractiveSlots: Int = 1,
         agingIntervalNanoseconds: UInt64 = 2_000_000_000
     ) {
-        self.capacity = max(1, capacity)
-        self.backgroundCapacity = max(0, capacity - max(0, reservedForegroundSlots))
+        let capacity = max(1, capacity)
+        let reservedInteractiveSlots = min(
+            max(0, reservedInteractiveSlots),
+            max(0, capacity - 1)
+        )
+        self.capacity = capacity
+        self.nonInteractiveCapacity = capacity - reservedInteractiveSlots
         self.agingIntervalNanoseconds = max(1, agingIntervalNanoseconds)
     }
 
@@ -94,11 +99,12 @@ actor LlamaRequestScheduler {
     }
 
     private func nextEligibleWaiterIndex() -> Int? {
-        let backgroundActive = active.values.filter { $0 == .background }.count
+        let nonInteractiveActive = active.values.filter { $0 != .interactive }.count
         let now = DispatchTime.now().uptimeNanoseconds
         return waiters.indices
             .filter { index in
-                waiters[index].priority != .background || backgroundActive < backgroundCapacity
+                waiters[index].priority == .interactive
+                    || nonInteractiveActive < nonInteractiveCapacity
             }
             .max { leftIndex, rightIndex in
                 let left = waiters[leftIndex]
@@ -162,6 +168,9 @@ public actor LlamaServerClient: TranslationBackend {
     }
 
     private static let alias = "gloss-local"
+    static let batchSeparatorMarker = "<|GLOSS_TRANSLATION_SPLIT|>"
+    private static let maximumBatchItems = 4
+    private static let maximumBatchCharacters = 1_000
     private static let maximumRecentOutputBytes = 16_384
 
     private let environment: [String: String]
@@ -222,37 +231,31 @@ public actor LlamaServerClient: TranslationBackend {
             (try? await glossaryStore.matchingTerms(in: request.items.map(\.text))) ?? []
 
         do {
-            let outputs = try await withThrowingTaskGroup(of: TranslationOutput.self) { group in
-                for item in request.items {
-                    group.addTask { [self] in
-                        let permit = try await requestScheduler.acquire(priority: request.priority)
-                        do {
-                            try Task.checkCancellation()
-                            let text = try await translateItem(
-                                item,
-                                request: request,
-                                glossary: glossary
-                            )
-                            await requestScheduler.release(permit)
-                            return TranslationOutput(id: item.id, text: text)
-                        } catch {
-                            await requestScheduler.release(permit)
-                            throw error
-                        }
-                    }
-                }
+            let units = Self.translationUnits(for: request.items)
+            GlossRuntimeLog.shared.write(
+                "llama",
+                "translation_plan items=\(request.items.count) units=\(units.count) batched=\(units.filter { $0.count > 1 }.count)"
+            )
+            var outputs: [TranslationOutput] = []
+            outputs.reserveCapacity(request.items.count)
 
-                var outputsByID: [String: TranslationOutput] = [:]
-                for try await output in group {
-                    outputsByID[output.id] = output
-                    onOutput?(output)
+            for unit in units {
+                let permit = try await requestScheduler.acquire(priority: request.priority)
+                let translatedUnit: [TranslationOutput]
+                do {
+                    try Task.checkCancellation()
+                    translatedUnit = try await translateUnit(
+                        unit,
+                        request: request,
+                        glossary: glossary
+                    )
+                    await requestScheduler.release(permit)
+                } catch {
+                    await requestScheduler.release(permit)
+                    throw error
                 }
-                return try request.items.map { item in
-                    guard let output = outputsByID[item.id] else {
-                        throw TranslationError.invalidResponse("本地模型缺少项目 \(item.id)。")
-                    }
-                    return output
-                }
+                outputs.append(contentsOf: translatedUnit)
+                translatedUnit.forEach { onOutput?($0) }
             }
             GlossRuntimeLog.shared.write(
                 "llama",
@@ -281,7 +284,7 @@ public actor LlamaServerClient: TranslationBackend {
         )
     }
 
-    public func stop() {
+    public func stop() async {
         startupTask?.cancel()
         startupTask = nil
         endpoint = nil
@@ -296,10 +299,12 @@ public actor LlamaServerClient: TranslationBackend {
         if let pipe = runningProcess?.standardError as? Pipe {
             pipe.fileHandleForReading.readabilityHandler = nil
         }
-        if runningProcess?.isRunning == true {
-            runningProcess?.terminate()
+        let forced = if let runningProcess {
+            await Self.terminateProcess(runningProcess)
+        } else {
+            false
         }
-        GlossRuntimeLog.shared.write("llama", "stop")
+        GlossRuntimeLog.shared.write("llama", "stop forced=\(forced)")
     }
 
     private func ensureReady() async throws {
@@ -318,9 +323,30 @@ public actor LlamaServerClient: TranslationBackend {
         } catch {
             startupTask = nil
             lastError = error.localizedDescription
-            stop()
+            GlossRuntimeLog.shared.write(
+                "llama",
+                "startup_failed error=\(error.localizedDescription)"
+            )
+            await stop()
             throw error
         }
+    }
+
+    @discardableResult
+    static func terminateProcess(
+        _ process: Process,
+        gracePeriod: Duration = .seconds(1)
+    ) async -> Bool {
+        guard process.isRunning else { return false }
+        process.terminate()
+        let deadline = ContinuousClock.now.advanced(by: gracePeriod)
+        while process.isRunning, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        guard process.isRunning else { return false }
+        Darwin.kill(process.processIdentifier, SIGKILL)
+        process.waitUntilExit()
+        return true
     }
 
     private func launchAndWaitUntilReady() async throws {
@@ -351,8 +377,13 @@ public actor LlamaServerClient: TranslationBackend {
             "--parallel", "2",
             "--gpu-layers", "99",
         ]
-        if FileManager.default.fileExists(atPath: modelReference) {
-            arguments += ["--model", modelReference]
+        let localModelPath = if FileManager.default.fileExists(atPath: modelReference) {
+            modelReference
+        } else {
+            Self.cachedModelPath(for: modelReference, environment: environment)
+        }
+        if let localModelPath {
+            arguments += ["--model", localModelPath]
         } else {
             arguments += ["--hf-repo", modelReference]
         }
@@ -385,7 +416,7 @@ public actor LlamaServerClient: TranslationBackend {
 
         GlossRuntimeLog.shared.write(
             "llama",
-            "launch_start source=\(runtime.source) model=\(modelReference)"
+            "launch_start source=\(runtime.source) model_source=\(localModelPath == nil ? "huggingface" : "local") model=\(modelReference)"
         )
         do {
             try process.run()
@@ -418,24 +449,86 @@ public actor LlamaServerClient: TranslationBackend {
         throw TranslationError.timedOut("llama-server startup")
     }
 
+    private func translateUnit(
+        _ items: [TranslationItem],
+        request: TranslationBatchRequest,
+        glossary: [GlossaryTerm]
+    ) async throws -> [TranslationOutput] {
+        guard items.count > 1,
+            !items.contains(where: { $0.text.contains(Self.batchSeparatorMarker) })
+        else {
+            return try await translateIndividually(items, request: request, glossary: glossary)
+        }
+
+        let sourceText = items.map(\.text).joined(
+            separator: "\n\n\(Self.batchSeparatorMarker)\n\n"
+        )
+        let prompt = Self.makePrompt(
+            sourceText: sourceText,
+            request: request,
+            glossary: glossary,
+            batchCount: items.count
+        )
+        let response = try await translatePrompt(
+            prompt,
+            sourceCharacterCount: items.reduce(0) { $0 + $1.text.count }
+        )
+
+        if let translations = Self.parseBatchTranslation(
+            response,
+            expectedCount: items.count
+        ) {
+            return zip(items, translations).map { item, text in
+                TranslationOutput(id: item.id, text: text)
+            }
+        }
+        GlossRuntimeLog.shared.write(
+            "llama",
+            "translation_batch_fallback items=\(items.count) reason=separator_mismatch"
+        )
+        return try await translateIndividually(items, request: request, glossary: glossary)
+    }
+
+    private func translateIndividually(
+        _ items: [TranslationItem],
+        request: TranslationBatchRequest,
+        glossary: [GlossaryTerm]
+    ) async throws -> [TranslationOutput] {
+        var outputs: [TranslationOutput] = []
+        outputs.reserveCapacity(items.count)
+        for item in items {
+            try Task.checkCancellation()
+            let text = try await translateItem(item, request: request, glossary: glossary)
+            outputs.append(TranslationOutput(id: item.id, text: text))
+        }
+        return outputs
+    }
+
     private func translateItem(
         _ item: TranslationItem,
         request: TranslationBatchRequest,
         glossary: [GlossaryTerm]
     ) async throws -> String {
-        guard let endpoint else {
-            throw TranslationError.backendUnavailable("llama-server 未运行。")
-        }
         let prompt = Self.makePrompt(
             sourceText: item.text,
             request: request,
             glossary: glossary
         )
+        return try await translatePrompt(prompt, sourceCharacterCount: item.text.count)
+    }
+
+    private func translatePrompt(
+        _ prompt: String,
+        sourceCharacterCount: Int
+    ) async throws -> String {
+        guard let endpoint else {
+            throw TranslationError.backendUnavailable("llama-server 未运行。")
+        }
         let body = ChatRequest(
             model: Self.alias,
             messages: [.init(role: "user", content: prompt)],
             temperature: 0,
-            maxTokens: min(4_096, max(128, item.text.count * 2))
+            maxTokens: min(4_096, max(128, sourceCharacterCount * 2))
         )
         var urlRequest = URLRequest(
             url: endpoint.appendingPathComponent("v1/chat/completions"),
@@ -507,10 +600,51 @@ public actor LlamaServerClient: TranslationBackend {
         return Self.nonBlank(output) ?? "llama-server 已退出。"
     }
 
+    static func translationUnits(for items: [TranslationItem]) -> [[TranslationItem]] {
+        guard let first = items.first else { return [] }
+        var units: [[TranslationItem]] = [[first]]
+        var current: [TranslationItem] = []
+        var currentCharacters = 0
+
+        for item in items.dropFirst() {
+            let itemCharacters = item.text.count
+            if !current.isEmpty,
+                current.count >= maximumBatchItems
+                    || currentCharacters + itemCharacters > maximumBatchCharacters
+            {
+                units.append(current)
+                current = []
+                currentCharacters = 0
+            }
+            current.append(item)
+            currentCharacters += itemCharacters
+        }
+        if !current.isEmpty {
+            units.append(current)
+        }
+        return units
+    }
+
+    static func parseBatchTranslation(
+        _ response: String,
+        expectedCount: Int
+    ) -> [String]? {
+        guard expectedCount > 1 else { return nil }
+        let parts = response
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: batchSeparatorMarker)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard parts.count == expectedCount, parts.allSatisfy({ !$0.isEmpty }) else {
+            return nil
+        }
+        return parts
+    }
+
     static func makePrompt(
         sourceText: String,
         request: TranslationBatchRequest,
-        glossary: [GlossaryTerm]
+        glossary: [GlossaryTerm],
+        batchCount: Int = 1
     ) -> String {
         var prompt: [String] = []
         if let context = request.context?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -530,6 +664,9 @@ public actor LlamaServerClient: TranslationBackend {
         }
         if request.contentKind == .ocr {
             command += ", correcting only unambiguous OCR artifacts"
+        }
+        if batchCount > 1 {
+            command += ". The source contains exactly \(batchCount) independent segments separated by \(batchSeparatorMarker). Translate every segment independently and return exactly \(batchCount) translations in the original order, separated by the exact same marker"
         }
         command += ". Preserve names, numbers, URLs, identifiers, commands, code-like tokens, paragraph breaks, and newline structure. Note that you must ONLY output the translated result without any additional explanation:"
         prompt += [command, sourceText]
@@ -580,6 +717,69 @@ public actor LlamaServerClient: TranslationBackend {
             return nil
         }
         return LlamaRuntimeLaunch(executable: executable, source: "external")
+    }
+
+    static func cachedModelPath(
+        for modelReference: String,
+        environment: [String: String]
+    ) -> String? {
+        let parts = modelReference.split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return nil }
+        let repositoryParts = parts[0].split(separator: "/")
+        guard repositoryParts.count == 2,
+            repositoryParts.allSatisfy({ $0 != "." && $0 != ".." }),
+            !parts[1].isEmpty
+        else { return nil }
+
+        var cacheRoots: [URL] = []
+        if let path = nonBlank(environment["HF_HUB_CACHE"]) {
+            cacheRoots.append(URL(fileURLWithPath: path, isDirectory: true))
+        }
+        if let path = nonBlank(environment["HF_HOME"]) {
+            cacheRoots.append(
+                URL(fileURLWithPath: path, isDirectory: true)
+                    .appendingPathComponent("hub", isDirectory: true)
+            )
+        }
+        if let path = nonBlank(environment["XDG_CACHE_HOME"]) {
+            cacheRoots.append(
+                URL(fileURLWithPath: path, isDirectory: true)
+                    .appendingPathComponent("huggingface/hub", isDirectory: true)
+            )
+        }
+        cacheRoots.append(
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+        )
+
+        let repositoryName = "models--" + parts[0].replacingOccurrences(of: "/", with: "--")
+        let quantization = parts[1]
+        for cacheRoot in cacheRoots {
+            let repository = cacheRoot.appendingPathComponent(repositoryName, isDirectory: true)
+            let reference = repository.appendingPathComponent("refs/main", isDirectory: false)
+            guard let revision = try? String(contentsOf: reference, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !revision.isEmpty,
+                revision.allSatisfy({ $0.isHexDigit })
+            else { continue }
+            let snapshot = repository
+                .appendingPathComponent("snapshots", isDirectory: true)
+                .appendingPathComponent(revision, isDirectory: true)
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: snapshot,
+                includingPropertiesForKeys: nil
+            ) else { continue }
+            if let model = files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+                .first(where: {
+                    $0.pathExtension.lowercased() == "gguf"
+                        && $0.lastPathComponent.localizedCaseInsensitiveContains(quantization)
+                }),
+                FileManager.default.fileExists(atPath: model.path)
+            {
+                return model.path
+            }
+        }
+        return nil
     }
 
     static func availableLoopbackPort() throws -> UInt16 {
