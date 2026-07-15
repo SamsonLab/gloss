@@ -57,6 +57,11 @@ package final class LoopbackServer: @unchecked Sendable {
         let name: String
         let version: String
         let backend: String
+        let provider: String
+        let model: String
+        let reasoning: String?
+        let configRevision: String
+        let warm: Bool
         let cacheSize: Int
     }
 
@@ -92,6 +97,7 @@ package final class LoopbackServer: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "com.samsoncj.gloss.loopback", qos: .userInitiated)
     private let broker: TranslationBroker
+    private let providerStatus: @Sendable () async -> TranslationProviderStatus
     private let runtimeLog: GlossRuntimeLog
     private let token: String
     private let port: NWEndpoint.Port
@@ -102,9 +108,19 @@ package final class LoopbackServer: @unchecked Sendable {
         broker: TranslationBroker,
         token: String,
         port: UInt16 = 8787,
+        providerStatus: @escaping @Sendable () async -> TranslationProviderStatus = {
+            TranslationProviderStatus(
+                provider: .codex,
+                model: TranslationProviderConfiguration.defaultCodexModel,
+                reasoningEffort: .low,
+                configurationRevision: "default",
+                isWarm: true
+            )
+        },
         runtimeLog: GlossRuntimeLog = .shared
     ) {
         self.broker = broker
+        self.providerStatus = providerStatus
         self.token = token
         self.port = NWEndpoint.Port(rawValue: port)!
         self.runtimeLog = runtimeLog
@@ -262,16 +278,22 @@ package final class LoopbackServer: @unchecked Sendable {
         if request.method == "GET", request.path == "/health" {
             Task {
                 let cacheSize = await broker.cacheCount()
+                let providerStatus = await providerStatus()
                 runtimeLog.write(
                     "bridge",
-                    "health status=200 duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) cache=\(cacheSize)"
+                    "health status=200 duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) provider=\(providerStatus.provider.rawValue) model=\(providerStatus.model) revision=\(providerStatus.configurationRevision) cache=\(cacheSize)"
                 )
                 sendJSON(
                     HealthResponse(
                         ok: true,
                         name: "Gloss",
                         version: "0.1.0",
-                        backend: "codex-app-server",
+                        backend: providerStatus.backendName,
+                        provider: providerStatus.provider.rawValue,
+                        model: providerStatus.model,
+                        reasoning: providerStatus.reasoningEffort?.rawValue,
+                        configRevision: providerStatus.configurationRevision,
+                        warm: providerStatus.isWarm,
                         cacheSize: cacheSize
                     ),
                     status: 200,

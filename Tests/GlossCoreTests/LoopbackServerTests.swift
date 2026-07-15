@@ -17,6 +17,14 @@ final class LoopbackServerTests: XCTestCase {
             broker: TranslationBroker(backend: BridgeBackend()),
             token: token,
             port: 18_787,
+            providerStatus: {
+                TranslationProviderStatus(
+                    provider: .llama,
+                    model: TranslationProviderConfiguration.defaultLlamaModel,
+                    configurationRevision: "provider-revision-1",
+                    isWarm: true
+                )
+            },
             runtimeLog: GlossRuntimeLog(directory: logDirectory)
         )
         try server.start()
@@ -62,7 +70,15 @@ final class LoopbackServerTests: XCTestCase {
         XCTAssertEqual(health.response.statusCode, 200)
         let healthJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: health.data) as? [String: Any])
         XCTAssertEqual(healthJSON["name"] as? String, "Gloss")
-        XCTAssertEqual(healthJSON["backend"] as? String, "codex-app-server")
+        XCTAssertEqual(healthJSON["backend"] as? String, "llama-server")
+        XCTAssertEqual(healthJSON["provider"] as? String, "llama")
+        XCTAssertEqual(
+            healthJSON["model"] as? String,
+            TranslationProviderConfiguration.defaultLlamaModel
+        )
+        XCTAssertEqual(healthJSON["configRevision"] as? String, "provider-revision-1")
+        XCTAssertEqual(healthJSON["warm"] as? Bool, true)
+        XCTAssertNil(healthJSON["reasoning"])
 
         let body = try JSONSerialization.data(withJSONObject: [
             "items": [["id": "first", "text": "Hello"]],

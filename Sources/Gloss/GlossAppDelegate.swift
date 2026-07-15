@@ -59,6 +59,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var codexLoginInProgress = false
     private var providerConfigurationGeneration = UUID()
     private var providerTransitionTask: Task<Void, Never>?
+    private lazy var activeProviderConfiguration = providerConfiguration
+    private var activeProviderRevision = UUID()
 
     private var glossBar: GlossBarController {
         if let glossBarController { return glossBarController }
@@ -1176,6 +1178,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard providerConfigurationGeneration == generation else { return }
             await backendRouter.use(selectedBackend)
             await broker.clearCache()
+            activeProviderConfiguration = configuration
+            activeProviderRevision = UUID()
             guard providerConfigurationGeneration == generation else { return }
             prewarmProvider(configuration: configuration, generation: generation)
         }
@@ -1454,7 +1458,22 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } catch {
                 extensionPreparationError = error.localizedDescription
             }
-            let server = LoopbackServer(broker: broker, token: token)
+            let server = LoopbackServer(
+                broker: broker,
+                token: token,
+                providerStatus: { [weak self] in
+                    guard let self else {
+                        return TranslationProviderStatus(
+                            provider: .codex,
+                            model: TranslationProviderConfiguration.defaultCodexModel,
+                            reasoningEffort: .low,
+                            configurationRevision: "unavailable",
+                            isWarm: false
+                        )
+                    }
+                    return await self.browserProviderStatus()
+                }
+            )
             server.onStateChange = { [weak self] state in
                 Task { @MainActor in
                     guard let self else { return }
@@ -1485,6 +1504,28 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             updateBrowserStatus(error.localizedDescription, succeeded: false)
         }
+    }
+
+    private func browserProviderStatus() async -> TranslationProviderStatus {
+        let configuration = activeProviderConfiguration
+        let isWarm: Bool
+        switch configuration.provider {
+        case .codex:
+            isWarm = true
+        case .llama:
+            isWarm = await llama.status().isRunning
+        }
+        return TranslationProviderStatus(
+            provider: configuration.provider,
+            model: configuration.provider == .codex
+                ? configuration.codexModel
+                : TranslationProviderConfiguration.defaultLlamaModel,
+            reasoningEffort: configuration.provider == .codex
+                ? configuration.codexReasoningEffort
+                : nil,
+            configurationRevision: activeProviderRevision.uuidString.lowercased(),
+            isWarm: isWarm
+        )
     }
 
     private func updateBrowserStatus(_ message: String, succeeded: Bool) {

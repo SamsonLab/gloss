@@ -56,6 +56,35 @@ public struct TranslationProviderConfiguration: Equatable, Sendable {
     }
 }
 
+public struct TranslationProviderStatus: Equatable, Sendable {
+    public let provider: TranslationProvider
+    public let model: String
+    public let reasoningEffort: CodexReasoningEffort?
+    public let configurationRevision: String
+    public let isWarm: Bool
+
+    public init(
+        provider: TranslationProvider,
+        model: String,
+        reasoningEffort: CodexReasoningEffort? = nil,
+        configurationRevision: String,
+        isWarm: Bool
+    ) {
+        self.provider = provider
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.configurationRevision = configurationRevision
+        self.isWarm = isWarm
+    }
+
+    public var backendName: String {
+        switch provider {
+        case .codex: "codex-app-server"
+        case .llama: "llama-server"
+        }
+    }
+}
+
 public actor TranslationBackendRouter: TranslationBackend {
     private var backend: any TranslationBackend
 
