@@ -150,6 +150,48 @@ final class CodexAppServerClientTests: XCTestCase {
         )
     }
 
+    func testTurnWaitStagesSplitTheWholeWaitWithoutOverlap() {
+        let milliseconds: (UInt64) -> UInt64 = { $0 * 1_000_000 }
+        let stages = CodexAppServerClient.turnWaitStages(
+            acceptedAt: milliseconds(1),
+            turnStartedAt: milliseconds(3),
+            agentMessageStartedAt: milliseconds(6),
+            firstDeltaAt: milliseconds(10),
+            lastDeltaAt: milliseconds(15),
+            agentMessageCompletedAt: milliseconds(21),
+            completedAt: milliseconds(28)
+        )
+
+        XCTAssertEqual(stages.dispatchMilliseconds, 2)
+        XCTAssertEqual(stages.modelWaitMilliseconds, 3)
+        XCTAssertEqual(stages.firstDeltaWaitMilliseconds, 4)
+        XCTAssertEqual(stages.outputStreamMilliseconds, 5)
+        XCTAssertEqual(stages.messageFinalizeMilliseconds, 6)
+        XCTAssertEqual(stages.turnFinalizeMilliseconds, 7)
+        XCTAssertEqual(stages.totalMilliseconds, 27)
+    }
+
+    func testTurnWaitStagesRemainAdditiveWhenLifecycleEventsAreMissing() {
+        let milliseconds: (UInt64) -> UInt64 = { $0 * 1_000_000 }
+        let stages = CodexAppServerClient.turnWaitStages(
+            acceptedAt: milliseconds(1),
+            turnStartedAt: nil,
+            agentMessageStartedAt: nil,
+            firstDeltaAt: milliseconds(10),
+            lastDeltaAt: milliseconds(14),
+            agentMessageCompletedAt: nil,
+            completedAt: milliseconds(21)
+        )
+
+        XCTAssertEqual(stages.dispatchMilliseconds, 0)
+        XCTAssertEqual(stages.modelWaitMilliseconds, 9)
+        XCTAssertEqual(stages.firstDeltaWaitMilliseconds, 0)
+        XCTAssertEqual(stages.outputStreamMilliseconds, 4)
+        XCTAssertEqual(stages.messageFinalizeMilliseconds, 0)
+        XCTAssertEqual(stages.turnFinalizeMilliseconds, 7)
+        XCTAssertEqual(stages.totalMilliseconds, 20)
+    }
+
     private func makeExecutable(at url: URL) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),

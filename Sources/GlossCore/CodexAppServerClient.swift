@@ -104,6 +104,33 @@ public actor CodexAppServerClient: TranslationBackend {
         var loggedFirstItem = false
     }
 
+    private struct TurnTimeline {
+        var turnStartedAt: UInt64?
+        var agentMessageStartedAt: UInt64?
+        var firstDeltaAt: UInt64?
+        var lastDeltaAt: UInt64?
+        var agentMessageCompletedAt: UInt64?
+        var turnCompletedAt: UInt64?
+    }
+
+    struct TurnWaitStages: Equatable {
+        let dispatchMilliseconds: Int
+        let modelWaitMilliseconds: Int
+        let firstDeltaWaitMilliseconds: Int
+        let outputStreamMilliseconds: Int
+        let messageFinalizeMilliseconds: Int
+        let turnFinalizeMilliseconds: Int
+
+        var totalMilliseconds: Int {
+            dispatchMilliseconds
+                + modelWaitMilliseconds
+                + firstDeltaWaitMilliseconds
+                + outputStreamMilliseconds
+                + messageFinalizeMilliseconds
+                + turnFinalizeMilliseconds
+        }
+    }
+
     private let logger = Logger(subsystem: "com.samsoncj.gloss", category: "Codex")
     private let runtimeLog = GlossRuntimeLog.shared
     private let environment: [String: String]
@@ -119,6 +146,7 @@ public actor CodexAppServerClient: TranslationBackend {
     private var turnContinuations: [String: CheckedContinuation<String, Error>] = [:]
     private var turnBuffers: [String: String] = [:]
     private var turnStreams: [String: TurnStreamState] = [:]
+    private var turnTimelines: [String: TurnTimeline] = [:]
     private var earlyTurnResults: [String: Result<String, Error>] = [:]
     private var threadIDs: [String] = []
     private var availableThreadIndices: [Int] = []
@@ -228,17 +256,28 @@ public actor CodexAppServerClient: TranslationBackend {
             let turnCompletedAt = DispatchTime.now().uptimeNanoseconds
             let translations = try validateModelOutput(output, request: request)
             finishTurnStream(turnID: startedTurnID, outputs: translations)
+            let timeline = turnTimelines.removeValue(forKey: startedTurnID) ?? TurnTimeline()
+            let turnWaitStages = Self.turnWaitStages(
+                acceptedAt: turnAcceptedAt,
+                turnStartedAt: timeline.turnStartedAt,
+                agentMessageStartedAt: timeline.agentMessageStartedAt,
+                firstDeltaAt: timeline.firstDeltaAt,
+                lastDeltaAt: timeline.lastDeltaAt,
+                agentMessageCompletedAt: timeline.agentMessageCompletedAt,
+                completedAt: timeline.turnCompletedAt ?? turnCompletedAt
+            )
             let parsedAt = DispatchTime.now().uptimeNanoseconds
             await rollbackThread(thread.id)
             let rolledBackAt = DispatchTime.now().uptimeNanoseconds
             runtimeLog.write(
                 "codex",
-                "translation_complete items=\(translations.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) priority=\(request.priority.rawValue) turn_id=\(startedTurnID) prepare_ms=\(Self.elapsedMilliseconds(from: startedAt, to: preparedAt)) queue_wait_ms=\(queueWaitMilliseconds) turn_start_ms=\(Self.elapsedMilliseconds(from: turnStartedAt, to: turnAcceptedAt)) turn_wait_ms=\(Self.elapsedMilliseconds(from: turnAcceptedAt, to: turnCompletedAt)) turn_complete_ms=\(Self.elapsedMilliseconds(from: turnAcceptedAt, to: turnCompletedAt)) parse_ms=\(Self.elapsedMilliseconds(from: turnCompletedAt, to: parsedAt)) rollback_ms=\(Self.elapsedMilliseconds(from: parsedAt, to: rolledBackAt))"
+                "translation_complete items=\(translations.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) priority=\(request.priority.rawValue) turn_id=\(startedTurnID) prepare_ms=\(Self.elapsedMilliseconds(from: startedAt, to: preparedAt)) queue_wait_ms=\(queueWaitMilliseconds) turn_start_ms=\(Self.elapsedMilliseconds(from: turnStartedAt, to: turnAcceptedAt)) turn_wait_ms=\(turnWaitStages.totalMilliseconds) turn_dispatch_ms=\(turnWaitStages.dispatchMilliseconds) model_wait_ms=\(turnWaitStages.modelWaitMilliseconds) first_delta_wait_ms=\(turnWaitStages.firstDeltaWaitMilliseconds) output_stream_ms=\(turnWaitStages.outputStreamMilliseconds) message_finalize_ms=\(turnWaitStages.messageFinalizeMilliseconds) turn_finalize_ms=\(turnWaitStages.turnFinalizeMilliseconds) turn_complete_ms=\(turnWaitStages.totalMilliseconds) parse_ms=\(Self.elapsedMilliseconds(from: turnCompletedAt, to: parsedAt)) rollback_ms=\(Self.elapsedMilliseconds(from: parsedAt, to: rolledBackAt))"
             )
             return translations
         } catch {
             if let turnID {
                 turnStreams.removeValue(forKey: turnID)
+                turnTimelines.removeValue(forKey: turnID)
             }
             await resetFailedTurn(threadID: thread.id, turnID: turnID)
             runtimeLog.write(
@@ -737,6 +776,7 @@ public actor CodexAppServerClient: TranslationBackend {
         guard let continuation = turnContinuations.removeValue(forKey: turnID) else { return }
         turnBuffers.removeValue(forKey: turnID)
         turnStreams.removeValue(forKey: turnID)
+        turnTimelines.removeValue(forKey: turnID)
         continuation.resume(throwing: TranslationError.timedOut("turn/start"))
     }
 
@@ -746,6 +786,9 @@ public actor CodexAppServerClient: TranslationBackend {
         acceptedAt: UInt64,
         onOutput: (@Sendable (TranslationOutput) -> Void)?
     ) {
+        if turnTimelines[turnID] == nil {
+            turnTimelines[turnID] = TurnTimeline()
+        }
         turnStreams[turnID] = TurnStreamState(
             request: request,
             onOutput: onOutput,
@@ -758,11 +801,20 @@ public actor CodexAppServerClient: TranslationBackend {
 
     private func consumeTurnDelta(_ delta: String, turnID: String) {
         guard !delta.isEmpty, var state = turnStreams[turnID] else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        var timeline = turnTimelines[turnID] ?? TurnTimeline()
+        if timeline.firstDeltaAt == nil {
+            timeline.firstDeltaAt = timeline.agentMessageCompletedAt ?? now
+        }
+        if timeline.lastDeltaAt == nil {
+            timeline.lastDeltaAt = timeline.firstDeltaAt
+        }
         if !state.loggedFirstDelta {
             state.loggedFirstDelta = true
+            let firstDeltaAt = max(state.acceptedAt, timeline.firstDeltaAt ?? now)
             runtimeLog.write(
                 "codex",
-                "translation_first_delta turn_id=\(turnID) first_delta_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: DispatchTime.now().uptimeNanoseconds))"
+                "translation_first_delta turn_id=\(turnID) first_delta_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: firstDeltaAt))"
             )
         }
 
@@ -778,20 +830,22 @@ public actor CodexAppServerClient: TranslationBackend {
                 state.loggedFirstItem = true
                 runtimeLog.write(
                     "codex",
-                    "translation_first_item turn_id=\(turnID) first_item_complete_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: DispatchTime.now().uptimeNanoseconds))"
+                    "translation_first_item turn_id=\(turnID) first_item_complete_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: now))"
                 )
             }
             state.onOutput?(TranslationOutput(id: item.id, text: item.text))
         }
+        turnTimelines[turnID] = timeline
         turnStreams[turnID] = state
     }
 
     private func finishTurnStream(turnID: String, outputs: [TranslationOutput]) {
         guard let state = turnStreams.removeValue(forKey: turnID) else { return }
         if !state.loggedFirstItem, !outputs.isEmpty {
+            let now = DispatchTime.now().uptimeNanoseconds
             runtimeLog.write(
                 "codex",
-                "translation_first_item turn_id=\(turnID) first_item_complete_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: DispatchTime.now().uptimeNanoseconds))"
+                "translation_first_item turn_id=\(turnID) first_item_complete_ms=\(Self.elapsedMilliseconds(from: state.acceptedAt, to: now))"
             )
         }
         for output in outputs where !state.emittedIDs.contains(output.id) {
@@ -844,22 +898,57 @@ public actor CodexAppServerClient: TranslationBackend {
 
         guard let method = message["method"]?.stringValue else { return }
         switch method {
+        case "turn/started":
+            guard let turnID = message["params"]?["turn"]?["id"]?.stringValue else { return }
+            var timeline = turnTimelines[turnID] ?? TurnTimeline()
+            if timeline.turnStartedAt == nil {
+                timeline.turnStartedAt = DispatchTime.now().uptimeNanoseconds
+            }
+            turnTimelines[turnID] = timeline
+
+        case "item/started":
+            guard let turnID = message["params"]?["turnId"]?.stringValue,
+                message["params"]?["item"]?["type"]?.stringValue == "agentMessage"
+            else { return }
+            var timeline = turnTimelines[turnID] ?? TurnTimeline()
+            if timeline.agentMessageStartedAt == nil {
+                timeline.agentMessageStartedAt = DispatchTime.now().uptimeNanoseconds
+            }
+            turnTimelines[turnID] = timeline
+
         case "item/agentMessage/delta":
             guard let turnID = message["params"]?["turnId"]?.stringValue else { return }
             let delta = message["params"]?["delta"]?.stringValue ?? ""
+            if !delta.isEmpty {
+                let now = DispatchTime.now().uptimeNanoseconds
+                var timeline = turnTimelines[turnID] ?? TurnTimeline()
+                if timeline.firstDeltaAt == nil {
+                    timeline.firstDeltaAt = now
+                }
+                timeline.lastDeltaAt = now
+                turnTimelines[turnID] = timeline
+            }
             turnBuffers[turnID, default: ""] += delta
             consumeTurnDelta(delta, turnID: turnID)
 
         case "item/completed":
             guard let turnID = message["params"]?["turnId"]?.stringValue,
-                message["params"]?["item"]?["type"]?.stringValue == "agentMessage",
-                turnBuffers[turnID, default: ""].isEmpty
+                message["params"]?["item"]?["type"]?.stringValue == "agentMessage"
             else { return }
+            var timeline = turnTimelines[turnID] ?? TurnTimeline()
+            if timeline.agentMessageCompletedAt == nil {
+                timeline.agentMessageCompletedAt = DispatchTime.now().uptimeNanoseconds
+            }
+            turnTimelines[turnID] = timeline
+            guard turnBuffers[turnID, default: ""].isEmpty else { return }
             turnBuffers[turnID] = message["params"]?["item"]?["text"]?.stringValue ?? ""
             consumeTurnDelta(turnBuffers[turnID] ?? "", turnID: turnID)
 
         case "turn/completed":
             guard let turnID = message["params"]?["turn"]?["id"]?.stringValue else { return }
+            var timeline = turnTimelines[turnID] ?? TurnTimeline()
+            timeline.turnCompletedAt = DispatchTime.now().uptimeNanoseconds
+            turnTimelines[turnID] = timeline
             let status = message["params"]?["turn"]?["status"]?.stringValue ?? "unknown"
             let result: Result<String, Error>
             if status == "completed" {
@@ -918,6 +1007,7 @@ public actor CodexAppServerClient: TranslationBackend {
         turnContinuations.removeAll()
         turnBuffers.removeAll()
         turnStreams.removeAll()
+        turnTimelines.removeAll()
         earlyTurnResults.removeAll()
 
         for waiter in threadWaiters {
@@ -1084,6 +1174,69 @@ public actor CodexAppServerClient: TranslationBackend {
             return priority.rank > otherPriority.rank
         }
         return sequence < otherSequence
+    }
+
+    static func turnWaitStages(
+        acceptedAt: UInt64,
+        turnStartedAt: UInt64?,
+        agentMessageStartedAt: UInt64?,
+        firstDeltaAt: UInt64?,
+        lastDeltaAt: UInt64?,
+        agentMessageCompletedAt: UInt64?,
+        completedAt: UInt64
+    ) -> TurnWaitStages {
+        let end = max(acceptedAt, completedAt)
+        let turnStarted = clampedTimestamp(turnStartedAt, fallback: acceptedAt, from: acceptedAt, to: end)
+        let agentMessageStarted = clampedTimestamp(
+            agentMessageStartedAt,
+            fallback: firstDeltaAt ?? agentMessageCompletedAt ?? end,
+            from: turnStarted,
+            to: end
+        )
+        let firstDelta = clampedTimestamp(
+            firstDeltaAt,
+            fallback: agentMessageCompletedAt ?? end,
+            from: agentMessageStarted,
+            to: end
+        )
+        let lastDelta = clampedTimestamp(
+            lastDeltaAt,
+            fallback: firstDelta,
+            from: firstDelta,
+            to: end
+        )
+        let agentMessageCompleted = clampedTimestamp(
+            agentMessageCompletedAt,
+            fallback: lastDelta,
+            from: lastDelta,
+            to: end
+        )
+
+        let dispatch = elapsedMilliseconds(from: acceptedAt, to: turnStarted)
+        let modelWait = elapsedMilliseconds(from: turnStarted, to: agentMessageStarted)
+        let firstDeltaWait = elapsedMilliseconds(from: agentMessageStarted, to: firstDelta)
+        let outputStream = elapsedMilliseconds(from: firstDelta, to: lastDelta)
+        let messageFinalize = elapsedMilliseconds(from: lastDelta, to: agentMessageCompleted)
+        let total = elapsedMilliseconds(from: acceptedAt, to: end)
+        let turnFinalize = total - dispatch - modelWait - firstDeltaWait - outputStream - messageFinalize
+
+        return TurnWaitStages(
+            dispatchMilliseconds: dispatch,
+            modelWaitMilliseconds: modelWait,
+            firstDeltaWaitMilliseconds: firstDeltaWait,
+            outputStreamMilliseconds: outputStream,
+            messageFinalizeMilliseconds: messageFinalize,
+            turnFinalizeMilliseconds: turnFinalize
+        )
+    }
+
+    private static func clampedTimestamp(
+        _ timestamp: UInt64?,
+        fallback: UInt64,
+        from lowerBound: UInt64,
+        to upperBound: UInt64
+    ) -> UInt64 {
+        min(max(timestamp ?? fallback, lowerBound), upperBound)
     }
 
     private static func resolveCodexExecutable(environment: [String: String]) -> String? {
