@@ -3,6 +3,48 @@ import XCTest
 @testable import Gloss
 
 final class BrowserExtensionFilesTests: XCTestCase {
+    func testSynchronizeManagedCopyUpdatesFilesWithoutReplacingDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gloss-extension-sync-\(UUID().uuidString)", isDirectory: true)
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let destination = root.appendingPathComponent("destination", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("new".utf8).write(to: source.appendingPathComponent("background.js"))
+        try Data("managed".utf8).write(to: source.appendingPathComponent(".gloss-managed"))
+        try Data("old".utf8).write(to: destination.appendingPathComponent("background.js"))
+        try Data("stale".utf8).write(to: destination.appendingPathComponent("stale.js"))
+        try Data("managed".utf8).write(to: destination.appendingPathComponent(".gloss-managed"))
+        let inodeBefore = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: destination.path)[.systemFileNumber]
+                as? NSNumber
+        )
+
+        try BrowserExtensionFiles.synchronizeManagedCopy(
+            source: source,
+            destination: destination
+        )
+
+        let inodeAfter = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: destination.path)[.systemFileNumber]
+                as? NSNumber
+        )
+        XCTAssertEqual(inodeAfter, inodeBefore)
+        XCTAssertEqual(
+            try Data(contentsOf: destination.appendingPathComponent("background.js")),
+            Data("new".utf8)
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: destination.appendingPathComponent("stale.js").path
+            )
+        )
+        try FileManager.default.removeItem(at: source.appendingPathComponent(".gloss-managed"))
+        XCTAssertTrue(try BrowserExtensionFiles.contentsMatch(source: source, destination: destination))
+    }
+
     func testContentsMatchIgnoresMarkerAndDetectsChangedOrExtraFiles() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("gloss-extension-test-\(UUID().uuidString)", isDirectory: true)

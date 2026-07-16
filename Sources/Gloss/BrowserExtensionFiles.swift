@@ -66,10 +66,44 @@ enum BrowserExtensionFiles {
             options: .atomic
         )
         if fileManager.fileExists(atPath: destination.path) {
-            try fileManager.removeItem(at: destination)
+            try synchronizeManagedCopy(source: staging, destination: destination)
+        } else {
+            try fileManager.moveItem(at: staging, to: destination)
         }
-        try fileManager.moveItem(at: staging, to: destination)
         return destination
+    }
+
+    static func synchronizeManagedCopy(source: URL, destination: URL) throws {
+        let fileManager = FileManager.default
+        let sourceFiles = try relativeFiles(in: source)
+        let sourceFileSet = Set(sourceFiles)
+        let destinationFiles = try relativeFiles(in: destination)
+
+        for relativePath in destinationFiles where !sourceFileSet.contains(relativePath) {
+            try fileManager.removeItem(at: destination.appendingPathComponent(relativePath))
+        }
+
+        for relativePath in sourceFiles {
+            let sourceFile = source.appendingPathComponent(relativePath)
+            let destinationFile = destination.appendingPathComponent(relativePath)
+            if fileManager.fileExists(atPath: destinationFile.path),
+                fileManager.contentsEqual(atPath: sourceFile.path, andPath: destinationFile.path)
+            {
+                continue
+            }
+            try fileManager.createDirectory(
+                at: destinationFile.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data(contentsOf: sourceFile).write(to: destinationFile, options: .atomic)
+            let attributes = try fileManager.attributesOfItem(atPath: sourceFile.path)
+            if let permissions = attributes[.posixPermissions] {
+                try fileManager.setAttributes(
+                    [.posixPermissions: permissions],
+                    ofItemAtPath: destinationFile.path
+                )
+            }
+        }
     }
 
     static func contentsMatch(
