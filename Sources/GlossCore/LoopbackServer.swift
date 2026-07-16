@@ -114,6 +114,7 @@ package final class LoopbackServer: @unchecked Sendable {
     private let providerStatus: @Sendable () async -> TranslationProviderStatus
     private let runtimeLog: GlossRuntimeLog
     private let token: String
+    private let version: String
     private let port: NWEndpoint.Port
     private let activeTasksLock = NSLock()
     private var activeTranslationTasks: [String: ActiveTranslationTask] = [:]
@@ -123,6 +124,7 @@ package final class LoopbackServer: @unchecked Sendable {
     package init(
         broker: TranslationBroker,
         token: String,
+        version: String = "development",
         port: UInt16 = 8787,
         providerStatus: @escaping @Sendable () async -> TranslationProviderStatus = {
             TranslationProviderStatus(
@@ -138,6 +140,7 @@ package final class LoopbackServer: @unchecked Sendable {
         self.broker = broker
         self.providerStatus = providerStatus
         self.token = token
+        self.version = version
         self.port = NWEndpoint.Port(rawValue: port)!
         self.runtimeLog = runtimeLog
     }
@@ -309,7 +312,7 @@ package final class LoopbackServer: @unchecked Sendable {
                     HealthResponse(
                         ok: true,
                         name: "Gloss",
-                        version: "0.1.0",
+                        version: version,
                         backend: providerStatus.backendName,
                         provider: providerStatus.provider.rawValue,
                         model: providerStatus.model,

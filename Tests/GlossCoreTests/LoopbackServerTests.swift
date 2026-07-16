@@ -17,6 +17,7 @@ final class LoopbackServerTests: XCTestCase {
         let server = LoopbackServer(
             broker: TranslationBroker(backend: backend),
             token: token,
+            version: "0.5.1",
             port: 18_787,
             providerStatus: {
                 TranslationProviderStatus(
@@ -71,6 +72,7 @@ final class LoopbackServerTests: XCTestCase {
         XCTAssertEqual(health.response.statusCode, 200)
         let healthJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: health.data) as? [String: Any])
         XCTAssertEqual(healthJSON["name"] as? String, "Gloss")
+        XCTAssertEqual(healthJSON["version"] as? String, "0.5.1")
         XCTAssertEqual(healthJSON["backend"] as? String, "llama-server")
         XCTAssertEqual(healthJSON["provider"] as? String, "llama")
         XCTAssertEqual(

@@ -1,6 +1,26 @@
 import AppKit
 
 enum GlossBrand {
+    static func menuHeaderTitle(version: String) -> NSAttributedString {
+        let title = NSMutableAttributedString(
+            string: "Gloss",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+            ]
+        )
+        title.append(
+            NSAttributedString(
+                string: "  v\(version)",
+                attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .medium),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+            )
+        )
+        return title
+    }
+
     static func markImage(pointSize: CGFloat, template: Bool = true) -> NSImage {
         let image = NSImage(
             size: NSSize(width: pointSize, height: pointSize),

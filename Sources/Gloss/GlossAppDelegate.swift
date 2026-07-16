@@ -62,6 +62,12 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var activeProviderConfiguration = providerConfiguration
     private var activeProviderRevision = UUID()
 
+    private var applicationVersion: String {
+        let value = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "dev" : trimmed
+    }
+
     private var glossBar: GlossBarController {
         if let glossBarController { return glossBarController }
         let controller = GlossBarController()
@@ -276,10 +282,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? runtimeLog.prepare()
-        let version =
-            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
-            as? String ?? "unknown"
-        runtimeLog.write("app", "started version=\(version)")
+        runtimeLog.write("app", "started version=\(applicationVersion)")
         NSApp.setActivationPolicy(.accessory)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
             self?.configureStatusItem()
@@ -513,7 +516,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
 
-        let title = NSMenuItem(title: "Gloss", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        title.attributedTitle = GlossBrand.menuHeaderTitle(version: applicationVersion)
         title.isEnabled = false
         menu.addItem(title)
 
@@ -1461,6 +1465,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let server = LoopbackServer(
                 broker: broker,
                 token: token,
+                version: applicationVersion,
                 providerStatus: { [weak self] in
                     guard let self else {
                         return TranslationProviderStatus(
