@@ -32,6 +32,7 @@ package final class LoopbackServer: @unchecked Sendable {
         let texts: [String]?
         let targetLanguage: String?
         let profile: String?
+        let contentKind: String?
         let sourceUrl: String?
         let priority: String?
         let requestId: String?
@@ -389,6 +390,18 @@ package final class LoopbackServer: @unchecked Sendable {
         } else {
             profile = .natural
         }
+        let contentKind: TranslationContentKind
+        if let rawContentKind = body.contentKind {
+            guard let parsedContentKind = TranslationContentKind(rawValue: rawContentKind) else {
+                sendJSON(
+                    ErrorResponse(error: "Unknown translation content kind."), status: 422, origin: origin,
+                    to: connection)
+                return
+            }
+            contentKind = parsedContentKind
+        } else {
+            contentKind = .webpage
+        }
         let priority: TranslationPriority
         if let rawPriority = body.priority {
             guard let parsed = TranslationPriority(rawValue: rawPriority) else {
@@ -405,14 +418,14 @@ package final class LoopbackServer: @unchecked Sendable {
             items: items,
             targetLanguage: targetLanguage,
             profile: profile,
-            contentKind: .webpage,
+            contentKind: contentKind,
             context: sourceContext(from: body.sourceUrl),
             priority: priority
         )
         let requestID = safeRequestID(body.requestId)
         runtimeLog.write(
             "bridge",
-            "translation_start items=\(items.count) chars=\(totalCharacters) profile=\(profile.rawValue) priority=\(priority.rawValue) request_id=\(requestID)"
+            "translation_start items=\(items.count) chars=\(totalCharacters) profile=\(profile.rawValue) content_kind=\(contentKind.rawValue) priority=\(priority.rawValue) request_id=\(requestID)"
         )
 
         if request.path == "/translate/stream" {

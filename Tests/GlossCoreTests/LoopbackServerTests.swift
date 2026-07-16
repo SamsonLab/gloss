@@ -13,8 +13,9 @@ final class LoopbackServerTests: XCTestCase {
         let logDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("gloss-bridge-log-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: logDirectory) }
+        let backend = BridgeBackend()
         let server = LoopbackServer(
-            broker: TranslationBroker(backend: BridgeBackend()),
+            broker: TranslationBroker(backend: backend),
             token: token,
             port: 18_787,
             providerStatus: {
@@ -82,6 +83,9 @@ final class LoopbackServerTests: XCTestCase {
 
         let body = try JSONSerialization.data(withJSONObject: [
             "items": [["id": "first", "text": "Hello"]],
+            "profile": "subtitle",
+            "contentKind": "subtitle",
+            "priority": "background",
             "targetLanguage": "Chinese (Simplified)",
         ])
         let translation = try await send(
@@ -100,6 +104,10 @@ final class LoopbackServerTests: XCTestCase {
         let translationJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: translation.data) as? [String: Any])
         let translations = try XCTUnwrap(translationJSON["translations"] as? [[String: String]])
         XCTAssertEqual(translations, [["id": "first", "text": "translated:Hello"]])
+        let metadata = await backend.latestMetadata()
+        XCTAssertEqual(metadata?.profile, .subtitle)
+        XCTAssertEqual(metadata?.contentKind, .subtitle)
+        XCTAssertEqual(metadata?.priority, .background)
 
         let stream = try await send(
             request(
@@ -159,6 +167,21 @@ final class LoopbackServerTests: XCTestCase {
             )
         )
         XCTAssertEqual(invalidPriority.response.statusCode, 422)
+
+        let invalidContentKindBody = try JSONSerialization.data(withJSONObject: [
+            "items": [["id": "invalid-kind", "text": "Hello"]],
+            "contentKind": "video",
+            "targetLanguage": "Chinese (Simplified)",
+        ])
+        let invalidContentKind = try await send(
+            request(
+                path: "/translate",
+                method: "POST",
+                headers: ["Content-Type": "application/json", "X-Gloss-Token": token, "Origin": origin],
+                body: invalidContentKindBody
+            )
+        )
+        XCTAssertEqual(invalidContentKind.response.statusCode, 422)
 
         let invalidBody = try JSONSerialization.data(withJSONObject: [
             "items": [
@@ -301,8 +324,20 @@ final class LoopbackServerTests: XCTestCase {
 }
 
 private actor BridgeBackend: TranslationBackend {
+    private var latestRequest: TranslationBatchRequest?
+
     func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput] {
-        request.items.map { TranslationOutput(id: $0.id, text: "translated:\($0.text)") }
+        latestRequest = request
+        return request.items.map { TranslationOutput(id: $0.id, text: "translated:\($0.text)") }
+    }
+
+    func latestMetadata() -> (
+        profile: TranslationProfile,
+        contentKind: TranslationContentKind,
+        priority: TranslationPriority
+    )? {
+        guard let latestRequest else { return nil }
+        return (latestRequest.profile, latestRequest.contentKind, latestRequest.priority)
     }
 }
 
