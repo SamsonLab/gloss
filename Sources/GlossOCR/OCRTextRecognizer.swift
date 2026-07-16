@@ -4,6 +4,11 @@ import Foundation
 
 package enum OCRTextRecognizer {
     package static func recognize(_ image: CGImage) async throws -> String {
+        let regions = try await recognizeRegions(image)
+        return try OCRTextLayout.orderedText(from: regions)
+    }
+
+    package static func recognizeRegions(_ image: CGImage) async throws -> [OCRTextRegion] {
         let task = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
 
@@ -16,7 +21,7 @@ package enum OCRTextRecognizer {
             try handler.perform([request])
             try Task.checkCancellation()
 
-            let regions = (request.results ?? []).compactMap { observation -> OCRTextRegion? in
+            return (request.results ?? []).compactMap { observation -> OCRTextRegion? in
                 guard let candidate = observation.topCandidates(1).first else { return nil }
                 return OCRTextRegion(
                     text: candidate.string,
@@ -24,7 +29,6 @@ package enum OCRTextRecognizer {
                     confidence: candidate.confidence
                 )
             }
-            return try OCRTextLayout.orderedText(from: regions)
         }
         return try await withTaskCancellationHandler {
             try await task.value
