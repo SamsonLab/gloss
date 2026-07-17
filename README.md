@@ -95,7 +95,8 @@ swift run gloss-cli 'Hello from Gloss.'
 同时运行 2 个后台 PDF turn，保留一个 thread 给交互翻译或 Spark 长尾竞速。后台 PDF
 turn 使用 Spark 支持的最低档 `low` reasoning。BabelDOC 默认用 qps 8 提前抓取段落，但模型侧仍严格限制为
 2 路；相邻请求会合并为最多 12 项、1,800 字符的有界批次。模型在 3 秒仍未开始
-响应时会记录慢请求，达到 8 秒后在空闲 thread 上发起一次竞速重试；每个 thread 默认完成
+响应时会记录慢请求；只有中心和 BabelDOC 上游的真实队列都排空，才会在空闲 thread 上
+发起 tail hedge，否则跳过竞速。没有统一队列状态的独立 Codex client 仍使用 8 秒阈值。每个 thread 默认完成
 10 次成功翻译后无中断轮换。可分别使用 `GLOSS_CODEX_DOCUMENT_REASONING_EFFORT`、
 `GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS` 和 `GLOSS_CODEX_THREAD_ROTATION_TURNS` 覆盖这些值，
 后两项设为 `off` 可关闭对应机制。
@@ -115,10 +116,11 @@ PDF 交互后续：BabelDOC/DocLayout 继续按需启动，不长期占用约 50
 可量化的页数或段落进度，避免模型加载期间看起来像任务卡住。后续可增加短时保活，但不作为
 默认常驻服务。
 
-调度后续：网页、字幕和 BabelDOC 的请求都应进入同一个派发中心。上游 qps 只控制预取和
-入队，不再直接决定模型并发；派发中心统一维护每条 thread 的空闲、运行、model wait、
-hedge 和交互保留状态，并负责优先级、合批、背压与取消。第三条 thread 默认保留给交互，
-只在队列接近排空且存在真实长尾时做 tail hedge，避免竞速请求反过来阻塞正常 PDF 批次。
+调度：网页、选词、字幕、OCR 和 BabelDOC 的真实 cache miss 统一进入
+`TranslationDispatchCenter`。上游 qps 只控制预取和入队；派发中心按优先级和 FIFO 派发，
+总并发最多 3、后台最多 2，并统一处理取消和状态快照。BabelDOC 尚未派发的条目也汇总进
+同一状态；Codex 只有在中心和上游真实队列都排空时才允许 tail hedge。第三条 thread 因此
+默认保留给交互，provider 内部调度暂时作为执行器安全网保留。
 
 本地 provider 默认查找 App 内的 `llama-server` helper、`GLOSS_LLAMA_SERVER_BIN`、`PATH`，以及 Homebrew 常用路径。模型可通过 `GLOSS_LLAMA_MODEL` 覆盖为 Hugging Face GGUF repo 或本地 `.gguf` 文件：
 

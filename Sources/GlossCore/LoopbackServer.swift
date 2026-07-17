@@ -219,6 +219,7 @@ package final class LoopbackServer: @unchecked Sendable {
         token: String,
         version: String = "development",
         port: UInt16 = 8787,
+        dispatchState: TranslationDispatchState? = nil,
         providerStatus: @escaping @Sendable () async -> TranslationProviderStatus = {
             TranslationProviderStatus(
                 provider: .codex,
@@ -240,7 +241,8 @@ package final class LoopbackServer: @unchecked Sendable {
         self.babelDOCBatchCoordinator = BabelDOCBatchCoordinator(
             broker: broker,
             configuration: babelDOCConfiguration,
-            runtimeLog: runtimeLog
+            runtimeLog: runtimeLog,
+            dispatchState: dispatchState
         )
         self.providerStatus = providerStatus
         self.token = token

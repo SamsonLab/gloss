@@ -89,6 +89,13 @@ final class CodexAppServerClientTests: XCTestCase {
             8_000_000_000
         )
         XCTAssertEqual(
+            CodexAppServerClient.readModelWaitHedgeNanoseconds(
+                [:],
+                dispatchAware: true
+            ),
+            3_000_000_000
+        )
+        XCTAssertEqual(
             CodexAppServerClient.readModelWaitHedgeNanoseconds([
                 "GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS": "6"
             ]),

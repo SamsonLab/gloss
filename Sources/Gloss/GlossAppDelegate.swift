@@ -28,12 +28,17 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let welcomeVersionKey = "welcomeVersion"
     private let glossaryStore = GlossaryStore()
     private let runtimeLog = GlossRuntimeLog.shared
+    private let dispatchState = TranslationDispatchState()
     private lazy var codex = makeCodexClient(configuration: providerConfiguration)
     private lazy var llama = LlamaServerClient(glossaryStore: glossaryStore)
     private lazy var backendRouter = TranslationBackendRouter(
         backend: backend(for: providerConfiguration.provider)
     )
-    private lazy var broker = TranslationBroker(backend: backendRouter)
+    private lazy var dispatchCenter = TranslationDispatchCenter(
+        backend: backendRouter,
+        dispatchState: dispatchState
+    )
+    private lazy var broker = TranslationBroker(backend: dispatchCenter)
     private let historyStore = TranslationHistoryStore()
     private var globalShortcut = GlobalShortcut.load()
     private lazy var statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -1212,7 +1217,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         CodexAppServerClient(
             glossaryStore: glossaryStore,
             model: configuration.codexModel,
-            reasoningEffort: configuration.codexReasoningEffort
+            reasoningEffort: configuration.codexReasoningEffort,
+            dispatchState: dispatchState
         )
     }
 
@@ -1563,6 +1569,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 broker: broker,
                 token: token,
                 version: applicationVersion,
+                dispatchState: dispatchState,
                 providerStatus: { [weak self] in
                     guard let self else {
                         return TranslationProviderStatus(

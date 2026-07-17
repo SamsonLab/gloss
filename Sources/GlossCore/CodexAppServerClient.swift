@@ -59,6 +59,7 @@ public actor CodexAppServerClient: TranslationBackend {
     private static let defaultMaximumConcurrentTurns = 3
     private static let modelWaitSlowNanoseconds: UInt64 = 3_000_000_000
     private static let defaultModelWaitHedgeNanoseconds: UInt64 = 8_000_000_000
+    private static let dispatchAwareModelWaitHedgeNanoseconds: UInt64 = 3_000_000_000
     private static let defaultThreadRotationTurns = 10
     static let disabledCodexFeatures = [
         "shell_tool",
@@ -233,6 +234,7 @@ public actor CodexAppServerClient: TranslationBackend {
     private let maximumConcurrentTurns: Int
     private let maximumBackgroundConcurrentTurns: Int
     private let glossaryStore: GlossaryStore
+    private let dispatchState: TranslationDispatchState?
     private var process: Process?
     private var inputHandle: FileHandle?
     private var outputBuffer = Data()
@@ -264,7 +266,8 @@ public actor CodexAppServerClient: TranslationBackend {
         glossaryStore: GlossaryStore = GlossaryStore(),
         model: String? = nil,
         reasoningEffort: CodexReasoningEffort? = nil,
-        documentReasoningEffort: CodexReasoningEffort? = .low
+        documentReasoningEffort: CodexReasoningEffort? = .low,
+        dispatchState: TranslationDispatchState? = nil
     ) {
         self.environment = environment
         self.timeoutNanoseconds = UInt64(max(1, timeoutSeconds) * 1_000_000_000)
@@ -281,7 +284,10 @@ public actor CodexAppServerClient: TranslationBackend {
             environment,
             configured: documentReasoningEffort
         )
-        self.modelWaitHedgeNanoseconds = Self.readModelWaitHedgeNanoseconds(environment)
+        self.modelWaitHedgeNanoseconds = Self.readModelWaitHedgeNanoseconds(
+            environment,
+            dispatchAware: dispatchState != nil
+        )
         self.threadRotationTurns = Self.readThreadRotationTurns(environment)
         let maximumConcurrentTurns = Self.readMaximumConcurrentTurns(environment)
         self.maximumConcurrentTurns = maximumConcurrentTurns
@@ -290,6 +296,7 @@ public actor CodexAppServerClient: TranslationBackend {
             maximumConcurrentTurns: maximumConcurrentTurns
         )
         self.glossaryStore = glossaryStore
+        self.dispatchState = dispatchState
     }
 
     public func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput] {
@@ -608,6 +615,16 @@ public actor CodexAppServerClient: TranslationBackend {
 
                 case .hedgeThreshold(let turnID):
                     guard !hedgeStarted else { continue }
+                    if let dispatchState {
+                        let snapshot = await dispatchState.snapshot()
+                        guard snapshot.allowsBackgroundHedge else {
+                            runtimeLog.write(
+                                "codex",
+                                "model_wait_hedge_skipped turn_id=\(turnID) reason=real_work_queued center_pending=\(snapshot.pendingInteractiveJobs + snapshot.pendingVisibleJobs + snapshot.pendingBackgroundJobs) upstream_pending=\(snapshot.upstreamBackgroundItems)"
+                            )
+                            continue
+                        }
+                    }
                     hedgeStarted = true
                     runtimeLog.write(
                         "codex",
@@ -955,9 +972,11 @@ public actor CodexAppServerClient: TranslationBackend {
                 successfulTurnsByThreadIndex.removeAll()
                 availableThreadIndices = Array(startedThreadIDs.indices)
                 activeThreadPriorities.removeAll()
+                let hedgeMilliseconds = modelWaitHedgeNanoseconds
+                    .map { String($0 / 1_000_000) } ?? "off"
                 runtimeLog.write(
                     "codex",
-                    "ready model=\(model ?? "default") threads=\(startedThreadIDs.count) background_limit=\(maximumBackgroundConcurrentTurns)"
+                    "ready model=\(model ?? "default") threads=\(startedThreadIDs.count) background_limit=\(maximumBackgroundConcurrentTurns) hedge_ms=\(hedgeMilliseconds) dispatch_aware=\(dispatchState != nil)"
                 )
             }
             threadStartupTask = nil
@@ -2029,13 +2048,18 @@ public actor CodexAppServerClient: TranslationBackend {
     }
 
     static func readModelWaitHedgeNanoseconds(
-        _ environment: [String: String]
+        _ environment: [String: String],
+        dispatchAware: Bool = false
     ) -> UInt64? {
         guard let rawValue = environment["GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased(),
             !rawValue.isEmpty
-        else { return defaultModelWaitHedgeNanoseconds }
+        else {
+            return dispatchAware
+                ? dispatchAwareModelWaitHedgeNanoseconds
+                : defaultModelWaitHedgeNanoseconds
+        }
         if ["0", "off", "disabled"].contains(rawValue) { return nil }
         guard let seconds = UInt64(rawValue), (3...60).contains(seconds) else {
             return defaultModelWaitHedgeNanoseconds

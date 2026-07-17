@@ -94,20 +94,24 @@ actor BabelDOCBatchCoordinator {
     private let broker: TranslationBroker
     private let configuration: Configuration
     private let runtimeLog: GlossRuntimeLog
+    private let dispatchState: TranslationDispatchState?
     private var pendingItems: [PendingItem] = []
     private var requests: [UUID: RequestState] = [:]
     private var cancelledBeforeEnqueue: Set<UUID> = []
     private var activeBatchCount = 0
     private var fillTask: Task<Void, Never>?
+    private var dispatchStateRevision = 0
 
     init(
         broker: TranslationBroker,
         configuration: Configuration = Configuration(),
-        runtimeLog: GlossRuntimeLog = .shared
+        runtimeLog: GlossRuntimeLog = .shared,
+        dispatchState: TranslationDispatchState? = nil
     ) {
         self.broker = broker
         self.configuration = configuration
         self.runtimeLog = runtimeLog
+        self.dispatchState = dispatchState
     }
 
     func translate(
@@ -169,6 +173,7 @@ actor BabelDOCBatchCoordinator {
             "bridge",
             "babeldoc_batch_enqueued request_items=\(items.count) pending_items=\(pendingItems.count) active_batches=\(activeBatchCount)"
         )
+        reportPendingState()
         schedule(
             force: firstPendingBatchIsFull(),
             delayNanoseconds: configuration.fillDelayNanoseconds,
@@ -187,6 +192,7 @@ actor BabelDOCBatchCoordinator {
             "bridge",
             "babeldoc_batch_cancelled remaining_items=\(state.remainingIDs.count) pending_items=\(pendingItems.count)"
         )
+        reportPendingState()
     }
 
     private func schedule(
@@ -297,6 +303,7 @@ actor BabelDOCBatchCoordinator {
         for index in selectedIndices.reversed() {
             pendingItems.remove(at: index)
         }
+        reportPendingState()
         return selected
     }
 
@@ -390,6 +397,20 @@ actor BabelDOCBatchCoordinator {
     private func fail(requestID: UUID, error: Error) {
         guard let state = requests.removeValue(forKey: requestID) else { return }
         pendingItems.removeAll { $0.requestID == requestID }
+        reportPendingState()
         state.continuation.resume(throwing: error)
+    }
+
+    private func reportPendingState() {
+        guard let dispatchState else { return }
+        dispatchStateRevision += 1
+        let revision = dispatchStateRevision
+        let count = pendingItems.count
+        Task {
+            await dispatchState.reportUpstreamBackgroundItems(
+                count,
+                revision: revision
+            )
+        }
     }
 }
