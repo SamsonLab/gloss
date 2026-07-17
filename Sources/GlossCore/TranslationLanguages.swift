@@ -132,6 +132,41 @@ public enum TranslationLanguages {
         language(forTargetName: targetName)?.shortTitle ?? targetName
     }
 
+    public static func targetName(forLanguageCode languageCode: String) -> String? {
+        let normalized =
+            languageCode
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        switch normalized {
+        case "zh", "zh-cn", "zh-hans":
+            return "Chinese (Simplified)"
+        case "zh-hk", "zh-tw", "zh-hant":
+            return "Chinese (Traditional)"
+        default:
+            let base = normalized.split(separator: "-", maxSplits: 1).first.map(String.init)
+            return common.first { language in
+                language.languageCode.lowercased() == normalized
+                    || base.map {
+                        $0 == language.languageCode.lowercased()
+                    } == true
+            }?.targetName
+        }
+    }
+
+    public static func babelDOCCode(forTargetName targetName: String) -> String? {
+        guard let language = language(forTargetName: targetName) else { return nil }
+        return switch language.languageCode {
+        case "zh-Hans": "zh-CN"
+        case "zh-Hant": "zh-TW"
+        default: language.languageCode
+        }
+    }
+
+    public static func detectedSourceLanguageCode(in sourceText: String) -> String? {
+        TranslationTargetResolver.detectedLanguage(in: sourceText)?.code
+    }
+
     public static func isValidTargetName(_ value: String) -> Bool {
         let name = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, name.count <= 100 else { return false }

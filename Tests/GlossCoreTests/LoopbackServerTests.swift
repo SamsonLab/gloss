@@ -110,6 +110,213 @@ final class LoopbackServerTests: XCTestCase {
         XCTAssertEqual(metadata?.profile, .subtitle)
         XCTAssertEqual(metadata?.contentKind, .subtitle)
         XCTAssertEqual(metadata?.priority, .background)
+        XCTAssertEqual(metadata?.targetLanguage, "Chinese (Simplified)")
+
+        let openAIRequestBody = try JSONSerialization.data(withJSONObject: [
+            "model": "gloss-provider",
+            "messages": [
+                [
+                    "role": "system",
+                    "content": "You are a professional machine translation engine.",
+                ],
+                [
+                    "role": "user",
+                    "content":
+                        ";; Treat next line as plain text input and translate it into zh-CN, "
+                        + "output translation ONLY. NO explanations. Input:\n\n"
+                        + "Hello from BabelDOC",
+                ],
+            ],
+        ])
+        let openAICompletion = try await send(
+            request(
+                path: "/v1/chat/completions",
+                method: "POST",
+                headers: [
+                    "Authorization": "Bearer \(token)",
+                    "Content-Type": "application/json",
+                ],
+                body: openAIRequestBody
+            )
+        )
+        XCTAssertEqual(openAICompletion.response.statusCode, 200)
+        let completionJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: openAICompletion.data)
+                as? [String: Any]
+        )
+        let choices = try XCTUnwrap(
+            completionJSON["choices"] as? [[String: Any]]
+        )
+        let message = try XCTUnwrap(choices.first?["message"] as? [String: Any])
+        XCTAssertEqual(
+            message["content"] as? String,
+            "translated:Hello from BabelDOC"
+        )
+        let babelMetadata = await backend.latestMetadata()
+        XCTAssertEqual(babelMetadata?.profile, .academic)
+        XCTAssertEqual(babelMetadata?.contentKind, .document)
+        XCTAssertEqual(babelMetadata?.priority, .background)
+        XCTAssertEqual(
+            babelMetadata?.targetLanguage,
+            "Chinese (Simplified)"
+        )
+
+        let structuredPrompt = """
+            You are a professional zh-CN native translator.
+
+            ## Rules
+
+            1. Keep the structure exactly unchanged.
+            2. Translate ALL human-readable content into zh-CN.
+
+            ## Output
+
+            Output ONLY the translated zh-CN text.
+
+            Now translate the following text:
+
+            <style>Scaled Dot-Product {v1} Attention</style>
+            """
+        let structuredRequestBody = try JSONSerialization.data(
+            withJSONObject: [
+                "model": "gloss-provider",
+                "messages": [
+                    ["role": "user", "content": structuredPrompt]
+                ],
+            ]
+        )
+        let structuredCompletion = try await send(
+            request(
+                path: "/v1/chat/completions",
+                method: "POST",
+                headers: [
+                    "Authorization": "Bearer \(token)",
+                    "Content-Type": "application/json",
+                ],
+                body: structuredRequestBody
+            )
+        )
+        XCTAssertEqual(structuredCompletion.response.statusCode, 200)
+        let structuredJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: structuredCompletion.data)
+                as? [String: Any]
+        )
+        let structuredChoices = try XCTUnwrap(
+            structuredJSON["choices"] as? [[String: Any]]
+        )
+        let structuredMessage = try XCTUnwrap(
+            structuredChoices.first?["message"] as? [String: Any]
+        )
+        XCTAssertEqual(
+            structuredMessage["content"] as? String,
+            "translated:<style>Scaled Dot-Product {v1} Attention</style>"
+        )
+
+        let batchPrompt = """
+            You are a professional zh-CN native translator who needs to fluently translate text into zh-CN.
+
+            Follow all rules strictly.
+
+            ## Output Format
+            Return a JSON array of the same length.
+
+            ## Here is the input:
+
+            [
+              {"id": 7, "input": "Attention Is All You Need", "layout_label": "title"},
+              {"id": 8, "input": "The dominant sequence models use recurrence.", "layout_label": "text"}
+            ]
+            """
+        let batchRequestBody = try JSONSerialization.data(withJSONObject: [
+            "model": "gloss-provider",
+            "messages": [
+                ["role": "user", "content": batchPrompt]
+            ],
+        ])
+        let batchCompletion = try await send(
+            request(
+                path: "/v1/chat/completions",
+                method: "POST",
+                headers: [
+                    "Authorization": "Bearer \(token)",
+                    "Content-Type": "application/json",
+                ],
+                body: batchRequestBody
+            )
+        )
+        XCTAssertEqual(batchCompletion.response.statusCode, 200)
+        let batchCompletionJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: batchCompletion.data)
+                as? [String: Any]
+        )
+        let batchChoices = try XCTUnwrap(
+            batchCompletionJSON["choices"] as? [[String: Any]]
+        )
+        let batchMessage = try XCTUnwrap(
+            batchChoices.first?["message"] as? [String: Any]
+        )
+        let batchContent = try XCTUnwrap(batchMessage["content"] as? String)
+        let batchOutputs = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(batchContent.utf8))
+                as? [[String: Any]]
+        )
+        XCTAssertEqual(batchOutputs.count, 2)
+        XCTAssertEqual(batchOutputs[0]["id"] as? Int, 7)
+        XCTAssertEqual(
+            batchOutputs[0]["output"] as? String,
+            "translated:Attention Is All You Need"
+        )
+        XCTAssertEqual(batchOutputs[1]["id"] as? Int, 8)
+        XCTAssertEqual(
+            batchOutputs[1]["output"] as? String,
+            "translated:The dominant sequence models use recurrence."
+        )
+
+        await backend.resetRequests()
+        let longSource = (0..<18).map { index in
+            "Section \(index) explains how bounded translation chunks reduce long-tail latency while preserving complete academic sentences."
+        }.joined(separator: " ")
+        let longPrompt = """
+            You are a professional zh-CN native translator.
+
+            ## Rules
+
+            1. Translate ALL human-readable content into zh-CN.
+
+            Now translate the following text:
+
+            \(longSource)
+            """
+        let longRequestBody = try JSONSerialization.data(withJSONObject: [
+            "model": "gloss-provider",
+            "messages": [
+                ["role": "user", "content": longPrompt]
+            ],
+        ])
+        let longCompletion = try await send(
+            request(
+                path: "/v1/chat/completions",
+                method: "POST",
+                headers: [
+                    "Authorization": "Bearer \(token)",
+                    "Content-Type": "application/json",
+                ],
+                body: longRequestBody
+            )
+        )
+        XCTAssertEqual(longCompletion.response.statusCode, 200)
+        let chunkRequests = await backend.recordedRequests()
+        XCTAssertGreaterThan(chunkRequests.count, 1)
+        XCTAssertTrue(
+            chunkRequests.allSatisfy {
+                $0.items.reduce(0) { $0 + $1.text.count } <= 1_800
+            }
+        )
+        XCTAssertTrue(
+            chunkRequests.allSatisfy {
+                $0.items.allSatisfy { $0.text.count <= 900 }
+            }
+        )
 
         let stream = try await send(
             request(
@@ -277,6 +484,96 @@ final class LoopbackServerTests: XCTestCase {
         _ = try? await streamTask.value
     }
 
+    func testBabelDOCBatchCoordinatorMergesConcurrentRequests() async throws {
+        let backend = BridgeBackend()
+        let coordinator = BabelDOCBatchCoordinator(
+            broker: TranslationBroker(backend: backend),
+            configuration: .init(fillDelayNanoseconds: 50_000_000)
+        )
+
+        async let first = coordinator.translate(
+            items: [TranslationItem(id: "shared", text: "First paragraph")],
+            targetLanguage: "Chinese (Simplified)",
+            context: "PDF"
+        )
+        async let second = coordinator.translate(
+            items: [TranslationItem(id: "shared", text: "Second paragraph")],
+            targetLanguage: "Chinese (Simplified)",
+            context: "PDF"
+        )
+
+        let outputs = try await (first, second)
+        XCTAssertEqual(outputs.0, [TranslationOutput(id: "shared", text: "translated:First paragraph")])
+        XCTAssertEqual(outputs.1, [TranslationOutput(id: "shared", text: "translated:Second paragraph")])
+        let requests = await backend.recordedRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(Set(requests[0].items.map(\.text)), ["First paragraph", "Second paragraph"])
+        XCTAssertEqual(Set(requests[0].items.map(\.id)).count, 2)
+    }
+
+    func testBabelDOCBatchCoordinatorKeepsModelRequestsBounded() async throws {
+        let backend = BridgeBackend()
+        let coordinator = BabelDOCBatchCoordinator(
+            broker: TranslationBroker(backend: backend),
+            configuration: .init(
+                maximumBatchItems: 2,
+                maximumBatchCharacters: 100,
+                maximumConcurrentBatches: 2,
+                fillDelayNanoseconds: 0
+            )
+        )
+        let items = (0..<5).map {
+            TranslationItem(id: "item-\($0)", text: "Paragraph \($0)")
+        }
+
+        let outputs = try await coordinator.translate(
+            items: items,
+            targetLanguage: "Chinese (Simplified)",
+            context: "PDF"
+        )
+
+        XCTAssertEqual(outputs.map(\.id), items.map(\.id))
+        let requests = await backend.recordedRequests()
+        XCTAssertEqual(requests.count, 3)
+        XCTAssertTrue(requests.allSatisfy { $0.items.count <= 2 })
+    }
+
+    func testBabelDOCBatchConfigurationReadsBoundedEnvironmentOverrides() {
+        let configuration = BabelDOCBatchCoordinator.Configuration(
+            environment: [
+                "GLOSS_BABELDOC_BATCH_ITEMS": "12",
+                "GLOSS_BABELDOC_BATCH_CHARACTERS": "1800",
+                "GLOSS_BABELDOC_MODEL_CONCURRENCY": "3",
+                "GLOSS_BABELDOC_FILL_DELAY_MS": "75",
+                "GLOSS_BABELDOC_REFILL_DELAY_MS": "250",
+            ]
+        )
+
+        XCTAssertEqual(configuration.maximumBatchItems, 12)
+        XCTAssertEqual(configuration.maximumBatchCharacters, 1_800)
+        XCTAssertEqual(configuration.maximumConcurrentBatches, 3)
+        XCTAssertEqual(configuration.fillDelayNanoseconds, 75_000_000)
+        XCTAssertEqual(configuration.refillDelayNanoseconds, 250_000_000)
+    }
+
+    func testBabelDOCBatchConfigurationRejectsOutOfRangeOverrides() {
+        let configuration = BabelDOCBatchCoordinator.Configuration(
+            environment: [
+                "GLOSS_BABELDOC_BATCH_ITEMS": "100",
+                "GLOSS_BABELDOC_BATCH_CHARACTERS": "20",
+                "GLOSS_BABELDOC_MODEL_CONCURRENCY": "0",
+                "GLOSS_BABELDOC_FILL_DELAY_MS": "-1",
+                "GLOSS_BABELDOC_REFILL_DELAY_MS": "9999",
+            ]
+        )
+
+        XCTAssertEqual(configuration.maximumBatchItems, 12)
+        XCTAssertEqual(configuration.maximumBatchCharacters, 1_800)
+        XCTAssertEqual(configuration.maximumConcurrentBatches, 2)
+        XCTAssertEqual(configuration.fillDelayNanoseconds, 25_000_000)
+        XCTAssertEqual(configuration.refillDelayNanoseconds, 0)
+    }
+
     private func request(
         path: String,
         method: String = "GET",
@@ -327,19 +624,35 @@ final class LoopbackServerTests: XCTestCase {
 
 private actor BridgeBackend: TranslationBackend {
     private var latestRequest: TranslationBatchRequest?
+    private var requests: [TranslationBatchRequest] = []
 
     func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput] {
         latestRequest = request
+        requests.append(request)
         return request.items.map { TranslationOutput(id: $0.id, text: "translated:\($0.text)") }
+    }
+
+    func resetRequests() {
+        requests = []
+    }
+
+    func recordedRequests() -> [TranslationBatchRequest] {
+        requests
     }
 
     func latestMetadata() -> (
         profile: TranslationProfile,
         contentKind: TranslationContentKind,
-        priority: TranslationPriority
+        priority: TranslationPriority,
+        targetLanguage: String
     )? {
         guard let latestRequest else { return nil }
-        return (latestRequest.profile, latestRequest.contentKind, latestRequest.priority)
+        return (
+            latestRequest.profile,
+            latestRequest.contentKind,
+            latestRequest.priority,
+            latestRequest.targetLanguage
+        )
     }
 }
 

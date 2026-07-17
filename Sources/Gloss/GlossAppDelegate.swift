@@ -35,7 +35,6 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
     private lazy var broker = TranslationBroker(backend: backendRouter)
     private let historyStore = TranslationHistoryStore()
-    private let documentTranslationStore = DocumentTranslationStore()
     private var globalShortcut = GlobalShortcut.load()
     private lazy var statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let servicesProvider = GlossServicesProvider()
@@ -70,25 +69,6 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let value = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? "dev" : trimmed
-    }
-
-    private var providerCacheRevision: String {
-        let configuration = providerConfiguration
-        let glossaryRevision = UserDefaults.standard.integer(forKey: glossaryRevisionKey)
-        let model =
-            configuration.provider == .codex
-            ? configuration.codexModel
-            : TranslationProviderConfiguration.defaultLlamaModel
-        return DocumentDigest.text(
-            [
-                "document-v2",
-                applicationVersion,
-                configuration.provider.rawValue,
-                model,
-                configuration.codexReasoningEffort.rawValue,
-                String(glossaryRevision),
-            ].joined(separator: "|")
-        )
     }
 
     private var glossBar: GlossBarController {
@@ -207,16 +187,11 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pdfTranslationWindow: PDFTranslationWindowController {
         if let pdfTranslationWindowController { return pdfTranslationWindowController }
         let controller = PDFTranslationWindowController(
-            broker: broker,
-            translationStore: documentTranslationStore,
             targetLanguage: { [weak self] in
                 self?.targetLanguage ?? "Chinese (Simplified)"
             },
-            profile: { [weak self] in
-                self?.profile ?? .natural
-            },
-            providerRevision: { [weak self] in
-                self?.providerCacheRevision ?? "unavailable"
+            bridgeToken: { [weak self] in
+                self?.pairingToken
             }
         )
         pdfTranslationWindowController = controller
@@ -922,7 +897,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.prompt = "打开并翻译"
-        panel.message = "Gloss 会优先翻译当前页，并在需要时使用本机 OCR。"
+        panel.message = "Gloss 使用 BabelDOC 保留版式，并通过当前 provider 翻译完整文档。"
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
 

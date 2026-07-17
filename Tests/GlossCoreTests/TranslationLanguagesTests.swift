@@ -3,6 +3,27 @@ import XCTest
 @testable import GlossCore
 
 final class TranslationLanguagesTests: XCTestCase {
+    func testMapsBabelDOCLanguageCodes() {
+        XCTAssertEqual(
+            TranslationLanguages.targetName(forLanguageCode: "zh-CN"),
+            "Chinese (Simplified)"
+        )
+        XCTAssertEqual(
+            TranslationLanguages.targetName(forLanguageCode: "ZH_hant"),
+            "Chinese (Traditional)"
+        )
+        XCTAssertEqual(
+            TranslationLanguages.babelDOCCode(
+                forTargetName: "Chinese (Simplified)"
+            ),
+            "zh-CN"
+        )
+        XCTAssertEqual(
+            TranslationLanguages.babelDOCCode(forTargetName: "English"),
+            "en"
+        )
+    }
+
     func testReversesChinesePrimaryForChineseSource() {
         XCTAssertEqual(
             TranslationTargetResolver.resolve(

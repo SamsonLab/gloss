@@ -34,6 +34,94 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(status.reasoningEffort, .xhigh)
     }
 
+    func testBackgroundDocumentsUseLowestSupportedReasoningByDefault() {
+        let document = TranslationBatchRequest(
+            items: [TranslationItem(id: "pdf", text: "Paper")],
+            targetLanguage: "Chinese (Simplified)",
+            profile: .academic,
+            contentKind: .document,
+            priority: .background
+        )
+        let webpage = TranslationBatchRequest(
+            items: [TranslationItem(id: "web", text: "Page")],
+            targetLanguage: "Chinese (Simplified)",
+            contentKind: .webpage,
+            priority: .background
+        )
+
+        XCTAssertEqual(
+            CodexAppServerClient.reasoningEffort(
+                for: document,
+                defaultEffort: .low,
+                documentEffort: .low
+            ),
+            .low
+        )
+        XCTAssertEqual(
+            CodexAppServerClient.reasoningEffort(
+                for: webpage,
+                defaultEffort: .low,
+                documentEffort: .low
+            ),
+            .low
+        )
+    }
+
+    func testDocumentReasoningEnvironmentCanInheritOrOverride() {
+        XCTAssertNil(
+            CodexAppServerClient.readDocumentReasoningEffort(
+                ["GLOSS_CODEX_DOCUMENT_REASONING_EFFORT": "inherit"],
+                configured: .low
+            )
+        )
+        XCTAssertEqual(
+            CodexAppServerClient.readDocumentReasoningEffort(
+                ["GLOSS_CODEX_DOCUMENT_REASONING_EFFORT": "medium"],
+                configured: .low
+            ),
+            .medium
+        )
+    }
+
+    func testModelWaitHedgeDefaultsToEightSecondsAndCanBeTuned() {
+        XCTAssertEqual(
+            CodexAppServerClient.readModelWaitHedgeNanoseconds([:]),
+            8_000_000_000
+        )
+        XCTAssertEqual(
+            CodexAppServerClient.readModelWaitHedgeNanoseconds([
+                "GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS": "6"
+            ]),
+            6_000_000_000
+        )
+        XCTAssertNil(
+            CodexAppServerClient.readModelWaitHedgeNanoseconds([
+                "GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS": "off"
+            ])
+        )
+        XCTAssertEqual(
+            CodexAppServerClient.readModelWaitHedgeNanoseconds([
+                "GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS": "invalid"
+            ]),
+            8_000_000_000
+        )
+    }
+
+    func testThreadRotationDefaultsToTenSuccessfulTurnsAndCanBeDisabled() {
+        XCTAssertEqual(CodexAppServerClient.readThreadRotationTurns([:]), 10)
+        XCTAssertEqual(
+            CodexAppServerClient.readThreadRotationTurns([
+                "GLOSS_CODEX_THREAD_ROTATION_TURNS": "20"
+            ]),
+            20
+        )
+        XCTAssertNil(
+            CodexAppServerClient.readThreadRotationTurns([
+                "GLOSS_CODEX_THREAD_ROTATION_TURNS": "off"
+            ])
+        )
+    }
+
     func testProcessEnvironmentMakesCodexInterpreterDiscoverableFromGUIApp() {
         let codexHome = URL(fileURLWithPath: "/tmp/gloss-codex-home")
         let environment = CodexAppServerClient.makeProcessEnvironment(
@@ -219,6 +307,41 @@ final class CodexAppServerClientTests: XCTestCase {
                 sequence: 1,
                 before: .visible,
                 otherSequence: 9
+            )
+        )
+    }
+
+    func testReservesOneThreadFromBackgroundWorkByDefault() {
+        XCTAssertEqual(
+            CodexAppServerClient.defaultBackgroundConcurrency(maximumConcurrentTurns: 3),
+            2
+        )
+        XCTAssertEqual(
+            CodexAppServerClient.defaultBackgroundConcurrency(maximumConcurrentTurns: 1),
+            1
+        )
+    }
+
+    func testBackgroundLimitDoesNotBlockInteractiveWork() {
+        XCTAssertFalse(
+            CodexAppServerClient.canAcquireAvailableThread(
+                priority: .background,
+                activeBackgroundTurns: 2,
+                maximumBackgroundTurns: 2
+            )
+        )
+        XCTAssertTrue(
+            CodexAppServerClient.canAcquireAvailableThread(
+                priority: .interactive,
+                activeBackgroundTurns: 2,
+                maximumBackgroundTurns: 2
+            )
+        )
+        XCTAssertTrue(
+            CodexAppServerClient.canAcquireAvailableThread(
+                priority: .background,
+                activeBackgroundTurns: 1,
+                maximumBackgroundTurns: 2
             )
         )
     }

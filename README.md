@@ -85,12 +85,40 @@ GLOSS_CODEX_HOME="$HOME/Library/Application Support/Gloss/Codex" \
 GLOSS_CODEX_MODEL=gpt-5.3-codex-spark \
 GLOSS_CODEX_REASONING_EFFORT=low \
 GLOSS_CODEX_MAX_CONCURRENCY=3 \
+GLOSS_CODEX_BACKGROUND_CONCURRENCY=2 \
 swift run gloss-cli 'Hello from Gloss.'
 ```
 
 `GLOSS_CODEX_BIN` 可覆盖外部 Codex CLI 路径。默认构建优先使用 App 内置 runtime；CLI 构建只使用用户安装的 Codex CLI。
 
-未设置时使用 `gpt-5.3-codex-spark`；并发数默认 3，可配置范围为 1–8。
+未设置时使用 `gpt-5.3-codex-spark`；并发数默认 3，可配置范围为 1–8。Gloss 默认最多
+同时运行 2 个后台 PDF turn，保留一个 thread 给交互翻译或 Spark 长尾竞速。后台 PDF
+turn 使用 Spark 支持的最低档 `low` reasoning。BabelDOC 默认用 qps 8 提前抓取段落，但模型侧仍严格限制为
+2 路；相邻请求会合并为最多 12 项、1,800 字符的有界批次。模型在 3 秒仍未开始
+响应时会记录慢请求，达到 8 秒后在空闲 thread 上发起一次竞速重试；每个 thread 默认完成
+10 次成功翻译后无中断轮换。可分别使用 `GLOSS_CODEX_DOCUMENT_REASONING_EFFORT`、
+`GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS` 和 `GLOSS_CODEX_THREAD_ROTATION_TURNS` 覆盖这些值，
+后两项设为 `off` 可关闭对应机制。
+Spark 当前拒绝 `minimal` reasoning，PDF 翻译可用的最低档是 `low`；不要将
+`GLOSS_CODEX_DOCUMENT_REASONING_EFFORT` 配置为 `minimal`。
+
+批处理实验参数可通过 `GLOSS_BABELDOC_BATCH_ITEMS`、`GLOSS_BABELDOC_BATCH_CHARACTERS`、
+`GLOSS_BABELDOC_MODEL_CONCURRENCY`、`GLOSS_BABELDOC_FILL_DELAY_MS` 和
+`GLOSS_BABELDOC_REFILL_DELAY_MS` 覆盖。默认值分别为 `12`、`1800`、`2`、`25` 和 `0`；
+提高真实模型并发会占用额外 Spark 额度，通常不如增加上游预取和合批稳定。
+`GLOSS_BABELDOC_SKIP_CLEAN=1`、`GLOSS_BABELDOC_DISABLE_SAME_TEXT_FALLBACK=1`
+和 `GLOSS_BABELDOC_IGNORE_CACHE=1` 分别用于验证快速 PDF 保存、关闭同文重译和无缓存基准；
+它们默认关闭，确认输出兼容性和翻译完整性后再考虑提升为默认行为。
+
+PDF 交互后续：BabelDOC/DocLayout 继续按需启动，不长期占用约 500–600 MB 内存。
+进度展示需要把“正在启动翻译服务”与“正在翻译文档”拆成独立阶段；服务就绪后再展示
+可量化的页数或段落进度，避免模型加载期间看起来像任务卡住。后续可增加短时保活，但不作为
+默认常驻服务。
+
+调度后续：网页、字幕和 BabelDOC 的请求都应进入同一个派发中心。上游 qps 只控制预取和
+入队，不再直接决定模型并发；派发中心统一维护每条 thread 的空闲、运行、model wait、
+hedge 和交互保留状态，并负责优先级、合批、背压与取消。第三条 thread 默认保留给交互，
+只在队列接近排空且存在真实长尾时做 tail hedge，避免竞速请求反过来阻塞正常 PDF 批次。
 
 本地 provider 默认查找 App 内的 `llama-server` helper、`GLOSS_LLAMA_SERVER_BIN`、`PATH`，以及 Homebrew 常用路径。模型可通过 `GLOSS_LLAMA_MODEL` 覆盖为 Hugging Face GGUF repo 或本地 `.gguf` 文件：
 
