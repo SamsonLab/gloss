@@ -312,9 +312,55 @@ the third run rendered normally, all pages retained selectable text, and every p
 Letter size. The optimization is retained as a low-risk efficiency improvement, not presented as
 an end-to-end breakthrough.
 
-The live benchmark XCTest now accepts `GLOSS_BABELDOC_BENCHMARK_QPS` and
-`GLOSS_BABELDOC_BENCHMARK_OUTPUT_MODE`, so future QPS and Mono/Dual comparisons use the same
-reproducible entry point.
+The live benchmark XCTest now accepts `GLOSS_BABELDOC_BENCHMARK_QPS`,
+`GLOSS_BABELDOC_BENCHMARK_PAGE_GROUP_SIZE`, and `GLOSS_BABELDOC_BENCHMARK_OUTPUT_MODE`, so future
+QPS, page-group, and Mono/Dual comparisons use the same reproducible entry point.
+
+## Real-time progress and page-group checkpoint — 2026-07-17
+
+BabelDOC already exposes structured `progress_start`, `progress_update`, and `progress_end`
+events internally. Its CLI renders those events with Rich, which collapses to a final progress
+table when stdout is a pipe. Gloss now launches the installed BabelDOC Python environment through
+a small instrumentation runner. The runner replaces only the CLI progress renderer and emits
+bounded NDJSON; translation configuration, parsing, translation, typesetting, and result merging
+remain BabelDOC code. The runner uses a guarded `__main__` entry and `freeze_support()` so macOS
+spawned parser processes import it without recursively launching the CLI.
+
+Gloss maps the native stages into product phases and displays live progress for service startup,
+parse/layout, model translation, typesetting/style restoration, and PDF save. The PDF window also
+reads document-turn measurements from the shared dispatch state and shows model preparation and
+model wait separately. The final runtime log persists wall time, every BabelDOC phase, cumulative
+model preparation/wait/output time, and model-turn count.
+
+A warm-cache 15-page smoke run verified the event path end to end:
+
+| Region | Measured wall time |
+| --- | ---: |
+| Python, BabelDOC, and DocLayout startup | 15.88 s |
+| Parse and layout | 10.89 s |
+| Translation phase | 1.92 s |
+| Typesetting and drawing | 3.22 s |
+| Font subset and save | 7.59 s |
+| End to end | 39.51 s |
+
+The short translation phase is a warm-cache result and is not a new cold-model performance claim.
+The generated Mono PDF retained all 15 Letter-size pages and a 2.3 MB cleaned output. Every page
+was rendered at 90 dpi and inspected; no page was empty, clipped, black, reordered, or missing a
+figure.
+
+The same checkpoint tested BabelDOC's built-in page splitting at 12 pages per part. An initial
+instrumentation run lacked a guarded Python entry point, recursively entered the CLI from a macOS
+spawned child, and was discarded. After adding `__main__` and `freeze_support()`, the valid warm
+12+3 page run took 59.43 seconds wall / 44.52 seconds inside BabelDOC, compared with 39.51 / 25.83
+seconds for one part. Parse rose from 10.89 to 14.97 seconds and subset/save from 7.59 to 22.20
+seconds. The result still retained all 15 Letter-size pages, and every page rendered normally.
+
+BabelDOC's current split loop processes parts serially and repeats expensive parse, font, save,
+and merge work, so smaller parts are not a pipeline. Production therefore keeps the existing
+50-page part size while retaining an explicit request-level page-group parameter, the opt-in
+`GLOSS_BABELDOC_PAGE_GROUP_SIZE` override, and native part progress for future experiments. Real
+overlap still requires a BabelDOC core change that pipelines a later part's parse work with an
+earlier part's model translation inside one managed process.
 
 ## Larger follow-up opportunities
 
