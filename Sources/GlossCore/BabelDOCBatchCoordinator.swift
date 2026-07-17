@@ -235,9 +235,13 @@ actor BabelDOCBatchCoordinator {
             guard !batch.isEmpty else { break }
             activeBatchCount += 1
             let characterCount = batch.reduce(0) { $0 + $1.brokerItem.text.count }
+            let characterUtilization = min(
+                100,
+                characterCount * 100 / configuration.maximumBatchCharacters
+            )
             runtimeLog.write(
                 "bridge",
-                "babeldoc_batch_dispatched items=\(batch.count) chars=\(characterCount) requests=\(Set(batch.map(\.requestID)).count) active_batches=\(activeBatchCount) pending_items=\(pendingItems.count)"
+                "babeldoc_batch_dispatched items=\(batch.count) chars=\(characterCount) utilization_pct=\(characterUtilization) requests=\(Set(batch.map(\.requestID)).count) active_batches=\(activeBatchCount) pending_items=\(pendingItems.count)"
             )
             let broker = self.broker
             let key = batch[0].key
@@ -266,22 +270,29 @@ actor BabelDOCBatchCoordinator {
 
     private func takeNextBatch() -> [PendingItem] {
         guard let first = pendingItems.first else { return [] }
-        var selectedIndices: [Int] = []
-        var characterCount = 0
+        var selectedIndices = [0]
+        var characterCount = first.brokerItem.text.count
 
-        for (index, pending) in pendingItems.enumerated()
-        where pending.key == first.key {
-            let nextCharacters = characterCount + pending.brokerItem.text.count
-            if !selectedIndices.isEmpty,
-                selectedIndices.count >= configuration.maximumBatchItems
-                    || nextCharacters > configuration.maximumBatchCharacters
-            {
-                break
+        let candidates = pendingItems.indices.dropFirst()
+            .filter { pendingItems[$0].key == first.key }
+            .sorted { left, right in
+                let leftCount = pendingItems[left].brokerItem.text.count
+                let rightCount = pendingItems[right].brokerItem.text.count
+                if leftCount == rightCount { return left < right }
+                return leftCount > rightCount
+            }
+
+        for index in candidates {
+            guard selectedIndices.count < configuration.maximumBatchItems else { break }
+            let itemCharacters = pendingItems[index].brokerItem.text.count
+            guard characterCount + itemCharacters <= configuration.maximumBatchCharacters else {
+                continue
             }
             selectedIndices.append(index)
-            characterCount = nextCharacters
+            characterCount += itemCharacters
         }
 
+        selectedIndices.sort()
         let selected = selectedIndices.map { pendingItems[$0] }
         for index in selectedIndices.reversed() {
             pendingItems.remove(at: index)

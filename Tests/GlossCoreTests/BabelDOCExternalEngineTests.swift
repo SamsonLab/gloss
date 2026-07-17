@@ -4,6 +4,47 @@ import XCTest
 @testable import GlossCore
 
 final class BabelDOCExternalEngineTests: XCTestCase {
+    func testLiveBenchmarkWhenRequested() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["GLOSS_RUN_BABELDOC_BENCHMARK"] == "1" else {
+            throw XCTSkip(
+                "Set GLOSS_RUN_BABELDOC_BENCHMARK=1 and the benchmark paths to run BabelDOC end to end."
+            )
+        }
+        let inputPath = try XCTUnwrap(environment["GLOSS_BABELDOC_BENCHMARK_INPUT"])
+        let outputPath = try XCTUnwrap(environment["GLOSS_BABELDOC_BENCHMARK_OUTPUT"])
+        let tokenPath = try XCTUnwrap(environment["GLOSS_BABELDOC_BENCHMARK_TOKEN_FILE"])
+        let token = try String(contentsOfFile: tokenPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let outputURL = URL(fileURLWithPath: outputPath, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: outputURL,
+            withIntermediateDirectories: true
+        )
+
+        let start = ContinuousClock.now
+        let result = try await BabelDOCExternalEngine().translate(
+            BabelDOCTranslationRequest(
+                inputURL: URL(fileURLWithPath: inputPath),
+                outputDirectory: outputURL,
+                sourceLanguageCode: "en",
+                targetLanguageCode: "zh-CN",
+                bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
+                bridgeToken: token,
+                skipScannedDetection: true,
+                outputMode: .monolingual
+            )
+        )
+        let elapsed = start.duration(to: .now)
+        try Data(result.log.utf8).write(
+            to: outputURL.appendingPathComponent("benchmark.log"),
+            options: .atomic
+        )
+
+        XCTAssertNotNil(result.monolingualPDF)
+        print("BABELDOC_BENCHMARK elapsed=\(elapsed) output=\(outputURL.path)")
+    }
+
     func testReliableTextLayerRequiresTextAcrossMostSampledPages() {
         let densePage = String(repeating: "A paragraph of selectable text. ", count: 5)
 

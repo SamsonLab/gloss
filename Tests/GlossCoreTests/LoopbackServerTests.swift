@@ -538,6 +538,41 @@ final class LoopbackServerTests: XCTestCase {
         XCTAssertTrue(requests.allSatisfy { $0.items.count <= 2 })
     }
 
+    func testBabelDOCBatchCoordinatorFillsAroundAnItemThatDoesNotFit() async throws {
+        let backend = BridgeBackend()
+        let coordinator = BabelDOCBatchCoordinator(
+            broker: TranslationBroker(backend: backend),
+            configuration: .init(
+                maximumBatchItems: 4,
+                maximumBatchCharacters: 1_000,
+                maximumConcurrentBatches: 1,
+                fillDelayNanoseconds: 0
+            )
+        )
+        let items = [
+            TranslationItem(id: "large-1", text: String(repeating: "A", count: 900)),
+            TranslationItem(id: "large-2", text: String(repeating: "B", count: 900)),
+            TranslationItem(id: "small-1", text: String(repeating: "C", count: 100)),
+            TranslationItem(id: "small-2", text: String(repeating: "D", count: 100)),
+        ]
+
+        let outputs = try await coordinator.translate(
+            items: items,
+            targetLanguage: "Chinese (Simplified)",
+            context: "PDF"
+        )
+
+        XCTAssertEqual(outputs.map(\.id), items.map(\.id))
+        let requests = await backend.recordedRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.map { $0.items.count }, [2, 2])
+        XCTAssertTrue(
+            requests.allSatisfy {
+                $0.items.reduce(0) { $0 + $1.text.count } == 1_000
+            }
+        )
+    }
+
     func testBabelDOCBatchConfigurationReadsBoundedEnvironmentOverrides() {
         let configuration = BabelDOCBatchCoordinator.Configuration(
             environment: [
