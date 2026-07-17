@@ -197,7 +197,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             },
             bridgeToken: { [weak self] in
                 self?.pairingToken
-            }
+            },
+            translationDispatchState: dispatchState
         )
         pdfTranslationWindowController = controller
         return controller

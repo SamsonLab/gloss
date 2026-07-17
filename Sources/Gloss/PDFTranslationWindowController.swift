@@ -27,12 +27,14 @@ private enum PDFTranslationWindowError: LocalizedError {
 final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     private let targetLanguage: () -> String
     private let bridgeToken: () -> String?
+    private let translationDispatchState: TranslationDispatchState
     private let babelDOCExternalEngine = BabelDOCExternalEngine()
 
     private let window: NSWindow
     private let pdfView = PDFView()
     private let fileLabel = NSTextField(labelWithString: "PDF 翻译")
     private let statusLabel = NSTextField(labelWithString: "选择一个 PDF 开始")
+    private let timingLabel = NSTextField(labelWithString: "")
     private let pageLabel = NSTextField(labelWithString: "—")
     private let progressIndicator = NSProgressIndicator()
     private let outputModeControl = NSSegmentedControl(
@@ -50,14 +52,21 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
 
     private var documentURL: URL?
     private var layoutTranslationTask: Task<Void, Never>?
+    private var progressRefreshTask: Task<Void, Never>?
     private var layoutTranslationID: UUID?
+    private var translationStartedAt: Date?
+    private var latestProgress: BabelDOCProgressUpdate?
+    private var latestPerformance =
+        TranslationDispatchState.DocumentPerformanceSnapshot()
 
     init(
         targetLanguage: @escaping () -> String,
-        bridgeToken: @escaping () -> String?
+        bridgeToken: @escaping () -> String?,
+        translationDispatchState: TranslationDispatchState
     ) {
         self.targetLanguage = targetLanguage
         self.bridgeToken = bridgeToken
+        self.translationDispatchState = translationDispatchState
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 980, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -91,6 +100,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         updatePageLabel()
         statusLabel.stringValue =
             "选择 Mono 或 Dual；Gloss 将通过当前 provider 翻译完整文档"
+        timingLabel.stringValue = ""
         updateTranslateButton()
 
         window.center()
@@ -108,6 +118,8 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         layoutTranslationID = nil
         layoutTranslationTask?.cancel()
         layoutTranslationTask = nil
+        progressRefreshTask?.cancel()
+        progressRefreshTask = nil
         finishRunning()
     }
 
@@ -149,6 +161,14 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             for: .horizontal
         )
 
+        timingLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        timingLabel.textColor = .tertiaryLabelColor
+        timingLabel.lineBreakMode = .byTruncatingTail
+        timingLabel.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
         let titleStack = NSStackView(views: [fileLabel, statusLabel])
         titleStack.orientation = .vertical
         titleStack.alignment = .leading
@@ -160,7 +180,9 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         )
         pageLabel.textColor = .secondaryLabelColor
 
-        progressIndicator.style = .spinning
+        progressIndicator.style = .bar
+        progressIndicator.minValue = 0
+        progressIndicator.maxValue = 100
         progressIndicator.controlSize = .small
         progressIndicator.isIndeterminate = true
         progressIndicator.isHidden = true
@@ -199,6 +221,8 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         headerStack.spacing = 10
         headerStack.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(headerStack)
+        timingLabel.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(timingLabel)
 
         pdfView.translatesAutoresizingMaskIntoConstraints = false
         pdfView.autoScales = true
@@ -215,7 +239,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             header.topAnchor.constraint(equalTo: content.topAnchor),
             header.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            header.heightAnchor.constraint(equalToConstant: 64),
+            header.heightAnchor.constraint(equalToConstant: 86),
 
             headerStack.leadingAnchor.constraint(
                 equalTo: header.leadingAnchor,
@@ -225,8 +249,20 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
                 equalTo: header.trailingAnchor,
                 constant: -18
             ),
-            headerStack.centerYAnchor.constraint(
-                equalTo: header.centerYAnchor
+            headerStack.topAnchor.constraint(equalTo: header.topAnchor, constant: 10),
+            progressIndicator.widthAnchor.constraint(equalToConstant: 112),
+
+            timingLabel.leadingAnchor.constraint(
+                equalTo: header.leadingAnchor,
+                constant: 18
+            ),
+            timingLabel.trailingAnchor.constraint(
+                equalTo: header.trailingAnchor,
+                constant: -18
+            ),
+            timingLabel.bottomAnchor.constraint(
+                equalTo: header.bottomAnchor,
+                constant: -8
             ),
 
             pdfView.topAnchor.constraint(equalTo: header.bottomAnchor),
@@ -355,16 +391,22 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         outputModeControl.isEnabled = false
         stopButton.isEnabled = true
         progressIndicator.isHidden = false
+        progressIndicator.isIndeterminate = true
+        progressIndicator.doubleValue = 0
         progressIndicator.startAnimation(nil)
-        statusLabel.stringValue =
-            outputMode == .monolingual
-            ? "BabelDOC 正在生成 Mono 单语 PDF；高速预取、双路模型翻译已启用…"
-            : "BabelDOC 正在生成 Dual 双语 PDF；高速预取、双路模型翻译已启用…"
+        statusLabel.stringValue = "正在启动 BabelDOC 翻译服务…"
+        timingLabel.stringValue = "启动 0.0s"
+        translationStartedAt = Date()
+        latestProgress = nil
+        latestPerformance = .init()
 
         let taskID = UUID()
         layoutTranslationID = taskID
+        startProgressRefresh(for: taskID)
         layoutTranslationTask = Task { [weak self] in
             guard let self else { return }
+            await translationDispatchState.beginDocumentPerformanceRun(id: taskID)
+            var completedTimings: BabelDOCPhaseTimings?
             defer {
                 try? FileManager.default.removeItem(at: outputDirectory)
                 if layoutTranslationID == taskID {
@@ -385,18 +427,19 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
                         )!,
                         bridgeToken: bridgeToken,
                         qps: 8,
+                        maximumPagesPerPart: Self.babelDOCMaximumPagesPerPart(),
                         skipScannedDetection: skipScannedDetection,
                         outputMode: outputMode
                     ),
-                    runtime: runtime
-                ) { [weak self] output in
-                    guard
-                        let summary = Self.babelDOCProgressSummary(output)
-                    else { return }
-                    Task { @MainActor [weak self] in
-                        self?.statusLabel.stringValue = summary
+                    runtime: runtime,
+                    onProgress: { [weak self] progress in
+                        Task { @MainActor [weak self] in
+                            await self?.showProgress(progress, for: taskID)
+                        }
                     }
-                }
+                )
+                completedTimings = result.timings
+                await Task.yield()
                 try Task.checkCancellation()
                 let generated =
                     outputMode == .monolingual
@@ -414,6 +457,23 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             } catch {
                 statusLabel.stringValue =
                     "BabelDOC 翻译失败：\(error.localizedDescription)"
+            }
+            let performance =
+                await translationDispatchState
+                .endDocumentPerformanceRun(id: taskID)
+            if let performance, layoutTranslationID == taskID {
+                latestPerformance = performance
+                updateTimingLabel()
+            }
+            if let completedTimings, let performance {
+                let wallMilliseconds =
+                    translationStartedAt.map {
+                        Int(Date().timeIntervalSince($0) * 1_000)
+                    } ?? 0
+                GlossRuntimeLog.shared.write(
+                    "pdf",
+                    "translation_complete mode=\(outputMode.rawValue) wall_ms=\(wallMilliseconds) launching_ms=\(completedTimings.launchingMilliseconds) parsing_ms=\(completedTimings.parsingMilliseconds) translating_ms=\(completedTimings.translatingMilliseconds) typesetting_ms=\(completedTimings.typesettingMilliseconds) saving_ms=\(completedTimings.savingMilliseconds) model_prepare_ms=\(performance.preparationMilliseconds) model_wait_ms=\(performance.modelWaitMilliseconds) model_output_stream_ms=\(performance.outputStreamMilliseconds) model_turn_ms=\(performance.totalTurnMilliseconds) model_turns=\(performance.completedTurns)"
+                )
             }
         }
     }
@@ -443,25 +503,126 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             ?? "en"
     }
 
-    nonisolated private static func babelDOCProgressSummary(
-        _ output: String
-    ) -> String? {
-        let cleaned =
-            output
-            .replacingOccurrences(of: "\r", with: "\n")
-            .split(separator: "\n")
-            .map {
-                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+    nonisolated private static func babelDOCMaximumPagesPerPart(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        guard let rawValue = environment["GLOSS_BABELDOC_PAGE_GROUP_SIZE"],
+            let value = Int(rawValue),
+            (4...200).contains(value)
+        else { return 50 }
+        return value
+    }
+
+    private func startProgressRefresh(for taskID: UUID) {
+        progressRefreshTask?.cancel()
+        progressRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task<Never, Never>.sleep(nanoseconds: 500_000_000)
+                } catch {
+                    return
+                }
+                guard let self, layoutTranslationID == taskID else { return }
+                if let performance =
+                    await translationDispatchState
+                    .documentPerformanceSnapshot(for: taskID)
+                {
+                    latestPerformance = performance
+                }
+                updateTimingLabel()
             }
-            .last(where: { !$0.isEmpty })
-        guard let cleaned else { return nil }
-        if let percent = cleaned.range(
-            of: #"\d{1,3}(?:\.\d+)?%"#,
-            options: .regularExpression
-        ) {
-            return "BabelDOC 翻译 \(cleaned[percent])"
         }
-        return nil
+    }
+
+    private func showProgress(
+        _ progress: BabelDOCProgressUpdate,
+        for taskID: UUID
+    ) async {
+        guard layoutTranslationID == taskID else { return }
+        latestProgress = progress
+        if let performance =
+            await translationDispatchState
+            .documentPerformanceSnapshot(for: taskID)
+        {
+            latestPerformance = performance
+        }
+
+        switch progress.phase {
+        case .launching:
+            progressIndicator.isIndeterminate = true
+            progressIndicator.startAnimation(nil)
+        default:
+            progressIndicator.stopAnimation(nil)
+            progressIndicator.isIndeterminate = false
+            progressIndicator.doubleValue = max(1, progress.overallProgress)
+        }
+
+        let percent = Int(progress.overallProgress.rounded())
+        let part: String
+        if let partIndex = progress.partIndex,
+            let totalParts = progress.totalParts,
+            totalParts > 1
+        {
+            part = " · 第 \(partIndex)/\(totalParts) 组"
+        } else {
+            part = ""
+        }
+        switch progress.phase {
+        case .launching:
+            statusLabel.stringValue = "正在启动 BabelDOC 翻译服务…"
+        case .parsing:
+            statusLabel.stringValue = "正在解析页面与版面 · \(percent)%\(part)"
+        case .translating:
+            statusLabel.stringValue = "模型正在翻译 · \(percent)%\(part)"
+        case .typesetting:
+            statusLabel.stringValue = "正在排版并恢复原始样式 · \(percent)%\(part)"
+        case .saving:
+            statusLabel.stringValue = "正在生成 PDF · \(percent)%\(part)"
+        case .finalizing:
+            statusLabel.stringValue = "正在整理输出文件 · \(percent)%"
+        case .completed:
+            statusLabel.stringValue = "BabelDOC 处理完成，正在保存…"
+        }
+        updateTimingLabel()
+    }
+
+    private func updateTimingLabel() {
+        let timings = latestProgress?.timings ?? BabelDOCPhaseTimings()
+        var launching = timings.launchingMilliseconds
+        if latestProgress == nil || latestProgress?.phase == .launching,
+            let translationStartedAt
+        {
+            launching = max(
+                launching,
+                Int(Date().timeIntervalSince(translationStartedAt) * 1_000)
+            )
+        }
+        var components = ["启动 \(formattedDuration(launching))"]
+        if latestProgress?.phase != .launching {
+            components.append("解析 \(formattedDuration(timings.parsingMilliseconds))")
+            if latestPerformance.completedTurns > 0 {
+                components.append(
+                    "模型准备累计 \(formattedDuration(latestPerformance.preparationMilliseconds))"
+                )
+                components.append(
+                    "模型等待累计 \(formattedDuration(latestPerformance.modelWaitMilliseconds))"
+                )
+            } else {
+                components.append("模型等待 —")
+            }
+            components.append(
+                "排版 \(formattedDuration(timings.typesettingMilliseconds))"
+            )
+            components.append("保存 \(formattedDuration(timings.savingMilliseconds))")
+            if latestPerformance.completedTurns > 0 {
+                components.append("\(latestPerformance.completedTurns) 批")
+            }
+        }
+        timingLabel.stringValue = components.joined(separator: " · ")
+    }
+
+    private func formattedDuration(_ milliseconds: Int) -> String {
+        String(format: "%.1fs", Double(max(0, milliseconds)) / 1_000)
     }
 
     private func updateTranslateButton() {
@@ -480,6 +641,8 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     }
 
     private func finishRunning() {
+        progressRefreshTask?.cancel()
+        progressRefreshTask = nil
         progressIndicator.stopAnimation(nil)
         progressIndicator.isHidden = true
         stopButton.isEnabled = false

@@ -379,6 +379,18 @@ public actor CodexAppServerClient: TranslationBackend {
         }
 
         let stages = result.waitStages
+        if request.contentKind == .document, let dispatchState {
+            await dispatchState.recordDocumentTurn(
+                preparationMilliseconds: Self.elapsedMilliseconds(
+                    from: startedAt,
+                    to: preparedAt
+                ),
+                queueWaitMilliseconds: result.queueWaitMilliseconds,
+                modelWaitMilliseconds: stages.modelWaitMilliseconds,
+                outputStreamMilliseconds: stages.outputStreamMilliseconds,
+                totalTurnMilliseconds: stages.totalMilliseconds
+            )
+        }
         runtimeLog.write(
             "codex",
             "translation_complete items=\(result.outputs.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) priority=\(request.priority.rawValue) turn_id=\(result.turnID) attempt=\(result.kind.rawValue) hedge_won=\(result.kind == .hedge) prepare_ms=\(Self.elapsedMilliseconds(from: startedAt, to: preparedAt)) queue_wait_ms=\(result.queueWaitMilliseconds) turn_start_ms=\(result.turnStartMilliseconds) turn_wait_ms=\(stages.totalMilliseconds) turn_dispatch_ms=\(stages.dispatchMilliseconds) model_wait_ms=\(stages.modelWaitMilliseconds) first_delta_wait_ms=\(stages.firstDeltaWaitMilliseconds) output_stream_ms=\(stages.outputStreamMilliseconds) message_finalize_ms=\(stages.messageFinalizeMilliseconds) turn_finalize_ms=\(stages.turnFinalizeMilliseconds) turn_complete_ms=\(stages.totalMilliseconds) parse_ms=\(result.parseMilliseconds) rollback_ms=\(result.rollbackMilliseconds)"

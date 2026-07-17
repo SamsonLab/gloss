@@ -4,6 +4,47 @@ import XCTest
 @testable import GlossCore
 
 final class TranslationDispatchCenterTests: XCTestCase {
+    func testDocumentPerformanceRunAccumulatesOnlyWhileActive() async {
+        let state = TranslationDispatchState()
+        let runID = UUID()
+
+        await state.recordDocumentTurn(
+            preparationMilliseconds: 99,
+            queueWaitMilliseconds: 99,
+            modelWaitMilliseconds: 99,
+            outputStreamMilliseconds: 99,
+            totalTurnMilliseconds: 99
+        )
+        await state.beginDocumentPerformanceRun(id: runID)
+        await state.recordDocumentTurn(
+            preparationMilliseconds: 600,
+            queueWaitMilliseconds: 20,
+            modelWaitMilliseconds: 750,
+            outputStreamMilliseconds: 120,
+            totalTurnMilliseconds: 1_100
+        )
+        await state.recordDocumentTurn(
+            preparationMilliseconds: 15,
+            queueWaitMilliseconds: 30,
+            modelWaitMilliseconds: 900,
+            outputStreamMilliseconds: 80,
+            totalTurnMilliseconds: 1_250
+        )
+
+        let active = await state.documentPerformanceSnapshot(for: runID)
+        XCTAssertEqual(active?.completedTurns, 2)
+        XCTAssertEqual(active?.preparationMilliseconds, 615)
+        XCTAssertEqual(active?.queueWaitMilliseconds, 50)
+        XCTAssertEqual(active?.modelWaitMilliseconds, 1_650)
+        XCTAssertEqual(active?.outputStreamMilliseconds, 200)
+        XCTAssertEqual(active?.totalTurnMilliseconds, 2_350)
+
+        let completed = await state.endDocumentPerformanceRun(id: runID)
+        XCTAssertEqual(completed, active)
+        let afterEnd = await state.documentPerformanceSnapshot(for: runID)
+        XCTAssertNil(afterEnd)
+    }
+
     func testBackgroundJobsReserveCapacityForInteractiveWork() async throws {
         let backend = DispatchControlledBackend()
         let dispatchState = TranslationDispatchState()

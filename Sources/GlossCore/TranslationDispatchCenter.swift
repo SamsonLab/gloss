@@ -1,6 +1,31 @@
 import Foundation
 
 public actor TranslationDispatchState {
+    public struct DocumentPerformanceSnapshot: Equatable, Sendable {
+        public let completedTurns: Int
+        public let preparationMilliseconds: Int
+        public let queueWaitMilliseconds: Int
+        public let modelWaitMilliseconds: Int
+        public let outputStreamMilliseconds: Int
+        public let totalTurnMilliseconds: Int
+
+        public init(
+            completedTurns: Int = 0,
+            preparationMilliseconds: Int = 0,
+            queueWaitMilliseconds: Int = 0,
+            modelWaitMilliseconds: Int = 0,
+            outputStreamMilliseconds: Int = 0,
+            totalTurnMilliseconds: Int = 0
+        ) {
+            self.completedTurns = completedTurns
+            self.preparationMilliseconds = preparationMilliseconds
+            self.queueWaitMilliseconds = queueWaitMilliseconds
+            self.modelWaitMilliseconds = modelWaitMilliseconds
+            self.outputStreamMilliseconds = outputStreamMilliseconds
+            self.totalTurnMilliseconds = totalTurnMilliseconds
+        }
+    }
+
     public struct Snapshot: Equatable, Sendable {
         public let pendingInteractiveJobs: Int
         public let pendingVisibleJobs: Int
@@ -29,6 +54,8 @@ public actor TranslationDispatchState {
         activeBackgroundJobs: 0
     )
     private var upstreamBackgroundItems = 0
+    private var documentRunID: UUID?
+    private var documentPerformance = DocumentPerformanceSnapshot()
 
     public init() {}
 
@@ -41,6 +68,51 @@ public actor TranslationDispatchState {
             activeVisibleJobs: centerSnapshot.activeVisibleJobs,
             activeBackgroundJobs: centerSnapshot.activeBackgroundJobs,
             upstreamBackgroundItems: upstreamBackgroundItems
+        )
+    }
+
+    public func beginDocumentPerformanceRun(id: UUID) {
+        documentRunID = id
+        documentPerformance = DocumentPerformanceSnapshot()
+    }
+
+    public func documentPerformanceSnapshot(
+        for id: UUID
+    ) -> DocumentPerformanceSnapshot? {
+        guard documentRunID == id else { return nil }
+        return documentPerformance
+    }
+
+    @discardableResult
+    public func endDocumentPerformanceRun(
+        id: UUID
+    ) -> DocumentPerformanceSnapshot? {
+        guard documentRunID == id else { return nil }
+        let snapshot = documentPerformance
+        documentRunID = nil
+        return snapshot
+    }
+
+    public func recordDocumentTurn(
+        preparationMilliseconds: Int,
+        queueWaitMilliseconds: Int,
+        modelWaitMilliseconds: Int,
+        outputStreamMilliseconds: Int,
+        totalTurnMilliseconds: Int
+    ) {
+        guard documentRunID != nil else { return }
+        documentPerformance = DocumentPerformanceSnapshot(
+            completedTurns: documentPerformance.completedTurns + 1,
+            preparationMilliseconds: documentPerformance.preparationMilliseconds
+                + max(0, preparationMilliseconds),
+            queueWaitMilliseconds: documentPerformance.queueWaitMilliseconds
+                + max(0, queueWaitMilliseconds),
+            modelWaitMilliseconds: documentPerformance.modelWaitMilliseconds
+                + max(0, modelWaitMilliseconds),
+            outputStreamMilliseconds: documentPerformance.outputStreamMilliseconds
+                + max(0, outputStreamMilliseconds),
+            totalTurnMilliseconds: documentPerformance.totalTurnMilliseconds
+                + max(0, totalTurnMilliseconds)
         )
     }
 

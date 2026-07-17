@@ -19,6 +19,9 @@ final class BabelDOCExternalEngineTests: XCTestCase {
         let qps =
             environment["GLOSS_BABELDOC_BENCHMARK_QPS"]
             .flatMap(Int.init) ?? 8
+        let pageGroupSize =
+            environment["GLOSS_BABELDOC_BENCHMARK_PAGE_GROUP_SIZE"]
+            .flatMap(Int.init) ?? 50
         let outputMode =
             environment["GLOSS_BABELDOC_BENCHMARK_OUTPUT_MODE"]
             .flatMap(BabelDOCOutputMode.init(rawValue:)) ?? .monolingual
@@ -38,6 +41,7 @@ final class BabelDOCExternalEngineTests: XCTestCase {
                 bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
                 bridgeToken: token,
                 qps: qps,
+                maximumPagesPerPart: pageGroupSize,
                 skipScannedDetection: true,
                 outputMode: outputMode
             )
@@ -55,7 +59,7 @@ final class BabelDOCExternalEngineTests: XCTestCase {
             XCTAssertNotNil(result.bilingualPDF)
         }
         print(
-            "BABELDOC_BENCHMARK elapsed=\(elapsed) qps=\(qps) mode=\(outputMode.rawValue) output=\(outputURL.path)"
+            "BABELDOC_BENCHMARK elapsed=\(elapsed) qps=\(qps) page_group=\(pageGroupSize) mode=\(outputMode.rawValue) launching_ms=\(result.timings.launchingMilliseconds) parsing_ms=\(result.timings.parsingMilliseconds) translating_ms=\(result.timings.translatingMilliseconds) typesetting_ms=\(result.timings.typesettingMilliseconds) saving_ms=\(result.timings.savingMilliseconds) output=\(outputURL.path)"
         )
     }
 
@@ -146,6 +150,8 @@ final class BabelDOCExternalEngineTests: XCTestCase {
         XCTAssertEqual(qpsIndex.map { launch.arguments[$0 + 1] }, "3")
         let workerIndex = launch.arguments.firstIndex(of: "--pool-max-workers")
         XCTAssertEqual(workerIndex.map { launch.arguments[$0 + 1] }, "3")
+        let partIndex = launch.arguments.firstIndex(of: "--max-pages-per-part")
+        XCTAssertEqual(partIndex.map { launch.arguments[$0 + 1] }, "50")
         XCTAssertTrue(launch.arguments.contains("--skip-scanned-detection"))
         XCTAssertTrue(launch.arguments.contains("--config"))
         XCTAssertTrue(launch.arguments.contains("/tmp/gloss-babeldoc.toml"))
@@ -228,6 +234,170 @@ final class BabelDOCExternalEngineTests: XCTestCase {
             XCTAssertFalse(normalLaunch.arguments.contains(argument))
             XCTAssertTrue(fastLaunch.arguments.contains(argument))
         }
+    }
+
+    func testPageGroupSizeIsPassedToBabelDOC() {
+        let request = BabelDOCTranslationRequest(
+            inputURL: URL(fileURLWithPath: "/tmp/input.pdf"),
+            outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            sourceLanguageCode: "en",
+            targetLanguageCode: "zh-CN",
+            bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
+            bridgeToken: "token",
+            maximumPagesPerPart: 7
+        )
+        let launch = BabelDOCExternalEngine.makeLaunch(
+            runtime: BabelDOCRuntimeLaunch(
+                executable: "/tmp/babeldoc",
+                source: "test"
+            ),
+            request: request,
+            configurationURL: URL(fileURLWithPath: "/tmp/config.toml"),
+            environment: [:]
+        )
+
+        let index = launch.arguments.firstIndex(of: "--max-pages-per-part")
+        XCTAssertEqual(index.map { launch.arguments[$0 + 1] }, "7")
+    }
+
+    func testProgressParserHandlesChunkedNDJSON() throws {
+        let parser = BabelDOCExternalEngine.ProgressOutputParser()
+        let prefix = BabelDOCExternalEngine.progressLinePrefix
+        let first = Data(
+            (prefix
+                + #"{"type":"progress_update","stage":"Parse Page Layout","stage_current":3,"stage_total":10,"overall_progress":12.5,"part_index":1,"total_parts":2}"#
+                + "\n"
+                + prefix
+                + #"{"type":"progress_update","stage":"Translate Para"#).utf8
+        )
+        let second = Data(
+            (#"graphs","stage_current":4,"stage_total":20,"overall_progress":42.0,"part_index":1,"total_parts":2}"#
+                + "\n").utf8
+        )
+
+        let firstEvents = parser.append(first)
+        XCTAssertEqual(firstEvents.count, 1)
+        XCTAssertEqual(firstEvents[0].stage, "Parse Page Layout")
+        XCTAssertEqual(firstEvents[0].overallProgress, 12.5)
+
+        let secondEvents = parser.append(second)
+        XCTAssertEqual(secondEvents.count, 1)
+        XCTAssertEqual(secondEvents[0].stage, "Translate Paragraphs")
+        XCTAssertEqual(secondEvents[0].partIndex, 1)
+        XCTAssertEqual(secondEvents[0].totalParts, 2)
+    }
+
+    func testProgressTimelineMapsBabelDOCStagesToProductPhases() throws {
+        let timeline = BabelDOCExternalEngine.ProgressTimeline()
+        let parser = BabelDOCExternalEngine.ProgressOutputParser()
+        func event(stage: String, progress: Double) throws
+            -> BabelDOCExternalEngine.ProgressWireEvent
+        {
+            let line =
+                BabelDOCExternalEngine.progressLinePrefix
+                + "{\"type\":\"progress_update\",\"stage\":\"\(stage)\",\"overall_progress\":\(progress)}\n"
+            return try XCTUnwrap(parser.append(Data(line.utf8)).first)
+        }
+
+        XCTAssertEqual(timeline.initialUpdate().phase, .launching)
+        XCTAssertEqual(
+            timeline.update(try event(stage: "Parse Paragraphs", progress: 20))?.phase,
+            .parsing
+        )
+        XCTAssertEqual(
+            timeline.update(try event(stage: "Translate Paragraphs", progress: 55))?.phase,
+            .translating
+        )
+        XCTAssertEqual(
+            timeline.update(try event(stage: "Typesetting", progress: 80))?.phase,
+            .typesetting
+        )
+        XCTAssertEqual(
+            timeline.update(try event(stage: "Save PDF", progress: 98))?.phase,
+            .saving
+        )
+        XCTAssertEqual(timeline.finish().phase, .completed)
+    }
+
+    func testProgressRunnerEmitsNativeBabelDOCEventsAsNDJSON() throws {
+        let interpreter = [
+            "/usr/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+        ].first(where: FileManager.default.isExecutableFile(atPath:))
+        guard let interpreter else {
+            throw XCTSkip("Python is unavailable for the BabelDOC runner integration test.")
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let package = directory.appendingPathComponent("babeldoc", isDirectory: true)
+        let executable = directory.appendingPathComponent("babeldoc-cli")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(
+            at: package,
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: package.appendingPathComponent("__init__.py"))
+        let fakeMain = """
+            def create_progress_handler(config, show_log=False):
+                raise RuntimeError("runner did not replace the handler")
+
+            def cli():
+                context, handler = create_progress_handler(None)
+                with context:
+                    handler({
+                        "type": "progress_update",
+                        "stage": "Translate Paragraphs",
+                        "stage_current": 3,
+                        "stage_total": 8,
+                        "overall_progress": 51.5,
+                        "part_index": 2,
+                        "total_parts": 3,
+                    })
+            """
+        try Data(fakeMain.utf8).write(
+            to: package.appendingPathComponent("main.py")
+        )
+        try Data("#!\(interpreter)\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: executable.path
+        )
+
+        let runtime = BabelDOCRuntimeLaunch(
+            executable: executable.path,
+            source: "test"
+        )
+        let runner = try XCTUnwrap(
+            BabelDOCExternalEngine.writeProgressRunner(
+                for: runtime,
+                in: directory
+            )
+        )
+        let launch = BabelDOCExternalEngine.progressLaunch(
+            base: (executable.path, [], ["PYTHONPATH": directory.path]),
+            runtime: runtime,
+            runnerURL: runner
+        )
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: launch.executable)
+        process.arguments = launch.arguments
+        process.environment = launch.environment
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        let events = BabelDOCExternalEngine.ProgressOutputParser().append(output)
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0].stage, "Translate Paragraphs")
+        XCTAssertEqual(events[0].overallProgress, 51.5)
+        XCTAssertEqual(events[0].partIndex, 2)
+        XCTAssertEqual(events[0].totalParts, 3)
     }
 
     func testWritesBridgeTokenToPrivateConfigurationFile() throws {

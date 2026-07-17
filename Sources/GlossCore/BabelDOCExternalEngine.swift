@@ -24,6 +24,7 @@ public struct BabelDOCTranslationRequest: Sendable {
     public let bridgeBaseURL: URL
     public let bridgeToken: String
     public let qps: Int
+    public let maximumPagesPerPart: Int
     public let skipScannedDetection: Bool
     public let outputMode: BabelDOCOutputMode
 
@@ -35,6 +36,7 @@ public struct BabelDOCTranslationRequest: Sendable {
         bridgeBaseURL: URL,
         bridgeToken: String,
         qps: Int = 8,
+        maximumPagesPerPart: Int = 50,
         skipScannedDetection: Bool = false,
         outputMode: BabelDOCOutputMode = .monolingual
     ) {
@@ -45,6 +47,7 @@ public struct BabelDOCTranslationRequest: Sendable {
         self.bridgeBaseURL = bridgeBaseURL
         self.bridgeToken = bridgeToken
         self.qps = max(1, qps)
+        self.maximumPagesPerPart = max(1, maximumPagesPerPart)
         self.skipScannedDetection = skipScannedDetection
         self.outputMode = outputMode
     }
@@ -54,15 +57,18 @@ public struct BabelDOCTranslationResult: Equatable, Sendable {
     public let monolingualPDF: URL?
     public let bilingualPDF: URL?
     public let log: String
+    public let timings: BabelDOCPhaseTimings
 
     public init(
         monolingualPDF: URL?,
         bilingualPDF: URL?,
-        log: String
+        log: String,
+        timings: BabelDOCPhaseTimings = BabelDOCPhaseTimings()
     ) {
         self.monolingualPDF = monolingualPDF
         self.bilingualPDF = bilingualPDF
         self.log = log
+        self.timings = timings
     }
 }
 
@@ -176,7 +182,8 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
     public func translate(
         _ request: BabelDOCTranslationRequest,
         runtime: BabelDOCRuntimeLaunch? = nil,
-        onOutput: (@Sendable (String) -> Void)? = nil
+        onOutput: (@Sendable (String) -> Void)? = nil,
+        onProgress: (@Sendable (BabelDOCProgressUpdate) -> Void)? = nil
     ) async throws -> BabelDOCTranslationResult {
         guard let runtime = runtime ?? Self.resolveRuntime() else {
             throw BabelDOCExternalEngineError.runtimeUnavailable
@@ -189,15 +196,32 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
         )
         let configurationURL = try Self.writeSecureConfiguration(for: request)
         defer { try? FileManager.default.removeItem(at: configurationURL) }
-        let launch = Self.makeLaunch(
+        let baseLaunch = Self.makeLaunch(
             runtime: runtime,
             request: request,
             configurationURL: configurationURL,
             environment: ProcessInfo.processInfo.environment
         )
+        let progressRunnerURL = try Self.writeProgressRunner(
+            for: runtime,
+            in: request.outputDirectory
+        )
+        defer {
+            if let progressRunnerURL {
+                try? FileManager.default.removeItem(at: progressRunnerURL)
+            }
+        }
+        let launch = Self.progressLaunch(
+            base: baseLaunch,
+            runtime: runtime,
+            runnerURL: progressRunnerURL
+        )
         let managed = ManagedProcess()
         let outputPipe = Pipe()
         let outputBuffer = OutputBuffer()
+        let progressParser = ProgressOutputParser()
+        let progressTimeline = ProgressTimeline()
+        onProgress?(progressTimeline.initialUpdate())
         managed.process.executableURL = URL(fileURLWithPath: launch.executable)
         managed.process.arguments = launch.arguments
         managed.process.environment = launch.environment
@@ -208,6 +232,11 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
             let data = handle.availableData
             guard !data.isEmpty else { return }
             outputBuffer.append(data)
+            for event in progressParser.append(data) {
+                if let update = progressTimeline.update(event) {
+                    onProgress?(update)
+                }
+            }
             onOutput?(String(decoding: data, as: UTF8.self))
         }
 
@@ -238,7 +267,17 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
         let remainder = outputPipe.fileHandleForReading.readDataToEndOfFile()
         if !remainder.isEmpty {
             outputBuffer.append(remainder)
+            for event in progressParser.append(remainder) {
+                if let update = progressTimeline.update(event) {
+                    onProgress?(update)
+                }
+            }
             onOutput?(String(decoding: remainder, as: UTF8.self))
+        }
+        for event in progressParser.finish() {
+            if let update = progressTimeline.update(event) {
+                onProgress?(update)
+            }
         }
         try Task.checkCancellation()
 
@@ -254,10 +293,13 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
         guard outputs.monolingualPDF != nil || outputs.bilingualPDF != nil else {
             throw BabelDOCExternalEngineError.outputMissing
         }
+        let completedProgress = progressTimeline.finish()
+        onProgress?(completedProgress)
         return BabelDOCTranslationResult(
             monolingualPDF: outputs.monolingualPDF,
             bilingualPDF: outputs.bilingualPDF,
-            log: log
+            log: log,
+            timings: completedProgress.timings
         )
     }
 
@@ -299,7 +341,7 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
             "--qps", String(request.qps),
             "--pool-max-workers", String(request.qps),
             "--report-interval", "0.5",
-            "--max-pages-per-part", "50",
+            "--max-pages-per-part", String(request.maximumPagesPerPart),
             "--watermark-output-mode", "no_watermark",
             "--no-auto-extract-glossary",
             "--disable-rich-text-translate",
@@ -359,6 +401,102 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
                 .joined(separator: ",")
         }
         return (runtime.executable, arguments, processEnvironment)
+    }
+
+    static func progressLaunch(
+        base: (
+            executable: String,
+            arguments: [String],
+            environment: [String: String]
+        ),
+        runtime: BabelDOCRuntimeLaunch,
+        runnerURL: URL?
+    ) -> (
+        executable: String,
+        arguments: [String],
+        environment: [String: String]
+    ) {
+        guard let runnerURL,
+            let interpreter = pythonInterpreter(for: runtime.executable)
+        else { return base }
+        var environment = base.environment
+        environment["PYTHONUNBUFFERED"] = "1"
+        return (
+            interpreter,
+            [runnerURL.path] + base.arguments,
+            environment
+        )
+    }
+
+    static func pythonInterpreter(for executable: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: executable) else { return nil }
+        defer { try? handle.close() }
+        let data = try? handle.read(upToCount: 512)
+        guard let data,
+            let firstLine = String(decoding: data, as: UTF8.self)
+                .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+                .first,
+            firstLine.hasPrefix("#!")
+        else { return nil }
+        let command = firstLine.dropFirst(2)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.contains(" "),
+            URL(fileURLWithPath: command).lastPathComponent.lowercased()
+                .contains("python"),
+            FileManager.default.isExecutableFile(atPath: command)
+        else { return nil }
+        return command
+    }
+
+    static func writeProgressRunner(
+        for runtime: BabelDOCRuntimeLaunch,
+        in directory: URL
+    ) throws -> URL? {
+        guard pythonInterpreter(for: runtime.executable) != nil else { return nil }
+        let url = directory.appendingPathComponent(".gloss-babeldoc-progress.py")
+        let contents = #"""
+            import contextlib
+            import json
+            import multiprocessing
+
+            import babeldoc.main
+
+            PREFIX = "__GLOSS_BABELDOC_PROGRESS__"
+            FIELDS = (
+                "type",
+                "stage",
+                "stage_current",
+                "stage_total",
+                "overall_progress",
+                "part_index",
+                "total_parts",
+            )
+
+            def create_progress_handler(_translation_config, show_log=False):
+                def handle(event):
+                    if event.get("type") not in {
+                        "stage_summary",
+                        "progress_start",
+                        "progress_update",
+                        "progress_end",
+                    }:
+                        return
+                    payload = {key: event[key] for key in FIELDS if key in event}
+                    print(PREFIX + json.dumps(payload, separators=(",", ":")), flush=True)
+                return contextlib.nullcontext(), handle
+
+            babeldoc.main.create_progress_handler = create_progress_handler
+
+            if __name__ == "__main__":
+                multiprocessing.freeze_support()
+                babeldoc.main.cli()
+            """#
+        try Data(contents.utf8).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+        return url
     }
 
     static func writeSecureConfiguration(
@@ -422,6 +560,7 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
             )
             .replacingOccurrences(of: "\r", with: "\n")
             .split(separator: "\n", omittingEmptySubsequences: true)
+            .filter { !$0.contains(progressLinePrefix) }
             .suffix(200)
             .joined(separator: "\n")
     }
