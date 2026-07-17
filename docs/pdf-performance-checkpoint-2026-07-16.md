@@ -252,6 +252,70 @@ expected to halve the 40-second model service time by itself. A realistic first 
 stable 2–6 second reduction and near-zero normal queue wait while preserving interactive
 capacity.
 
+## Second optimization sweep
+
+The next sweep deliberately tested fixed PDF work outside the dispatcher and more aggressive
+upstream/model policies. Failed experiments were removed from production code after measurement.
+
+### Fast PDF postprocessing: visually correct, text-layer regression
+
+An experimental path asked BabelDOC for its unclean 28 MB output, then used the Python runtime's
+PyMuPDF to subset fonts, compress, validate page count and render every page. In a warm-cache
+paired run, the traditional path took 55.49 seconds wall / 36.95 seconds BabelDOC. The fast path
+took 51.16 seconds wall / 33.89 seconds BabelDOC plus 0.96 seconds of postprocessing. Output size
+was 3.0 MB, and all 15 pages were visually equivalent at 100 dpi.
+
+The visual result hid a real regression: native BabelDOC output mapped spaces to usable nonbreaking
+spaces, while the reconstructed text layer exposed 817 `0x01` control characters. Copy, search and
+downstream extraction would be worse even though rendered pixels were nearly identical. The fast
+postprocessor was therefore rejected and removed. The result also confirms that BabelDOC's font
+subsetting must happen before its final save; it cannot be faithfully reconstructed from an
+already-saved `--skip-clean` PDF.
+
+### Upstream QPS after unified dispatch
+
+Higher QPS did not violate the two-lane model limit, and normal Codex queue wait remained zero.
+It did reduce model turns at QPS 24, but larger, earlier batches produced heavier Spark tails:
+
+| Configuration | Wall | BabelDOC | Model turns | Model window | Cumulative wait | Longest wait |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| QPS 16, run 1 | 96.12 s | 80.90 s | 32 | 52.39 s | 75.79 s | 11.87 s |
+| QPS 24, run 1 | 91.84 s | 77.77 s | 29 | 56.66 s | 90.97 s | 28.17 s |
+| QPS 24, run 2 | 70.83 s | 57.83 s | 29 | 36.31 s | 58.53 s | 3.76 s |
+| QPS 24, run 3 | 94.85 s | 81.13 s | 29 | 57.05 s | 84.84 s | 13.60 s |
+
+QPS 24 achieved a new best run, but its 91.84-second p50 and 94.85-second worst result were worse
+than the established QPS 8 p50 of 82.14 seconds. QPS 8 remains the production default. This also
+shows why turn count alone is not a sufficient optimization metric.
+
+### Forced hard-tail hedge: rejected
+
+A two-level policy deferred the normal three-second hedge while real work was queued, then forced
+one hedge after eight seconds on the reserved third thread. The hedge won, but raised active
+background work to three and made the next normal batch wait 2.24 seconds for a thread. The run
+took 102.45 seconds wall / 85.65 seconds BabelDOC with a 55.35-second model window. The forced
+policy was removed. Dispatch-aware hedges remain allowed only when both the center and BabelDOC
+upstream backlog are empty.
+
+### Compact provider-local item identifiers: retained
+
+The Codex prompt previously repeated BabelDOC's UUID-shaped item identifiers in both input and
+model output. Codex now maps those identifiers to base-36 batch-local indices and restores the
+original IDs after strict `id` and `index` validation. This changes neither the broker API nor
+the output ordering.
+
+Three no-cache QPS 8 runs completed successfully. Their model output-stream totals were 8.58,
+10.12 and 11.45 seconds (p50 10.12 seconds) for 187 completed items. The adjacent long-ID QPS 8
+control used 10.48 seconds. The measured median latency gain is small, about 0.36 seconds, but the
+token reduction is deterministic and the mapping is isolated to the provider. All 15 pages of
+the third run rendered normally, all pages retained selectable text, and every page remained
+Letter size. The optimization is retained as a low-risk efficiency improvement, not presented as
+an end-to-end breakthrough.
+
+The live benchmark XCTest now accepts `GLOSS_BABELDOC_BENCHMARK_QPS` and
+`GLOSS_BABELDOC_BENCHMARK_OUTPUT_MODE`, so future QPS and Mono/Dual comparisons use the same
+reproducible entry point.
+
 ## Larger follow-up opportunities
 
 After the dispatch center is measured:
