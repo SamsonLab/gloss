@@ -123,6 +123,35 @@ third thread temporarily raised active background work to three and normal work 
 0.8–2.4 seconds for a thread. A local optimization made the complete pipeline slower than the
 80.75-second default.
 
+## Dispatch packing follow-up
+
+The first dispatch-center increment replaced FIFO-prefix packing with bounded best-fit packing.
+It always anchors the oldest compatible item to prevent starvation, then fills the remaining
+character budget with the largest compatible waiting items that fit. The dispatcher now logs
+`utilization_pct` for every batch. An opt-in end-to-end XCTest also makes the full no-cache
+BabelDOC benchmark reproducible without hand-written token configuration files.
+
+Three fresh runs used the same reference paper, a restarted Gloss process for an empty broker
+cache, qps 8, 12 items, 1,800 characters, two model lanes and refill delay 0:
+
+| Run | Wall | BabelDOC | Model turns | Model window | Cumulative model wait | Queue wait |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 82.14 s | 67.36 s | 32 | 39.46 s | 55.51 s | 0 ms |
+| 2 | 84.35 s | 69.95 s | 33 | 44.02 s | 63.78 s | 0 ms |
+| 3 | 78.83 s | 65.03 s | 34 | 40.36 s | 59.84 s | 0 ms |
+| p50 / worst | 82.14 / 84.35 s | 67.36 / 69.95 s | 33 / 34 | 40.36 / 44.02 s | 59.84 / 63.78 s | 0 ms |
+
+Best-fit made many large-text batches reach 95–99% of the character budget and the synthetic
+`900, 900, 100, 100` case now needs two turns instead of three. It did not reduce the real
+paper's median turn count below the prior 32-turn best. This is a safe queue-quality improvement,
+not yet a measured end-to-end speedup.
+
+An additional qps-aligned refill experiment waited 125 ms whenever the waiting queue was not
+already full. It increased average character utilization to 64.7%, but still used 34 model
+turns and regressed to 95.06 seconds wall / 80.72 seconds BabelDOC / 45.47 seconds model window.
+Refill delay therefore remains 0. The result rejects fixed queue waiting as a substitute for a
+dispatcher that understands upstream backlog and lane state.
+
 ### Why same-text fallback is not the next target
 
 BabelDOC reported 12 fallback paragraphs in the reference run. Disabling same-text fallback
