@@ -177,7 +177,7 @@ Gloss will keep this service on demand rather than permanently resident. Future 
 `Starting translation service` separately from document translation and may keep the service
 alive briefly while the PDF window remains active.
 
-## Next architecture: one dispatch center
+## Dispatch-center architecture
 
 The current system has three schedulers with only partial information:
 
@@ -185,7 +185,7 @@ The current system has three schedulers with only partial information:
 2. `BabelDOCBatchCoordinator` controls PDF merging and two active batches.
 3. `CodexAppServerClient` controls thread leases and starts hedges.
 
-The next stage should replace their independent execution decisions with one dispatch center:
+The first implementation stage now routes every real cache miss through one dispatch center:
 
 ```text
 web / selection / subtitles / BabelDOC producers
@@ -199,7 +199,34 @@ provider executor (Codex threads or local llama)
 ```
 
 Upstream qps becomes admission and prefetch only. It may enqueue quickly, but it cannot create
-model concurrency. The dispatch center owns the source of truth for each lane:
+model concurrency. The center enforces three total jobs and two background jobs, prioritizes
+interactive then visible then background work with FIFO inside each priority, propagates
+cancellation, and publishes a state snapshot. BabelDOC also reports its not-yet-dispatched
+backlog into that state. Codex checks both layers before admitting a gated tail hedge, so a
+hedge cannot start while known real work is queued.
+
+Provider-local scheduling remains as an executor safety net in this stage. The dispatch center
+is now the admission authority, while the provider still maps admitted work to a physical Codex
+thread or llama slot. Later work can remove that duplicated safety layer after live mixed-workload
+validation.
+
+A live dispatch-center regression run took 96.23 seconds wall / 81.35 seconds BabelDOC, but the
+center's 36 admissions waited only 11 ms cumulatively (2 ms maximum), background active jobs
+never exceeded two, and Codex thread queue wait remained zero. The regression was explained by
+79.70 seconds of cumulative Spark model wait and five 4–9.6 second turns, not local dispatch.
+
+The previously rejected three-second hedge threshold was then repeated with dispatch admission.
+The run took 84.75 seconds wall / 70.76 seconds BabelDOC with 33 model turns. Four model waits
+crossed three seconds; all four were skipped because the upstream queue still held 9–13 real
+items. No hedge started and normal queue wait remained zero. Gloss therefore uses a three-second
+gated threshold when the shared dispatch state is available, while standalone Codex clients keep
+the conservative eight-second default.
+
+The final production build was restarted without a hedge environment override. A real background
+document translation succeeded through Spark, and the runtime reported `threads=3`,
+`background_limit=2`, `hedge_ms=3000`, and `dispatch_aware=true`.
+
+The dispatch state represents:
 
 - idle;
 - running a real job;
