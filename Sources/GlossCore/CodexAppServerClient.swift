@@ -1583,7 +1583,11 @@ public actor CodexAppServerClient: TranslationBackend {
                 ModelInput.GlossaryItem(source: $0.source, target: $0.target)
             },
             items: request.items.enumerated().map { index, item in
-                ModelInput.Item(id: item.id, index: index, text: item.text)
+                ModelInput.Item(
+                    id: Self.compactModelItemID(for: index),
+                    index: index,
+                    text: item.text
+                )
             }
         )
         let encoder = JSONEncoder()
@@ -1642,8 +1646,12 @@ public actor CodexAppServerClient: TranslationBackend {
         }
 
         var seen: Set<String> = []
-        let expected = Dictionary(uniqueKeysWithValues: request.items.enumerated().map { ($0.element.id, $0.offset) })
-        var resultByID: [String: String] = [:]
+        let expected = Dictionary(
+            uniqueKeysWithValues: request.items.indices.map {
+                (Self.compactModelItemID(for: $0), $0)
+            }
+        )
+        var resultByIndex: [Int: String] = [:]
 
         for translation in envelope.translations {
             guard seen.insert(translation.id).inserted else {
@@ -1655,15 +1663,19 @@ public actor CodexAppServerClient: TranslationBackend {
             guard translation.index == expectedIndex else {
                 throw TranslationError.invalidResponse("项目 \(translation.id) 的 index 不正确。")
             }
-            resultByID[translation.id] = translation.text
+            resultByIndex[expectedIndex] = translation.text
         }
 
-        return try request.items.map { item in
-            guard let text = resultByID[item.id] else {
+        return try request.items.enumerated().map { index, item in
+            guard let text = resultByIndex[index] else {
                 throw TranslationError.invalidResponse("缺少项目 \(item.id)。")
             }
             return TranslationOutput(id: item.id, text: text)
         }
+    }
+
+    static func compactModelItemID(for index: Int) -> String {
+        String(index, radix: 36)
     }
 
     private static func modelJSONData(from output: String) throws -> Data {

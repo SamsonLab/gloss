@@ -114,6 +114,13 @@ final class CodexAppServerClientTests: XCTestCase {
         )
     }
 
+    func testModelItemIDsStayCompactWithinLargeBatches() {
+        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 0), "0")
+        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 10), "a")
+        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 35), "z")
+        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 36), "10")
+    }
+
     func testThreadRotationDefaultsToTenSuccessfulTurnsAndCanBeDisabled() {
         XCTAssertEqual(CodexAppServerClient.readThreadRotationTurns([:]), 10)
         XCTAssertEqual(

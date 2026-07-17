@@ -16,6 +16,12 @@ final class BabelDOCExternalEngineTests: XCTestCase {
         let tokenPath = try XCTUnwrap(environment["GLOSS_BABELDOC_BENCHMARK_TOKEN_FILE"])
         let token = try String(contentsOfFile: tokenPath, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let qps =
+            environment["GLOSS_BABELDOC_BENCHMARK_QPS"]
+            .flatMap(Int.init) ?? 8
+        let outputMode =
+            environment["GLOSS_BABELDOC_BENCHMARK_OUTPUT_MODE"]
+            .flatMap(BabelDOCOutputMode.init(rawValue:)) ?? .monolingual
         let outputURL = URL(fileURLWithPath: outputPath, isDirectory: true)
         try FileManager.default.createDirectory(
             at: outputURL,
@@ -31,8 +37,9 @@ final class BabelDOCExternalEngineTests: XCTestCase {
                 targetLanguageCode: "zh-CN",
                 bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
                 bridgeToken: token,
+                qps: qps,
                 skipScannedDetection: true,
-                outputMode: .monolingual
+                outputMode: outputMode
             )
         )
         let elapsed = start.duration(to: .now)
@@ -41,8 +48,15 @@ final class BabelDOCExternalEngineTests: XCTestCase {
             options: .atomic
         )
 
-        XCTAssertNotNil(result.monolingualPDF)
-        print("BABELDOC_BENCHMARK elapsed=\(elapsed) output=\(outputURL.path)")
+        switch outputMode {
+        case .monolingual:
+            XCTAssertNotNil(result.monolingualPDF)
+        case .bilingual:
+            XCTAssertNotNil(result.bilingualPDF)
+        }
+        print(
+            "BABELDOC_BENCHMARK elapsed=\(elapsed) qps=\(qps) mode=\(outputMode.rawValue) output=\(outputURL.path)"
+        )
     }
 
     func testReliableTextLayerRequiresTextAcrossMostSampledPages() {
