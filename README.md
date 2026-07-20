@@ -85,12 +85,43 @@ GLOSS_CODEX_HOME="$HOME/Library/Application Support/Gloss/Codex" \
 GLOSS_CODEX_MODEL=gpt-5.3-codex-spark \
 GLOSS_CODEX_REASONING_EFFORT=low \
 GLOSS_CODEX_MAX_CONCURRENCY=3 \
+GLOSS_CODEX_BACKGROUND_CONCURRENCY=2 \
 swift run gloss-cli 'Hello from Gloss.'
 ```
 
 `GLOSS_CODEX_BIN` 可覆盖外部 Codex CLI 路径。默认构建优先使用 App 内置 runtime；CLI 构建只使用用户安装的 Codex CLI。
 
-未设置时使用 `gpt-5.3-codex-spark`；并发数默认 3，可配置范围为 1–8。
+未设置时使用 `gpt-5.3-codex-spark`；并发数默认 3，可配置范围为 1–8。Gloss 默认最多
+同时运行 2 个后台 PDF turn，保留一个 thread 给交互翻译或 Spark 长尾竞速。后台 PDF
+turn 使用 Spark 支持的最低档 `low` reasoning。BabelDOC 默认用 qps 8 提前抓取段落，但模型侧仍严格限制为
+2 路；相邻请求会合并为最多 12 项、1,800 字符的有界批次。模型在 3 秒仍未开始
+响应时会记录慢请求；只有中心和 BabelDOC 上游的真实队列都排空，才会在空闲 thread 上
+发起 tail hedge，否则跳过竞速。没有统一队列状态的独立 Codex client 仍使用 8 秒阈值。每个 thread 默认完成
+10 次成功翻译后无中断轮换。可分别使用 `GLOSS_CODEX_DOCUMENT_REASONING_EFFORT`、
+`GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS` 和 `GLOSS_CODEX_THREAD_ROTATION_TURNS` 覆盖这些值，
+后两项设为 `off` 可关闭对应机制。
+Spark 当前拒绝 `minimal` reasoning，PDF 翻译可用的最低档是 `low`；不要将
+`GLOSS_CODEX_DOCUMENT_REASONING_EFFORT` 配置为 `minimal`。
+
+批处理实验参数可通过 `GLOSS_BABELDOC_BATCH_ITEMS`、`GLOSS_BABELDOC_BATCH_CHARACTERS`、
+`GLOSS_BABELDOC_MODEL_CONCURRENCY`、`GLOSS_BABELDOC_FILL_DELAY_MS` 和
+`GLOSS_BABELDOC_REFILL_DELAY_MS` 覆盖。默认值分别为 `12`、`1800`、`2`、`25` 和 `0`；
+提高真实模型并发会占用额外 Spark 额度，通常不如增加上游预取和合批稳定。
+`GLOSS_BABELDOC_SKIP_CLEAN=1`、`GLOSS_BABELDOC_DISABLE_SAME_TEXT_FALLBACK=1`
+和 `GLOSS_BABELDOC_IGNORE_CACHE=1` 分别用于验证快速 PDF 保存、关闭同文重译和无缓存基准；
+它们默认关闭，确认输出兼容性和翻译完整性后再考虑提升为默认行为。
+
+打开 PDF 翻译模块会立即启动仅监听本机回环地址的 DocLayout 服务，并在窗口存续期间保持模型
+常驻；关闭模块后服务随即停止，避免 App 空闲时长期占用约 500–600 MB 内存。窗口支持按钮选择、
+Finder 多文件打开和直接拖拽多个 PDF，任务去重后进入批量队列。文档按队列顺序逐个处理，复用
+同一版面服务，避免并行启动多个 BabelDOC 进程造成内存峰值。进度展示会将服务启动、版面解析、
+模型等待、排版与保存拆成独立状态。
+
+调度：网页、选词、字幕、OCR 和 BabelDOC 的真实 cache miss 统一进入
+`TranslationDispatchCenter`。上游 qps 只控制预取和入队；派发中心按优先级和 FIFO 派发，
+总并发最多 3、后台最多 2，并统一处理取消和状态快照。BabelDOC 尚未派发的条目也汇总进
+同一状态；Codex 只有在中心和上游真实队列都排空时才允许 tail hedge。第三条 thread 因此
+默认保留给交互，provider 内部调度暂时作为执行器安全网保留。
 
 本地 provider 默认查找 App 内的 `llama-server` helper、`GLOSS_LLAMA_SERVER_BIN`、`PATH`，以及 Homebrew 常用路径。模型可通过 `GLOSS_LLAMA_MODEL` 覆盖为 Hugging Face GGUF repo 或本地 `.gguf` 文件：
 

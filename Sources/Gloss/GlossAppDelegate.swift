@@ -3,6 +3,7 @@ import GlossCore
 import GlossOCR
 import SafariServices
 import ServiceManagement
+import UniformTypeIdentifiers
 
 @MainActor
 final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -23,15 +24,21 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let providerKey = "translationProvider"
     private let codexModelKey = "codexModel"
     private let codexReasoningEffortKey = "codexReasoningEffort"
+    private let glossaryRevisionKey = "glossaryRevision"
     private let welcomeVersionKey = "welcomeVersion"
     private let glossaryStore = GlossaryStore()
     private let runtimeLog = GlossRuntimeLog.shared
+    private let dispatchState = TranslationDispatchState()
     private lazy var codex = makeCodexClient(configuration: providerConfiguration)
     private lazy var llama = LlamaServerClient(glossaryStore: glossaryStore)
     private lazy var backendRouter = TranslationBackendRouter(
         backend: backend(for: providerConfiguration.provider)
     )
-    private lazy var broker = TranslationBroker(backend: backendRouter)
+    private lazy var dispatchCenter = TranslationDispatchCenter(
+        backend: backendRouter,
+        dispatchState: dispatchState
+    )
+    private lazy var broker = TranslationBroker(backend: dispatchCenter)
     private let historyStore = TranslationHistoryStore()
     private var globalShortcut = GlobalShortcut.load()
     private lazy var statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -42,6 +49,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var historyWindowController: HistoryWindowController?
     private var glossaryWindowController: GlossaryWindowController?
     private var appExclusionsWindowController: AppExclusionsWindowController?
+    private var pdfTranslationWindowController: PDFTranslationWindowController?
     private var selectionMonitor: SelectionMonitor?
     private var currentSelection: SelectionSnapshot?
     private var activeTranslationID: UUID?
@@ -169,9 +177,30 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let controller = GlossaryWindowController(store: glossaryStore)
         controller.onChange = { [weak self] in
             guard let self else { return }
+            UserDefaults.standard.set(
+                UserDefaults.standard.integer(forKey: glossaryRevisionKey) + 1,
+                forKey: glossaryRevisionKey
+            )
+            activeProviderRevision = UUID()
             Task { await broker.clearCache() }
+            pdfTranslationWindowController?.translationConfigurationDidChange()
         }
         glossaryWindowController = controller
+        return controller
+    }
+
+    private var pdfTranslationWindow: PDFTranslationWindowController {
+        if let pdfTranslationWindowController { return pdfTranslationWindowController }
+        let controller = PDFTranslationWindowController(
+            targetLanguage: { [weak self] in
+                self?.targetLanguage ?? "Chinese (Simplified)"
+            },
+            bridgeToken: { [weak self] in
+                self?.pairingToken
+            },
+            translationDispatchState: dispatchState
+        )
+        pdfTranslationWindowController = controller
         return controller
     }
 
@@ -260,11 +289,14 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var providerConfiguration: TranslationProviderConfiguration {
         get {
             let defaults = UserDefaults.standard
-            let provider = defaults.string(forKey: providerKey)
+            let provider =
+                defaults.string(forKey: providerKey)
                 .flatMap(TranslationProvider.init(rawValue:)) ?? .codex
-            let model = defaults.string(forKey: codexModelKey)
+            let model =
+                defaults.string(forKey: codexModelKey)
                 ?? TranslationProviderConfiguration.defaultCodexModel
-            let effort = defaults.string(forKey: codexReasoningEffortKey)
+            let effort =
+                defaults.string(forKey: codexReasoningEffortKey)
                 .flatMap(CodexReasoningEffort.init(rawValue:)) ?? .low
             return TranslationProviderConfiguration(
                 provider: provider,
@@ -297,8 +329,39 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             startAccessibilityPolling()
         }
 
-        let arguments = Set(ProcessInfo.processInfo.arguments.dropFirst())
-        if arguments.contains("--show-history") {
+        let rawArguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        let arguments = Set(rawArguments)
+        let pdfURLs = rawArguments.indices.compactMap { index -> URL? in
+            guard rawArguments[index] == "--open-pdf",
+                rawArguments.indices.contains(index + 1)
+            else { return nil }
+            return URL(fileURLWithPath: rawArguments[index + 1])
+        }
+        if !pdfURLs.isEmpty {
+            let requestedPage =
+                rawArguments.firstIndex(of: "--pdf-page")
+                .flatMap { index in
+                    rawArguments.indices.contains(index + 1)
+                        ? Int(rawArguments[index + 1])
+                        : nil
+                }
+                .map { max(0, $0 - 1) } ?? 0
+            DispatchQueue.main.async { [weak self] in
+                for (index, url) in pdfURLs.enumerated() {
+                    do {
+                        try self?.pdfTranslationWindow.open(
+                            url,
+                            pageIndex: index == 0 ? requestedPage : 0
+                        )
+                    } catch {
+                        self?.showAlert(
+                            title: "无法打开 \(url.lastPathComponent)",
+                            message: error.localizedDescription
+                        )
+                    }
+                }
+            }
+        } else if arguments.contains("--show-history") {
             DispatchQueue.main.async { [weak self] in
                 self?.historyWindow.show()
             }
@@ -347,16 +410,45 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         runtimeLog.write("app", "stopping")
         activeOCRTask?.cancel()
+        pdfTranslationWindowController?.stop()
         stopAccessibilityPolling()
         selectionMonitor?.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         loopbackServer?.stop()
     }
 
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        let pdfURLs =
+            filenames
+            .map(URL.init(fileURLWithPath:))
+            .filter { $0.pathExtension.lowercased() == "pdf" }
+        guard !pdfURLs.isEmpty else {
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
+
+        var failures: [String] = []
+        for url in pdfURLs {
+            do {
+                try pdfTranslationWindow.open(url)
+            } catch {
+                failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+            }
+        }
+        if failures.isEmpty {
+            sender.reply(toOpenOrPrint: .success)
+        } else {
+            sender.reply(toOpenOrPrint: .failure)
+            showAlert(title: "部分 PDF 无法打开", message: failures.joined(separator: "\n"))
+        }
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminationInProgress else { return .terminateLater }
         terminationInProgress = true
-        Task { [codex, llama] in
+        let pdfWindow = pdfTranslationWindowController
+        Task { [codex, llama, pdfWindow] in
+            await pdfWindow?.stopAndWait()
             await codex.stop()
             await llama.stop()
             NSApp.reply(toApplicationShouldTerminate: true)
@@ -546,6 +638,15 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         screenshot.target = self
         menu.addItem(screenshot)
+
+        let pdf = NSMenuItem(
+            title: "打开 PDF 翻译…",
+            action: #selector(openPDFTranslation),
+            keyEquivalent: "o"
+        )
+        pdf.keyEquivalentModifierMask = [.command, .option]
+        pdf.target = self
+        menu.addItem(pdf)
 
         let selectedText = NSMenuItem(
             title: "翻译当前选区（\(globalShortcut.displayName)）",
@@ -815,6 +916,10 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         translateExternalText(text, sourceName: "剪贴板")
     }
 
+    @objc private func openPDFTranslation() {
+        pdfTranslationWindow.show()
+    }
+
     @objc private func translateClipboardImage() {
         do {
             translateImage(
@@ -1025,6 +1130,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if reverseLanguage == value {
             reverseLanguage = value == "English" ? "Chinese (Simplified)" : "English"
         }
+        pdfTranslationWindowController?.translationConfigurationDidChange()
         statusItem.menu = buildMenu()
     }
 
@@ -1039,6 +1145,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if reverseLanguage == value {
             reverseLanguage = value == "English" ? "Chinese (Simplified)" : "English"
         }
+        pdfTranslationWindowController?.translationConfigurationDidChange()
         statusItem.menu = buildMenu()
     }
 
@@ -1101,6 +1208,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let value = TranslationProfile(rawValue: rawValue)
         else { return }
         profile = value
+        pdfTranslationWindowController?.translationConfigurationDidChange()
         statusItem.menu = buildMenu()
     }
 
@@ -1116,7 +1224,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         CodexAppServerClient(
             glossaryStore: glossaryStore,
             model: configuration.codexModel,
-            reasoningEffort: configuration.codexReasoningEffort
+            reasoningEffort: configuration.codexReasoningEffort,
+            dispatchState: dispatchState
         )
     }
 
@@ -1184,6 +1293,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             await broker.clearCache()
             activeProviderConfiguration = configuration
             activeProviderRevision = UUID()
+            pdfTranslationWindowController?.translationConfigurationDidChange()
             guard providerConfigurationGeneration == generation else { return }
             prewarmProvider(configuration: configuration, generation: generation)
         }
@@ -1466,6 +1576,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 broker: broker,
                 token: token,
                 version: applicationVersion,
+                dispatchState: dispatchState,
                 providerStatus: { [weak self] in
                     guard let self else {
                         return TranslationProviderStatus(

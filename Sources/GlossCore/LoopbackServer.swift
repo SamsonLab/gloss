@@ -57,6 +57,88 @@ package final class LoopbackServer: @unchecked Sendable {
         let translations: [Item]
     }
 
+    private struct OpenAIChatCompletionBody: Decodable {
+        struct Message: Decodable {
+            let role: String
+            let content: String
+        }
+
+        let model: String?
+        let messages: [Message]
+    }
+
+    private struct BabelDOCBatchInput: Decodable {
+        let id: JSONValue
+        let input: String
+    }
+
+    private struct BabelDOCBatchOutput: Encodable {
+        let id: JSONValue
+        let output: String
+    }
+
+    private struct BabelDOCCompatiblePrompt: Sendable {
+        enum OutputMode: Sendable {
+            case plainText
+            case jsonArray
+        }
+
+        struct Item: Sendable {
+            let responseID: JSONValue?
+            let text: String
+        }
+
+        let targetLanguage: String
+        let items: [Item]
+        let outputMode: OutputMode
+    }
+
+    private struct BabelDOCTranslationChunk: Sendable {
+        let id: String
+        let originalIndex: Int
+        let chunkIndex: Int
+        let separatorBefore: String
+        let text: String
+    }
+
+    private struct OpenAIChatCompletionResponse: Encodable {
+        struct Choice: Encodable {
+            struct Message: Encodable {
+                let role: String
+                let content: String
+            }
+
+            let index: Int
+            let message: Message
+            let finishReason: String
+
+            enum CodingKeys: String, CodingKey {
+                case index
+                case message
+                case finishReason = "finish_reason"
+            }
+        }
+
+        struct Usage: Encodable {
+            let promptTokens: Int
+            let completionTokens: Int
+            let totalTokens: Int
+
+            enum CodingKeys: String, CodingKey {
+                case promptTokens = "prompt_tokens"
+                case completionTokens = "completion_tokens"
+                case totalTokens = "total_tokens"
+            }
+        }
+
+        let id: String
+        let object: String
+        let created: Int
+        let model: String
+        let choices: [Choice]
+        let usage: Usage
+    }
+
     private struct HealthResponse: Encodable {
         let ok: Bool
         let name: String
@@ -108,9 +190,20 @@ package final class LoopbackServer: @unchecked Sendable {
     private static let maximumRequestSize = 1_100_000
     private static let maximumItems = 40
     private static let maximumTotalCharacters = 100_000
+    private static let maximumBabelDOCChunkCharacters = 900
+    private static let defaultBabelDOCBatchConfiguration =
+        BabelDOCBatchCoordinator.Configuration(
+            maximumBatchItems: 12,
+            maximumBatchCharacters: 1_800,
+            maximumConcurrentBatches: 2,
+            fillDelayNanoseconds: 25_000_000,
+            refillDelayNanoseconds: 0
+        )
 
     private let queue = DispatchQueue(label: "com.samsoncj.gloss.loopback", qos: .userInitiated)
     private let broker: TranslationBroker
+    private let babelDOCBatchConfiguration: BabelDOCBatchCoordinator.Configuration
+    private let babelDOCBatchCoordinator: BabelDOCBatchCoordinator
     private let providerStatus: @Sendable () async -> TranslationProviderStatus
     private let runtimeLog: GlossRuntimeLog
     private let token: String
@@ -126,6 +219,7 @@ package final class LoopbackServer: @unchecked Sendable {
         token: String,
         version: String = "development",
         port: UInt16 = 8787,
+        dispatchState: TranslationDispatchState? = nil,
         providerStatus: @escaping @Sendable () async -> TranslationProviderStatus = {
             TranslationProviderStatus(
                 provider: .codex,
@@ -135,14 +229,30 @@ package final class LoopbackServer: @unchecked Sendable {
                 isWarm: true
             )
         },
-        runtimeLog: GlossRuntimeLog = .shared
+        runtimeLog: GlossRuntimeLog = .shared,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.broker = broker
+        let babelDOCConfiguration = BabelDOCBatchCoordinator.Configuration(
+            environment: environment,
+            defaults: Self.defaultBabelDOCBatchConfiguration
+        )
+        self.babelDOCBatchConfiguration = babelDOCConfiguration
+        self.babelDOCBatchCoordinator = BabelDOCBatchCoordinator(
+            broker: broker,
+            configuration: babelDOCConfiguration,
+            runtimeLog: runtimeLog,
+            dispatchState: dispatchState
+        )
         self.providerStatus = providerStatus
         self.token = token
         self.version = version
         self.port = NWEndpoint.Port(rawValue: port)!
         self.runtimeLog = runtimeLog
+        runtimeLog.write(
+            "bridge",
+            "babeldoc_batch_configuration max_items=\(babelDOCConfiguration.maximumBatchItems) max_chars=\(babelDOCConfiguration.maximumBatchCharacters) concurrency=\(babelDOCConfiguration.maximumConcurrentBatches) fill_delay_ms=\(babelDOCConfiguration.fillDelayNanoseconds / 1_000_000) refill_delay_ms=\(babelDOCConfiguration.refillDelayNanoseconds / 1_000_000)"
+        )
     }
 
     package func start() throws {
@@ -283,7 +393,10 @@ package final class LoopbackServer: @unchecked Sendable {
             return
         }
 
-        let suppliedToken = request.headers["x-gloss-token"] ?? request.headers["x-pit-token"]
+        let suppliedToken =
+            request.headers["x-gloss-token"]
+            ?? request.headers["x-pit-token"]
+            ?? bearerToken(from: request.headers["authorization"])
         guard suppliedToken == token else {
             runtimeLog.write("bridge", "request_rejected reason=auth path=\(request.path)")
             sendJSON(
@@ -331,6 +444,16 @@ package final class LoopbackServer: @unchecked Sendable {
 
         if request.method == "POST", request.path == "/metrics" {
             recordBrowserMetric(request, origin: origin, connection: connection)
+            return
+        }
+
+        if request.method == "POST", request.path == "/v1/chat/completions" {
+            completeOpenAITranslation(
+                request,
+                startedAt: startedAt,
+                origin: origin,
+                connection: connection
+            )
             return
         }
 
@@ -539,6 +662,161 @@ package final class LoopbackServer: @unchecked Sendable {
         }
     }
 
+    private func completeOpenAITranslation(
+        _ request: HTTPRequest,
+        startedAt: UInt64,
+        origin: String?,
+        connection: NWConnection
+    ) {
+        let body: OpenAIChatCompletionBody
+        do {
+            body = try JSONDecoder().decode(
+                OpenAIChatCompletionBody.self,
+                from: request.body
+            )
+        } catch {
+            sendJSON(
+                ErrorResponse(error: "Invalid OpenAI chat completion payload."),
+                status: 400,
+                origin: origin,
+                to: connection
+            )
+            return
+        }
+        guard let prompt = body.messages.last(where: { $0.role == "user" })?.content,
+            let parsed = Self.parseBabelDOCCompatiblePrompt(prompt)
+        else {
+            sendJSON(
+                ErrorResponse(error: "Unsupported local OpenAI-compatible prompt."),
+                status: 422,
+                origin: origin,
+                to: connection
+            )
+            return
+        }
+
+        let requestID = "babeldoc-\(UUID().uuidString)"
+        runtimeLog.write(
+            "bridge",
+            "babeldoc_translation_start items=\(parsed.items.count) chars=\(parsed.items.reduce(0) { $0 + $1.text.count }) target=\(parsed.targetLanguage)"
+        )
+        startTranslationTask(requestID: requestID) { [weak self] in
+            guard let self else { return }
+            do {
+                let outputs = try await translateBabelDOCItems(
+                    parsed,
+                    requestID: requestID
+                )
+                guard outputs.count == parsed.items.count else {
+                    throw TranslationError.invalidResponse(
+                        "BabelDOC compatibility request returned an incomplete translation."
+                    )
+                }
+                let translated = try Self.babelDOCResponseContent(
+                    for: parsed,
+                    outputs: outputs
+                )
+                let model = body.model ?? "gloss-provider"
+                sendJSON(
+                    OpenAIChatCompletionResponse(
+                        id: "chatcmpl-\(UUID().uuidString)",
+                        object: "chat.completion",
+                        created: Int(Date().timeIntervalSince1970),
+                        model: model,
+                        choices: [
+                            OpenAIChatCompletionResponse.Choice(
+                                index: 0,
+                                message: .init(
+                                    role: "assistant",
+                                    content: translated
+                                ),
+                                finishReason: "stop"
+                            )
+                        ],
+                        usage: .init(
+                            promptTokens: 0,
+                            completionTokens: 0,
+                            totalTokens: 0
+                        )
+                    ),
+                    status: 200,
+                    origin: origin,
+                    to: connection
+                )
+                runtimeLog.write(
+                    "bridge",
+                    "babeldoc_translation_complete duration_ms=\(Self.elapsedMilliseconds(since: startedAt))"
+                )
+            } catch {
+                runtimeLog.write(
+                    "bridge",
+                    "babeldoc_translation_failed duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error)))"
+                )
+                sendJSON(
+                    ErrorResponse(error: error.localizedDescription),
+                    status: 500,
+                    origin: origin,
+                    to: connection
+                )
+            }
+        }
+    }
+
+    private func translateBabelDOCItems(
+        _ prompt: BabelDOCCompatiblePrompt,
+        requestID: String
+    ) async throws -> [TranslationOutput] {
+        let chunks = Self.makeBabelDOCTranslationChunks(
+            prompt.items,
+            requestID: requestID
+        )
+        runtimeLog.write(
+            "bridge",
+            "babeldoc_translation_plan source_items=\(prompt.items.count) chunks=\(chunks.count) max_chunk_chars=\(Self.maximumBabelDOCChunkCharacters) max_batch_items=\(babelDOCBatchConfiguration.maximumBatchItems) max_batch_chars=\(babelDOCBatchConfiguration.maximumBatchCharacters)"
+        )
+
+        let targetLanguage = prompt.targetLanguage
+        let translated = try await babelDOCBatchCoordinator.translate(
+            items: chunks.map { TranslationItem(id: $0.id, text: $0.text) },
+            targetLanguage: targetLanguage,
+            context:
+                "Layout-preserving PDF translation via BabelDOC. Translate every bounded chunk completely and preserve continuity."
+        )
+        let translatedByID = Dictionary(
+            translated.map { ($0.id, $0.text) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        return try prompt.items.indices.map { originalIndex in
+            let originalChunks =
+                chunks
+                .filter { $0.originalIndex == originalIndex }
+                .sorted { $0.chunkIndex < $1.chunkIndex }
+            guard !originalChunks.isEmpty else {
+                throw TranslationError.invalidResponse(
+                    "BabelDOC compatibility request lost a source paragraph."
+                )
+            }
+            var translated = ""
+            for chunk in originalChunks {
+                guard
+                    let value = translatedByID[chunk.id]?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                    !value.isEmpty
+                else {
+                    throw TranslationError.invalidResponse(
+                        "BabelDOC compatibility request returned an incomplete chunk."
+                    )
+                }
+                translated += chunk.separatorBefore + value
+            }
+            return TranslationOutput(
+                id: "\(requestID)-\(originalIndex)",
+                text: translated
+            )
+        }
+    }
+
     private func cancelTranslations(
         _ request: HTTPRequest,
         origin: String?,
@@ -603,7 +881,9 @@ package final class LoopbackServer: @unchecked Sendable {
         activeTasksLock.lock()
         let entries = requestIDs.compactMap { activeTranslationTasks.removeValue(forKey: $0) }
         activeTasksLock.unlock()
-        entries.forEach { $0.task?.cancel() }
+        for entry in entries {
+            entry.task?.cancel()
+        }
         return entries.count
     }
 
@@ -612,7 +892,9 @@ package final class LoopbackServer: @unchecked Sendable {
         let entries = Array(activeTranslationTasks.values)
         activeTranslationTasks.removeAll(keepingCapacity: false)
         activeTasksLock.unlock()
-        entries.forEach { $0.task?.cancel() }
+        for entry in entries {
+            entry.task?.cancel()
+        }
     }
 
     private func recordBrowserMetric(
@@ -638,6 +920,305 @@ package final class LoopbackServer: @unchecked Sendable {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
         let filtered = String((value ?? "none").unicodeScalars.filter(allowed.contains).prefix(100))
         return filtered.isEmpty ? "none" : filtered
+    }
+
+    private func bearerToken(from authorization: String?) -> String? {
+        guard let authorization else { return nil }
+        let components = authorization.split(
+            separator: " ",
+            maxSplits: 1,
+            omittingEmptySubsequences: true
+        )
+        guard components.count == 2,
+            components[0].caseInsensitiveCompare("Bearer") == .orderedSame
+        else { return nil }
+        return String(components[1])
+    }
+
+    static func parseBabelDOCPrompt(
+        _ prompt: String
+    ) -> (text: String, targetLanguage: String)? {
+        guard
+            let inputRange = prompt.range(
+                of: "Input:\n\n",
+                options: [.backwards, .caseInsensitive]
+            )
+        else { return nil }
+        let text = prompt[inputRange.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.count <= 20_000 else { return nil }
+
+        let expression = try? NSRegularExpression(
+            pattern: #"translate\s+it\s+into\s+([^,\n]+),\s*output\s+translation\s+ONLY"#,
+            options: [.caseInsensitive]
+        )
+        let fullRange = NSRange(prompt.startIndex..<prompt.endIndex, in: prompt)
+        guard let match = expression?.firstMatch(in: prompt, range: fullRange),
+            let languageRange = Range(match.range(at: 1), in: prompt)
+        else { return nil }
+        let languageCode = prompt[languageRange]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            let targetLanguage =
+                TranslationLanguages.targetName(forLanguageCode: languageCode)
+                ?? (TranslationLanguages.isValidTargetName(languageCode)
+                    ? languageCode
+                    : nil)
+        else { return nil }
+        return (text, targetLanguage)
+    }
+
+    private static func parseBabelDOCCompatiblePrompt(
+        _ prompt: String
+    ) -> BabelDOCCompatiblePrompt? {
+        if let plain = parseBabelDOCPrompt(prompt) {
+            return BabelDOCCompatiblePrompt(
+                targetLanguage: plain.targetLanguage,
+                items: [.init(responseID: nil, text: plain.text)],
+                outputMode: .plainText
+            )
+        }
+
+        if let structured = parseBabelDOCStructuredPrompt(prompt) {
+            return BabelDOCCompatiblePrompt(
+                targetLanguage: structured.targetLanguage,
+                items: [.init(responseID: nil, text: structured.text)],
+                outputMode: .plainText
+            )
+        }
+
+        guard
+            let inputRange = prompt.range(
+                of: "## Here is the input:",
+                options: [.backwards, .caseInsensitive]
+            ),
+            let targetLanguage = babelDOCTargetLanguage(inBatchPrompt: prompt)
+        else { return nil }
+        let json = prompt[inputRange.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            !json.isEmpty,
+            json.count <= Self.maximumRequestSize,
+            let data = json.data(using: .utf8),
+            let inputs = try? JSONDecoder().decode(
+                [BabelDOCBatchInput].self,
+                from: data
+            ),
+            !inputs.isEmpty,
+            inputs.count <= Self.maximumItems,
+            inputs.allSatisfy({
+                !$0.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }),
+            inputs.reduce(0, { $0 + $1.input.count })
+                <= Self.maximumTotalCharacters
+        else { return nil }
+
+        return BabelDOCCompatiblePrompt(
+            targetLanguage: targetLanguage,
+            items: inputs.map {
+                .init(responseID: $0.id, text: $0.input)
+            },
+            outputMode: .jsonArray
+        )
+    }
+
+    private static func parseBabelDOCStructuredPrompt(
+        _ prompt: String
+    ) -> (text: String, targetLanguage: String)? {
+        guard
+            let inputRange = prompt.range(
+                of: "Now translate the following text:",
+                options: [.backwards, .caseInsensitive]
+            )
+        else { return nil }
+        let text = prompt[inputRange.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.count <= 20_000 else { return nil }
+
+        let expression = try? NSRegularExpression(
+            pattern:
+                #"Translate\s+ALL\s+human-readable\s+content\s+into\s+([A-Za-z][A-Za-z0-9_-]*)\."#,
+            options: [.caseInsensitive]
+        )
+        let fullRange = NSRange(prompt.startIndex..<prompt.endIndex, in: prompt)
+        guard let match = expression?.firstMatch(in: prompt, range: fullRange),
+            let languageRange = Range(match.range(at: 1), in: prompt)
+        else { return nil }
+        let languageCode = String(prompt[languageRange])
+        guard
+            let targetLanguage =
+                TranslationLanguages.targetName(
+                    forLanguageCode: languageCode
+                )
+                ?? (TranslationLanguages.isValidTargetName(languageCode)
+                    ? languageCode
+                    : nil)
+        else { return nil }
+        return (text, targetLanguage)
+    }
+
+    private static func babelDOCTargetLanguage(
+        inBatchPrompt prompt: String
+    ) -> String? {
+        let expression = try? NSRegularExpression(
+            pattern: #"translate\s+text\s+into\s+([A-Za-z][A-Za-z0-9_-]*)"#,
+            options: [.caseInsensitive]
+        )
+        let fullRange = NSRange(prompt.startIndex..<prompt.endIndex, in: prompt)
+        guard let match = expression?.firstMatch(in: prompt, range: fullRange),
+            let languageRange = Range(match.range(at: 1), in: prompt)
+        else { return nil }
+        let languageCode = String(prompt[languageRange])
+        return TranslationLanguages.targetName(forLanguageCode: languageCode)
+            ?? (TranslationLanguages.isValidTargetName(languageCode)
+                ? languageCode
+                : nil)
+    }
+
+    private static func makeBabelDOCTranslationChunks(
+        _ items: [BabelDOCCompatiblePrompt.Item],
+        requestID: String
+    ) -> [BabelDOCTranslationChunk] {
+        items.enumerated().flatMap { originalIndex, item in
+            splitBabelDOCText(item.text).enumerated().map {
+                chunkIndex, piece in
+                BabelDOCTranslationChunk(
+                    id: "\(requestID)-\(originalIndex)-\(chunkIndex)",
+                    originalIndex: originalIndex,
+                    chunkIndex: chunkIndex,
+                    separatorBefore: piece.separatorBefore,
+                    text: piece.text
+                )
+            }
+        }
+    }
+
+    private static func splitBabelDOCText(
+        _ text: String
+    ) -> [(separatorBefore: String, text: String)] {
+        let source = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard source.count > maximumBabelDOCChunkCharacters else {
+            return source.isEmpty ? [] : [("", source)]
+        }
+
+        var pieces: [(separatorBefore: String, text: String)] = []
+        var remaining = source[...]
+        var separatorBefore = ""
+
+        while remaining.count > maximumBabelDOCChunkCharacters {
+            let hardEnd = remaining.index(
+                remaining.startIndex,
+                offsetBy: maximumBabelDOCChunkCharacters
+            )
+            let prefix = remaining[..<hardEnd]
+            let minimumOffset = maximumBabelDOCChunkCharacters / 2
+            let splitIndex =
+                preferredBabelDOCSplitIndex(
+                    in: prefix,
+                    minimumOffset: minimumOffset
+                )
+                ?? hardEnd
+            let rawPiece = remaining[..<splitIndex]
+            let piece = rawPiece.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            if !piece.isEmpty {
+                pieces.append((separatorBefore, piece))
+            }
+
+            var nextStart = splitIndex
+            var consumedWhitespace = ""
+            while nextStart < remaining.endIndex,
+                remaining[nextStart].isWhitespace
+            {
+                consumedWhitespace.append(remaining[nextStart])
+                nextStart = remaining.index(after: nextStart)
+            }
+            separatorBefore = normalizedBabelDOCSeparator(
+                consumedWhitespace,
+                hardSplit: nextStart == splitIndex
+            )
+            remaining = remaining[nextStart...]
+        }
+
+        let tail = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty {
+            pieces.append((separatorBefore, tail))
+        }
+        return pieces
+    }
+
+    private static func preferredBabelDOCSplitIndex(
+        in text: Substring,
+        minimumOffset: Int
+    ) -> String.Index? {
+        let punctuation = CharacterSet(charactersIn: ".!?。！？;；")
+        var whitespaceFallback: String.Index?
+        for index in text.indices.reversed() {
+            let offset = text.distance(from: text.startIndex, to: index)
+            guard offset >= minimumOffset else { break }
+            let character = text[index]
+            if character.unicodeScalars.allSatisfy({
+                punctuation.contains($0)
+            }) {
+                return text.index(after: index)
+            }
+            if character.isWhitespace, whitespaceFallback == nil {
+                whitespaceFallback = index
+            }
+        }
+        return whitespaceFallback
+    }
+
+    private static func normalizedBabelDOCSeparator(
+        _ whitespace: String,
+        hardSplit: Bool
+    ) -> String {
+        if whitespace.contains("\n\n") {
+            return "\n\n"
+        }
+        if whitespace.contains("\n") {
+            return "\n"
+        }
+        return hardSplit ? "" : " "
+    }
+
+    private static func babelDOCResponseContent(
+        for prompt: BabelDOCCompatiblePrompt,
+        outputs: [TranslationOutput]
+    ) throws -> String {
+        switch prompt.outputMode {
+        case .plainText:
+            guard let output = outputs.first else {
+                throw TranslationError.invalidResponse(
+                    "BabelDOC compatibility request returned no translation."
+                )
+            }
+            return output.text
+        case .jsonArray:
+            let response = zip(prompt.items, outputs).compactMap {
+                item, output -> BabelDOCBatchOutput? in
+                guard let responseID = item.responseID else { return nil }
+                return BabelDOCBatchOutput(
+                    id: responseID,
+                    output: output.text
+                )
+            }
+            guard response.count == prompt.items.count else {
+                throw TranslationError.invalidResponse(
+                    "BabelDOC compatibility response lost paragraph identifiers."
+                )
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.withoutEscapingSlashes]
+            let data = try encoder.encode(response)
+            guard let value = String(data: data, encoding: .utf8) else {
+                throw TranslationError.invalidResponse(
+                    "BabelDOC compatibility response could not be encoded."
+                )
+            }
+            return value
+        }
     }
 
     private func sourceContext(from sourceURL: String?) -> String? {

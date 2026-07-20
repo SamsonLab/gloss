@@ -57,6 +57,10 @@ struct CodexRuntimeLaunch: Equatable, Sendable {
 
 public actor CodexAppServerClient: TranslationBackend {
     private static let defaultMaximumConcurrentTurns = 3
+    private static let modelWaitSlowNanoseconds: UInt64 = 3_000_000_000
+    private static let defaultModelWaitHedgeNanoseconds: UInt64 = 8_000_000_000
+    private static let dispatchAwareModelWaitHedgeNanoseconds: UInt64 = 3_000_000_000
+    private static let defaultThreadRotationTurns = 10
     static let disabledCodexFeatures = [
         "shell_tool",
         "unified_exec",
@@ -123,11 +127,69 @@ public actor CodexAppServerClient: TranslationBackend {
         let continuation: CheckedContinuation<Int, Error>
     }
 
+    private struct ThreadLease: Sendable {
+        let index: Int
+        let id: String
+    }
+
+    private enum TurnAttemptKind: String, Sendable {
+        case primary
+        case hedge
+    }
+
+    private struct TurnAttemptResult: Sendable {
+        let outputs: [TranslationOutput]
+        let kind: TurnAttemptKind
+        let turnID: String
+        let queueWaitMilliseconds: Int
+        let turnStartMilliseconds: Int
+        let waitStages: TurnWaitStages
+        let parseMilliseconds: Int
+        let rollbackMilliseconds: Int
+    }
+
+    private enum HedgeEvent: @unchecked Sendable {
+        case attemptSucceeded(TurnAttemptResult)
+        case attemptFailed(TurnAttemptKind, Error)
+        case modelWaitSlow(String)
+        case hedgeThreshold(String)
+        case modelStarted
+    }
+
+    private actor TurnAttemptState {
+        struct Snapshot: Sendable {
+            let turnID: String?
+            let modelStarted: Bool
+            let finished: Bool
+        }
+
+        private var turnID: String?
+        private var modelStarted = false
+        private var finished = false
+
+        func markTurnStarted(_ turnID: String) {
+            self.turnID = turnID
+        }
+
+        func markModelStarted() {
+            modelStarted = true
+        }
+
+        func markFinished() {
+            finished = true
+        }
+
+        func snapshot() -> Snapshot {
+            Snapshot(turnID: turnID, modelStarted: modelStarted, finished: finished)
+        }
+    }
+
     private struct TurnStreamState {
         var parser = TranslationDeltaParser()
         let request: TranslationBatchRequest
         let onOutput: (@Sendable (TranslationOutput) -> Void)?
         let acceptedAt: UInt64
+        let attemptState: TurnAttemptState?
         var emittedIDs: Set<String> = []
         var loggedFirstDelta = false
         var loggedFirstItem = false
@@ -142,7 +204,7 @@ public actor CodexAppServerClient: TranslationBackend {
         var turnCompletedAt: UInt64?
     }
 
-    struct TurnWaitStages: Equatable {
+    struct TurnWaitStages: Equatable, Sendable {
         let dispatchMilliseconds: Int
         let modelWaitMilliseconds: Int
         let firstDeltaWaitMilliseconds: Int
@@ -166,8 +228,13 @@ public actor CodexAppServerClient: TranslationBackend {
     private let timeoutNanoseconds: UInt64
     private let model: String?
     private let reasoningEffort: CodexReasoningEffort
+    private let documentReasoningEffort: CodexReasoningEffort?
+    private let modelWaitHedgeNanoseconds: UInt64?
+    private let threadRotationTurns: Int?
     private let maximumConcurrentTurns: Int
+    private let maximumBackgroundConcurrentTurns: Int
     private let glossaryStore: GlossaryStore
+    private let dispatchState: TranslationDispatchState?
     private var process: Process?
     private var inputHandle: FileHandle?
     private var outputBuffer = Data()
@@ -178,8 +245,11 @@ public actor CodexAppServerClient: TranslationBackend {
     private var turnStreams: [String: TurnStreamState] = [:]
     private var turnTimelines: [String: TurnTimeline] = [:]
     private var earlyTurnResults: [String: Result<String, Error>] = [:]
+    private var discardedTurnIDs: Set<String> = []
     private var threadIDs: [String] = []
+    private var successfulTurnsByThreadIndex: [Int: Int] = [:]
     private var availableThreadIndices: [Int] = []
+    private var activeThreadPriorities: [Int: TranslationPriority] = [:]
     private var threadWaiters: [ThreadWaiter] = []
     private var nextRequestID = 1
     private var nextThreadWaiterSequence = 1
@@ -195,7 +265,9 @@ public actor CodexAppServerClient: TranslationBackend {
         timeoutSeconds: TimeInterval = 120,
         glossaryStore: GlossaryStore = GlossaryStore(),
         model: String? = nil,
-        reasoningEffort: CodexReasoningEffort? = nil
+        reasoningEffort: CodexReasoningEffort? = nil,
+        documentReasoningEffort: CodexReasoningEffort? = .low,
+        dispatchState: TranslationDispatchState? = nil
     ) {
         self.environment = environment
         self.timeoutNanoseconds = UInt64(max(1, timeoutSeconds) * 1_000_000_000)
@@ -208,8 +280,23 @@ public actor CodexAppServerClient: TranslationBackend {
             .flatMap(CodexReasoningEffort.init(rawValue:))
             ?? reasoningEffort
             ?? .low
-        self.maximumConcurrentTurns = Self.readMaximumConcurrentTurns(environment)
+        self.documentReasoningEffort = Self.readDocumentReasoningEffort(
+            environment,
+            configured: documentReasoningEffort
+        )
+        self.modelWaitHedgeNanoseconds = Self.readModelWaitHedgeNanoseconds(
+            environment,
+            dispatchAware: dispatchState != nil
+        )
+        self.threadRotationTurns = Self.readThreadRotationTurns(environment)
+        let maximumConcurrentTurns = Self.readMaximumConcurrentTurns(environment)
+        self.maximumConcurrentTurns = maximumConcurrentTurns
+        self.maximumBackgroundConcurrentTurns = Self.readMaximumBackgroundConcurrentTurns(
+            environment,
+            maximumConcurrentTurns: maximumConcurrentTurns
+        )
         self.glossaryStore = glossaryStore
+        self.dispatchState = dispatchState
     }
 
     public func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput] {
@@ -229,9 +316,14 @@ public actor CodexAppServerClient: TranslationBackend {
     ) async throws -> [TranslationOutput] {
         let startedAt = DispatchTime.now().uptimeNanoseconds
         let characterCount = request.items.reduce(0) { $0 + $1.text.count }
+        let selectedReasoningEffort = Self.reasoningEffort(
+            for: request,
+            defaultEffort: reasoningEffort,
+            documentEffort: documentReasoningEffort
+        )
         runtimeLog.write(
             "codex",
-            "translation_start items=\(request.items.count) chars=\(characterCount) kind=\(request.contentKind.rawValue) profile=\(request.profile.rawValue) priority=\(request.priority.rawValue)"
+            "translation_start items=\(request.items.count) chars=\(characterCount) kind=\(request.contentKind.rawValue) profile=\(request.profile.rawValue) priority=\(request.priority.rawValue) reasoning_effort=\(selectedReasoningEffort.rawValue)"
         )
         let glossary =
             (try? await glossaryStore.matchingTerms(in: request.items.map(\.text))) ?? []
@@ -247,16 +339,105 @@ public actor CodexAppServerClient: TranslationBackend {
 
         let prompt = try makePrompt(for: request, glossary: glossary)
         let preparedAt = DispatchTime.now().uptimeNanoseconds
-        let thread = try await acquireThread(priority: request.priority)
-        let acquiredAt = DispatchTime.now().uptimeNanoseconds
-        let queueWaitMilliseconds = Self.elapsedMilliseconds(from: preparedAt, to: acquiredAt)
+
+        let hedgeEligible =
+            onOutput == nil
+            && request.priority == .background
+            && request.contentKind == .document
+            && maximumConcurrentTurns > maximumBackgroundConcurrentTurns
+            && modelWaitHedgeNanoseconds != nil
+        let primaryState = TurnAttemptState()
+        let result: TurnAttemptResult
+
+        do {
+            if hedgeEligible, let modelWaitHedgeNanoseconds {
+                result = try await runHedgedTurn(
+                    request: request,
+                    prompt: prompt,
+                    primaryState: primaryState,
+                    hedgeThresholdNanoseconds: modelWaitHedgeNanoseconds
+                )
+                for output in result.outputs {
+                    onOutput?(output)
+                }
+            } else {
+                result = try await runTurnAttempt(
+                    request: request,
+                    prompt: prompt,
+                    kind: .primary,
+                    attemptState: primaryState,
+                    onOutput: onOutput,
+                    acquisition: .scheduled
+                )
+            }
+        } catch {
+            runtimeLog.write(
+                "codex",
+                "translation_failed stage=turn duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error))) reason=\(error.localizedDescription)"
+            )
+            throw error
+        }
+
+        let stages = result.waitStages
+        if request.contentKind == .document, let dispatchState {
+            await dispatchState.recordDocumentTurn(
+                preparationMilliseconds: Self.elapsedMilliseconds(
+                    from: startedAt,
+                    to: preparedAt
+                ),
+                queueWaitMilliseconds: result.queueWaitMilliseconds,
+                modelWaitMilliseconds: stages.modelWaitMilliseconds,
+                outputStreamMilliseconds: stages.outputStreamMilliseconds,
+                totalTurnMilliseconds: stages.totalMilliseconds
+            )
+        }
         runtimeLog.write(
             "codex",
-            "translation_acquired priority=\(request.priority.rawValue) queue_wait_ms=\(queueWaitMilliseconds)"
+            "translation_complete items=\(result.outputs.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) priority=\(request.priority.rawValue) turn_id=\(result.turnID) attempt=\(result.kind.rawValue) hedge_won=\(result.kind == .hedge) prepare_ms=\(Self.elapsedMilliseconds(from: startedAt, to: preparedAt)) queue_wait_ms=\(result.queueWaitMilliseconds) turn_start_ms=\(result.turnStartMilliseconds) turn_wait_ms=\(stages.totalMilliseconds) turn_dispatch_ms=\(stages.dispatchMilliseconds) model_wait_ms=\(stages.modelWaitMilliseconds) first_delta_wait_ms=\(stages.firstDeltaWaitMilliseconds) output_stream_ms=\(stages.outputStreamMilliseconds) message_finalize_ms=\(stages.messageFinalizeMilliseconds) turn_finalize_ms=\(stages.turnFinalizeMilliseconds) turn_complete_ms=\(stages.totalMilliseconds) parse_ms=\(result.parseMilliseconds) rollback_ms=\(result.rollbackMilliseconds)"
         )
-        defer { releaseThread(index: thread.index, id: thread.id) }
+        return result.outputs
+    }
+
+    private enum ThreadAcquisition {
+        case scheduled
+        case opportunisticHedge
+    }
+
+    private func runTurnAttempt(
+        request: TranslationBatchRequest,
+        prompt: String,
+        kind: TurnAttemptKind,
+        attemptState: TurnAttemptState?,
+        onOutput: (@Sendable (TranslationOutput) -> Void)?,
+        acquisition: ThreadAcquisition
+    ) async throws -> TurnAttemptResult {
+        let queuedAt = DispatchTime.now().uptimeNanoseconds
+        let thread: ThreadLease
+        switch acquisition {
+        case .scheduled:
+            thread = try await acquireThread(priority: request.priority)
+        case .opportunisticHedge:
+            guard let hedgeThread = tryAcquireHedgeThread() else {
+                throw TranslationError.backendUnavailable("没有空闲 thread 可用于 Spark 竞速重试。")
+            }
+            thread = hedgeThread
+        }
+        let acquiredAt = DispatchTime.now().uptimeNanoseconds
+        let queueWaitMilliseconds = Self.elapsedMilliseconds(from: queuedAt, to: acquiredAt)
+        runtimeLog.write(
+            "codex",
+            "translation_acquired attempt=\(kind.rawValue) priority=\(request.priority.rawValue) queue_wait_ms=\(queueWaitMilliseconds) thread_index=\(thread.index)"
+        )
+        var didReleaseThread = false
+        defer {
+            if !didReleaseThread {
+                releaseThread(index: thread.index, id: thread.id)
+            }
+        }
+
         var turnID: String?
         do {
+            try Task.checkCancellation()
             var params: [String: JSONValue] = [
                 "threadId": .string(thread.id),
                 "input": .array([
@@ -266,7 +447,13 @@ public actor CodexAppServerClient: TranslationBackend {
                         "text_elements": .array([]),
                     ])
                 ]),
-                "effort": .string(reasoningEffort.rawValue),
+                "effort": .string(
+                    Self.reasoningEffort(
+                        for: request,
+                        defaultEffort: reasoningEffort,
+                        documentEffort: documentReasoningEffort
+                    ).rawValue
+                ),
                 "summary": .string("none"),
                 "outputSchema": Self.translationSchema,
             ]
@@ -285,10 +472,12 @@ public actor CodexAppServerClient: TranslationBackend {
                 throw TranslationError.invalidResponse("Codex 没有返回 turn id。")
             }
             turnID = startedTurnID
+            await attemptState?.markTurnStarted(startedTurnID)
             beginTurnStream(
                 turnID: startedTurnID,
                 request: request,
                 acceptedAt: turnAcceptedAt,
+                attemptState: attemptState,
                 onOutput: onOutput
             )
 
@@ -309,23 +498,209 @@ public actor CodexAppServerClient: TranslationBackend {
             let parsedAt = DispatchTime.now().uptimeNanoseconds
             await rollbackThread(thread.id)
             let rolledBackAt = DispatchTime.now().uptimeNanoseconds
-            runtimeLog.write(
-                "codex",
-                "translation_complete items=\(translations.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) priority=\(request.priority.rawValue) turn_id=\(startedTurnID) prepare_ms=\(Self.elapsedMilliseconds(from: startedAt, to: preparedAt)) queue_wait_ms=\(queueWaitMilliseconds) turn_start_ms=\(Self.elapsedMilliseconds(from: turnStartedAt, to: turnAcceptedAt)) turn_wait_ms=\(turnWaitStages.totalMilliseconds) turn_dispatch_ms=\(turnWaitStages.dispatchMilliseconds) model_wait_ms=\(turnWaitStages.modelWaitMilliseconds) first_delta_wait_ms=\(turnWaitStages.firstDeltaWaitMilliseconds) output_stream_ms=\(turnWaitStages.outputStreamMilliseconds) message_finalize_ms=\(turnWaitStages.messageFinalizeMilliseconds) turn_finalize_ms=\(turnWaitStages.turnFinalizeMilliseconds) turn_complete_ms=\(turnWaitStages.totalMilliseconds) parse_ms=\(Self.elapsedMilliseconds(from: turnCompletedAt, to: parsedAt)) rollback_ms=\(Self.elapsedMilliseconds(from: parsedAt, to: rolledBackAt))"
+            await attemptState?.markFinished()
+            let result = TurnAttemptResult(
+                outputs: translations,
+                kind: kind,
+                turnID: startedTurnID,
+                queueWaitMilliseconds: queueWaitMilliseconds,
+                turnStartMilliseconds: Self.elapsedMilliseconds(
+                    from: turnStartedAt,
+                    to: turnAcceptedAt
+                ),
+                waitStages: turnWaitStages,
+                parseMilliseconds: Self.elapsedMilliseconds(
+                    from: turnCompletedAt,
+                    to: parsedAt
+                ),
+                rollbackMilliseconds: Self.elapsedMilliseconds(
+                    from: parsedAt,
+                    to: rolledBackAt
+                )
             )
-            return translations
+            let releaseID = await recordSuccessfulTurnAndRotateIfNeeded(
+                index: thread.index,
+                id: thread.id
+            )
+            releaseThread(index: thread.index, id: releaseID)
+            didReleaseThread = true
+            return result
         } catch {
+            await attemptState?.markFinished()
             if let turnID {
+                if error is CancellationError {
+                    discardedTurnIDs.insert(turnID)
+                }
                 turnStreams.removeValue(forKey: turnID)
                 turnTimelines.removeValue(forKey: turnID)
             }
             await resetFailedTurn(threadID: thread.id, turnID: turnID)
+            if let turnID {
+                earlyTurnResults.removeValue(forKey: turnID)
+            }
+            let event = error is CancellationError ? "translation_attempt_cancelled" : "translation_attempt_failed"
             runtimeLog.write(
                 "codex",
-                "translation_failed stage=turn duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) error_type=\(String(reflecting: type(of: error))) reason=\(error.localizedDescription)"
+                "\(event) attempt=\(kind.rawValue) turn_id=\(turnID ?? "none") error_type=\(String(reflecting: type(of: error)))"
             )
             throw error
         }
+    }
+
+    private func runHedgedTurn(
+        request: TranslationBatchRequest,
+        prompt: String,
+        primaryState: TurnAttemptState,
+        hedgeThresholdNanoseconds: UInt64
+    ) async throws -> TurnAttemptResult {
+        try await withThrowingTaskGroup(
+            of: HedgeEvent.self,
+            returning: TurnAttemptResult.self
+        ) { group in
+            group.addTask {
+                do {
+                    return .attemptSucceeded(
+                        try await self.runTurnAttempt(
+                            request: request,
+                            prompt: prompt,
+                            kind: .primary,
+                            attemptState: primaryState,
+                            onOutput: nil,
+                            acquisition: .scheduled
+                        )
+                    )
+                } catch {
+                    return .attemptFailed(.primary, error)
+                }
+            }
+            group.addTask {
+                await Self.waitForModelActivity(
+                    primaryState,
+                    timeoutNanoseconds: Self.modelWaitSlowNanoseconds,
+                    timeoutEvent: { .modelWaitSlow($0) }
+                )
+            }
+
+            var hedgeStarted = false
+            var primaryError: Error?
+            var hedgeError: Error?
+
+            while let event = try await group.next() {
+                switch event {
+                case .attemptSucceeded(let result):
+                    group.cancelAll()
+                    return result
+
+                case .attemptFailed(let kind, let error):
+                    switch kind {
+                    case .primary:
+                        primaryError = error
+                        if !hedgeStarted {
+                            group.cancelAll()
+                            throw error
+                        }
+                    case .hedge:
+                        hedgeError = error
+                    }
+                    if primaryError != nil, hedgeError != nil {
+                        group.cancelAll()
+                        throw primaryError ?? error
+                    }
+
+                case .modelWaitSlow(let turnID):
+                    runtimeLog.write(
+                        "codex",
+                        "model_wait_slow turn_id=\(turnID) threshold_ms=3000"
+                    )
+                    group.addTask {
+                        await Self.waitForModelActivity(
+                            primaryState,
+                            timeoutNanoseconds:
+                                hedgeThresholdNanoseconds
+                                > Self.modelWaitSlowNanoseconds
+                                ? hedgeThresholdNanoseconds
+                                    - Self.modelWaitSlowNanoseconds
+                                : 0,
+                            timeoutEvent: { .hedgeThreshold($0) }
+                        )
+                    }
+
+                case .hedgeThreshold(let turnID):
+                    guard !hedgeStarted else { continue }
+                    if let dispatchState {
+                        let snapshot = await dispatchState.snapshot()
+                        guard snapshot.allowsBackgroundHedge else {
+                            runtimeLog.write(
+                                "codex",
+                                "model_wait_hedge_skipped turn_id=\(turnID) reason=real_work_queued center_pending=\(snapshot.pendingInteractiveJobs + snapshot.pendingVisibleJobs + snapshot.pendingBackgroundJobs) upstream_pending=\(snapshot.upstreamBackgroundItems)"
+                            )
+                            continue
+                        }
+                    }
+                    hedgeStarted = true
+                    runtimeLog.write(
+                        "codex",
+                        "model_wait_hedge_requested turn_id=\(turnID) threshold_ms=\(hedgeThresholdNanoseconds / 1_000_000)"
+                    )
+                    group.addTask {
+                        do {
+                            return .attemptSucceeded(
+                                try await self.runTurnAttempt(
+                                    request: request,
+                                    prompt: prompt,
+                                    kind: .hedge,
+                                    attemptState: nil,
+                                    onOutput: nil,
+                                    acquisition: .opportunisticHedge
+                                )
+                            )
+                        } catch {
+                            return .attemptFailed(.hedge, error)
+                        }
+                    }
+
+                case .modelStarted:
+                    break
+                }
+            }
+
+            throw primaryError
+                ?? hedgeError
+                ?? TranslationError.backendUnavailable("Spark 竞速翻译没有返回结果。")
+        }
+    }
+
+    private nonisolated static func waitForModelActivity(
+        _ state: TurnAttemptState,
+        timeoutNanoseconds: UInt64,
+        timeoutEvent: @escaping @Sendable (String) -> HedgeEvent
+    ) async -> HedgeEvent {
+        var turnID: String?
+        while !Task.isCancelled {
+            let snapshot = await state.snapshot()
+            turnID = snapshot.turnID ?? turnID
+            if snapshot.modelStarted || snapshot.finished {
+                return .modelStarted
+            }
+            if turnID != nil {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard let turnID else { return .modelStarted }
+
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+        while !Task.isCancelled {
+            let snapshot = await state.snapshot()
+            if snapshot.modelStarted || snapshot.finished {
+                return .modelStarted
+            }
+            if DispatchTime.now().uptimeNanoseconds >= deadline {
+                return timeoutEvent(turnID)
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return .modelStarted
     }
 
     public func prewarm() async throws {
@@ -415,7 +790,9 @@ public actor CodexAppServerClient: TranslationBackend {
         failAll(with: stopped)
         initialized = false
         threadIDs.removeAll()
+        successfulTurnsByThreadIndex.removeAll()
         availableThreadIndices.removeAll()
+        activeThreadPriorities.removeAll()
         startupTask?.cancel()
         startupTask = nil
         threadStartupTask?.cancel()
@@ -490,10 +867,12 @@ public actor CodexAppServerClient: TranslationBackend {
         )
 
         process.executableURL = URL(fileURLWithPath: runtime.executable)
-        process.arguments = runtime.argumentPrefix + Self.fastLaunchArguments(
-            reasoningEffort: reasoningEffort,
-            modelCatalog: modelCatalog
-        )
+        process.arguments =
+            runtime.argumentPrefix
+            + Self.fastLaunchArguments(
+                reasoningEffort: reasoningEffort,
+                modelCatalog: modelCatalog
+            )
         process.currentDirectoryURL = workingDirectory
         process.environment = Self.makeProcessEnvironment(
             environment,
@@ -602,10 +981,14 @@ public actor CodexAppServerClient: TranslationBackend {
             let startedThreadIDs = try await task.value
             if threadIDs.isEmpty {
                 threadIDs = startedThreadIDs
+                successfulTurnsByThreadIndex.removeAll()
                 availableThreadIndices = Array(startedThreadIDs.indices)
+                activeThreadPriorities.removeAll()
+                let hedgeMilliseconds = modelWaitHedgeNanoseconds
+                    .map { String($0 / 1_000_000) } ?? "off"
                 runtimeLog.write(
                     "codex",
-                    "ready model=\(model ?? "default") threads=\(startedThreadIDs.count)"
+                    "ready model=\(model ?? "default") threads=\(startedThreadIDs.count) background_limit=\(maximumBackgroundConcurrentTurns) hedge_ms=\(hedgeMilliseconds) dispatch_aware=\(dispatchState != nil)"
                 )
             }
             threadStartupTask = nil
@@ -642,6 +1025,54 @@ public actor CodexAppServerClient: TranslationBackend {
             throw TranslationError.invalidResponse("Codex 没有返回 thread id。")
         }
         return threadID
+    }
+
+    private func recordSuccessfulTurnAndRotateIfNeeded(
+        index: Int,
+        id: String
+    ) async -> String {
+        guard let threadRotationTurns,
+            threadIDs.indices.contains(index),
+            threadIDs[index] == id
+        else { return id }
+
+        let successfulTurns = successfulTurnsByThreadIndex[index, default: 0] + 1
+        successfulTurnsByThreadIndex[index] = successfulTurns
+        guard successfulTurns >= threadRotationTurns else { return id }
+
+        do {
+            let replacementID = try await startThread()
+            guard threadIDs.indices.contains(index), threadIDs[index] == id else {
+                deleteThreadBestEffort(replacementID)
+                return id
+            }
+            threadIDs[index] = replacementID
+            successfulTurnsByThreadIndex[index] = 0
+            deleteThreadBestEffort(id)
+            runtimeLog.write(
+                "codex",
+                "thread_rotated thread_index=\(index) successful_turns=\(successfulTurns)"
+            )
+            return replacementID
+        } catch {
+            successfulTurnsByThreadIndex[index] = max(0, threadRotationTurns - 1)
+            runtimeLog.write(
+                "codex",
+                "thread_rotation_failed thread_index=\(index) error_type=\(String(reflecting: type(of: error)))"
+            )
+            return id
+        }
+    }
+
+    private func deleteThreadBestEffort(_ threadID: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await self.request(
+                method: "thread/delete",
+                params: .object(["threadId": .string(threadID)]),
+                timeoutNanoseconds: 2_000_000_000
+            )
+        }
     }
 
     static func fastThreadStartParameters(
@@ -750,12 +1181,22 @@ public actor CodexAppServerClient: TranslationBackend {
         }
     }
 
-    private func acquireThread(priority: TranslationPriority) async throws -> (index: Int, id: String) {
+    private func acquireThread(priority: TranslationPriority) async throws -> ThreadLease {
         let index: Int
-        if availableThreadIndices.isEmpty {
+        if let availableIndex = availableThreadIndices.first,
+            Self.canAcquireAvailableThread(
+                priority: priority,
+                activeBackgroundTurns: activeBackgroundTurnCount,
+                maximumBackgroundTurns: maximumBackgroundConcurrentTurns
+            )
+        {
+            availableThreadIndices.removeFirst()
+            activeThreadPriorities[availableIndex] = priority
+            index = availableIndex
+        } else {
             runtimeLog.write(
                 "codex",
-                "translation_queued priority=\(priority.rawValue) active=\(threadIDs.count - availableThreadIndices.count) queued=\(threadWaiters.count + 1)"
+                "translation_queued priority=\(priority.rawValue) active=\(activeThreadPriorities.count) background_active=\(activeBackgroundTurnCount) background_limit=\(maximumBackgroundConcurrentTurns) queued=\(threadWaiters.count + 1)"
             )
             index = try await withCheckedThrowingContinuation { continuation in
                 threadWaiters.append(
@@ -767,19 +1208,39 @@ public actor CodexAppServerClient: TranslationBackend {
                 )
                 nextThreadWaiterSequence += 1
             }
-        } else {
-            index = availableThreadIndices.removeFirst()
         }
-        return (index, threadIDs[index])
+        return ThreadLease(index: index, id: threadIDs[index])
+    }
+
+    private func tryAcquireHedgeThread() -> ThreadLease? {
+        guard let index = availableThreadIndices.first,
+            !threadWaiters.contains(where: { $0.priority.rank > TranslationPriority.background.rank })
+        else { return nil }
+        availableThreadIndices.removeFirst()
+        activeThreadPriorities[index] = .background
+        runtimeLog.write(
+            "codex",
+            "hedge_thread_acquired thread_index=\(index) background_active=\(activeBackgroundTurnCount)"
+        )
+        return ThreadLease(index: index, id: threadIDs[index])
     }
 
     private func releaseThread(index: Int, id: String) {
         guard threadIDs.indices.contains(index), threadIDs[index] == id else { return }
-        if threadWaiters.isEmpty {
+        activeThreadPriorities.removeValue(forKey: index)
+        let eligibleWaiterIndices = threadWaiters.indices.filter { waiterIndex in
+            let waiter = threadWaiters[waiterIndex]
+            return Self.canAcquireAvailableThread(
+                priority: waiter.priority,
+                activeBackgroundTurns: activeBackgroundTurnCount,
+                maximumBackgroundTurns: maximumBackgroundConcurrentTurns
+            )
+        }
+        guard !eligibleWaiterIndices.isEmpty else {
             availableThreadIndices.append(index)
             return
         }
-        let nextWaiterIndex = threadWaiters.indices.min { left, right in
+        let nextWaiterIndex = eligibleWaiterIndices.min { left, right in
             let leftWaiter = threadWaiters[left]
             let rightWaiter = threadWaiters[right]
             return Self.shouldSchedule(
@@ -789,7 +1250,13 @@ public actor CodexAppServerClient: TranslationBackend {
                 otherSequence: rightWaiter.sequence
             )
         }!
-        threadWaiters.remove(at: nextWaiterIndex).continuation.resume(returning: index)
+        let waiter = threadWaiters.remove(at: nextWaiterIndex)
+        activeThreadPriorities[index] = waiter.priority
+        waiter.continuation.resume(returning: index)
+    }
+
+    private var activeBackgroundTurnCount: Int {
+        activeThreadPriorities.values.filter { $0 == .background }.count
     }
 
     private func sendNotification(method: String, params: JSONValue) throws {
@@ -820,17 +1287,35 @@ public actor CodexAppServerClient: TranslationBackend {
     }
 
     private func waitForTurn(_ turnID: String) async throws -> String {
-        if let result = earlyTurnResults.removeValue(forKey: turnID) {
-            return try result.get()
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            turnContinuations[turnID] = continuation
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: self?.timeoutNanoseconds ?? 120_000_000_000)
-                await self?.expireTurn(turnID)
+        try Task.checkCancellation()
+        return try await withTaskCancellationHandler {
+            if let result = earlyTurnResults.removeValue(forKey: turnID) {
+                return try result.get()
             }
+
+            return try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                turnContinuations[turnID] = continuation
+                Task { [weak self] in
+                    try? await Task.sleep(
+                        nanoseconds: self?.timeoutNanoseconds ?? 120_000_000_000
+                    )
+                    await self?.expireTurn(turnID)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelTurnWait(turnID) }
         }
+    }
+
+    private func cancelTurnWait(_ turnID: String) {
+        earlyTurnResults.removeValue(forKey: turnID)
+        guard let continuation = turnContinuations.removeValue(forKey: turnID) else { return }
+        turnBuffers.removeValue(forKey: turnID)
+        continuation.resume(throwing: CancellationError())
     }
 
     private func expireTurn(_ turnID: String) {
@@ -845,6 +1330,7 @@ public actor CodexAppServerClient: TranslationBackend {
         turnID: String,
         request: TranslationBatchRequest,
         acceptedAt: UInt64,
+        attemptState: TurnAttemptState?,
         onOutput: (@Sendable (TranslationOutput) -> Void)?
     ) {
         if turnTimelines[turnID] == nil {
@@ -853,8 +1339,12 @@ public actor CodexAppServerClient: TranslationBackend {
         turnStreams[turnID] = TurnStreamState(
             request: request,
             onOutput: onOutput,
-            acceptedAt: acceptedAt
+            acceptedAt: acceptedAt,
+            attemptState: attemptState
         )
+        if turnTimelines[turnID]?.agentMessageStartedAt != nil {
+            Task { await attemptState?.markModelStarted() }
+        }
         if let buffered = turnBuffers[turnID], !buffered.isEmpty {
             consumeTurnDelta(buffered, turnID: turnID)
         }
@@ -976,6 +1466,9 @@ public actor CodexAppServerClient: TranslationBackend {
                 timeline.agentMessageStartedAt = DispatchTime.now().uptimeNanoseconds
             }
             turnTimelines[turnID] = timeline
+            if let attemptState = turnStreams[turnID]?.attemptState {
+                Task { await attemptState.markModelStarted() }
+            }
 
         case "item/agentMessage/delta":
             guard let turnID = message["params"]?["turnId"]?.stringValue else { return }
@@ -1022,10 +1515,18 @@ public actor CodexAppServerClient: TranslationBackend {
                 result = .failure(TranslationError.backendUnavailable(reason))
             }
 
+            if discardedTurnIDs.remove(turnID) != nil {
+                turnStreams.removeValue(forKey: turnID)
+                turnTimelines.removeValue(forKey: turnID)
+                return
+            }
             if let continuation = turnContinuations.removeValue(forKey: turnID) {
                 continuation.resume(with: result)
             } else {
                 earlyTurnResults[turnID] = result
+            }
+            if let attemptState = turnStreams[turnID]?.attemptState {
+                Task { await attemptState.markFinished() }
             }
 
         default:
@@ -1052,7 +1553,9 @@ public actor CodexAppServerClient: TranslationBackend {
         process = nil
         inputHandle = nil
         threadIDs.removeAll()
+        successfulTurnsByThreadIndex.removeAll()
         availableThreadIndices.removeAll()
+        activeThreadPriorities.removeAll()
         failAll(with: error)
     }
 
@@ -1070,11 +1573,13 @@ public actor CodexAppServerClient: TranslationBackend {
         turnStreams.removeAll()
         turnTimelines.removeAll()
         earlyTurnResults.removeAll()
+        discardedTurnIDs.removeAll()
 
         for waiter in threadWaiters {
             waiter.continuation.resume(throwing: error)
         }
         threadWaiters.removeAll()
+        activeThreadPriorities.removeAll()
     }
 
     private func makePrompt(
@@ -1090,7 +1595,11 @@ public actor CodexAppServerClient: TranslationBackend {
                 ModelInput.GlossaryItem(source: $0.source, target: $0.target)
             },
             items: request.items.enumerated().map { index, item in
-                ModelInput.Item(id: item.id, index: index, text: item.text)
+                ModelInput.Item(
+                    id: Self.compactModelItemID(for: index),
+                    index: index,
+                    text: item.text
+                )
             }
         )
         let encoder = JSONEncoder()
@@ -1149,8 +1658,12 @@ public actor CodexAppServerClient: TranslationBackend {
         }
 
         var seen: Set<String> = []
-        let expected = Dictionary(uniqueKeysWithValues: request.items.enumerated().map { ($0.element.id, $0.offset) })
-        var resultByID: [String: String] = [:]
+        let expected = Dictionary(
+            uniqueKeysWithValues: request.items.indices.map {
+                (Self.compactModelItemID(for: $0), $0)
+            }
+        )
+        var resultByIndex: [Int: String] = [:]
 
         for translation in envelope.translations {
             guard seen.insert(translation.id).inserted else {
@@ -1162,15 +1675,19 @@ public actor CodexAppServerClient: TranslationBackend {
             guard translation.index == expectedIndex else {
                 throw TranslationError.invalidResponse("项目 \(translation.id) 的 index 不正确。")
             }
-            resultByID[translation.id] = translation.text
+            resultByIndex[expectedIndex] = translation.text
         }
 
-        return try request.items.map { item in
-            guard let text = resultByID[item.id] else {
+        return try request.items.enumerated().map { index, item in
+            guard let text = resultByIndex[index] else {
                 throw TranslationError.invalidResponse("缺少项目 \(item.id)。")
             }
             return TranslationOutput(id: item.id, text: text)
         }
+    }
+
+    static func compactModelItemID(for index: Int) -> String {
+        String(index, radix: 36)
     }
 
     private static func modelJSONData(from output: String) throws -> Data {
@@ -1204,7 +1721,8 @@ public actor CodexAppServerClient: TranslationBackend {
             )
         }
 
-        let bundled = bundleURL
+        let bundled =
+            bundleURL
             .appendingPathComponent("Contents/Helpers/gloss-codex-app-server")
             .path
         if FileManager.default.isExecutableFile(atPath: bundled) {
@@ -1235,6 +1753,45 @@ public actor CodexAppServerClient: TranslationBackend {
             return priority.rank > otherPriority.rank
         }
         return sequence < otherSequence
+    }
+
+    static func canAcquireAvailableThread(
+        priority: TranslationPriority,
+        activeBackgroundTurns: Int,
+        maximumBackgroundTurns: Int
+    ) -> Bool {
+        priority != .background || activeBackgroundTurns < maximumBackgroundTurns
+    }
+
+    static func defaultBackgroundConcurrency(maximumConcurrentTurns: Int) -> Int {
+        max(1, maximumConcurrentTurns - 1)
+    }
+
+    static func reasoningEffort(
+        for request: TranslationBatchRequest,
+        defaultEffort: CodexReasoningEffort,
+        documentEffort: CodexReasoningEffort?
+    ) -> CodexReasoningEffort {
+        if request.contentKind == .document,
+            request.priority == .background,
+            let documentEffort
+        {
+            return documentEffort
+        }
+        return defaultEffort
+    }
+
+    static func readDocumentReasoningEffort(
+        _ environment: [String: String],
+        configured: CodexReasoningEffort?
+    ) -> CodexReasoningEffort? {
+        guard let rawValue = environment["GLOSS_CODEX_DOCUMENT_REASONING_EFFORT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !rawValue.isEmpty
+        else { return configured }
+        if rawValue == "inherit" { return nil }
+        return CodexReasoningEffort(rawValue: rawValue) ?? configured
     }
 
     static func turnWaitStages(
@@ -1473,13 +2030,16 @@ public actor CodexAppServerClient: TranslationBackend {
         if let configured = environment["GLOSS_CODEX_HOME"]?.nilIfBlank {
             directory = URL(fileURLWithPath: configured, isDirectory: true)
         } else {
-            guard let applicationSupport = FileManager.default.urls(
-                for: .applicationSupportDirectory,
-                in: .userDomainMask
-            ).first else {
+            guard
+                let applicationSupport = FileManager.default.urls(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask
+                ).first
+            else {
                 throw TranslationError.backendUnavailable("无法定位 Gloss 的应用支持目录。")
             }
-            directory = applicationSupport
+            directory =
+                applicationSupport
                 .appendingPathComponent("Gloss", isDirectory: true)
                 .appendingPathComponent("Codex", isDirectory: true)
         }
@@ -1508,6 +2068,53 @@ public actor CodexAppServerClient: TranslationBackend {
             let value = Int(rawValue),
             (1...8).contains(value)
         else { return defaultMaximumConcurrentTurns }
+        return value
+    }
+
+    static func readModelWaitHedgeNanoseconds(
+        _ environment: [String: String],
+        dispatchAware: Bool = false
+    ) -> UInt64? {
+        guard let rawValue = environment["GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !rawValue.isEmpty
+        else {
+            return dispatchAware
+                ? dispatchAwareModelWaitHedgeNanoseconds
+                : defaultModelWaitHedgeNanoseconds
+        }
+        if ["0", "off", "disabled"].contains(rawValue) { return nil }
+        guard let seconds = UInt64(rawValue), (3...60).contains(seconds) else {
+            return defaultModelWaitHedgeNanoseconds
+        }
+        return seconds * 1_000_000_000
+    }
+
+    static func readThreadRotationTurns(_ environment: [String: String]) -> Int? {
+        guard let rawValue = environment["GLOSS_CODEX_THREAD_ROTATION_TURNS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !rawValue.isEmpty
+        else { return defaultThreadRotationTurns }
+        if ["0", "off", "disabled"].contains(rawValue) { return nil }
+        guard let turns = Int(rawValue), (1...1_000).contains(turns) else {
+            return defaultThreadRotationTurns
+        }
+        return turns
+    }
+
+    private static func readMaximumBackgroundConcurrentTurns(
+        _ environment: [String: String],
+        maximumConcurrentTurns: Int
+    ) -> Int {
+        let defaultValue = defaultBackgroundConcurrency(
+            maximumConcurrentTurns: maximumConcurrentTurns
+        )
+        guard let rawValue = environment["GLOSS_CODEX_BACKGROUND_CONCURRENCY"],
+            let value = Int(rawValue),
+            (1...maximumConcurrentTurns).contains(value)
+        else { return defaultValue }
         return value
     }
 
