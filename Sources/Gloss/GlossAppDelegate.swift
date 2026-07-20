@@ -331,10 +331,13 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let rawArguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
         let arguments = Set(rawArguments)
-        if let pdfArgumentIndex = rawArguments.firstIndex(of: "--open-pdf"),
-            rawArguments.indices.contains(pdfArgumentIndex + 1)
-        {
-            let url = URL(fileURLWithPath: rawArguments[pdfArgumentIndex + 1])
+        let pdfURLs = rawArguments.indices.compactMap { index -> URL? in
+            guard rawArguments[index] == "--open-pdf",
+                rawArguments.indices.contains(index + 1)
+            else { return nil }
+            return URL(fileURLWithPath: rawArguments[index + 1])
+        }
+        if !pdfURLs.isEmpty {
             let requestedPage =
                 rawArguments.firstIndex(of: "--pdf-page")
                 .flatMap { index in
@@ -344,10 +347,18 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 .map { max(0, $0 - 1) } ?? 0
             DispatchQueue.main.async { [weak self] in
-                do {
-                    try self?.pdfTranslationWindow.open(url, pageIndex: requestedPage)
-                } catch {
-                    self?.showAlert(title: "无法打开 PDF", message: error.localizedDescription)
+                for (index, url) in pdfURLs.enumerated() {
+                    do {
+                        try self?.pdfTranslationWindow.open(
+                            url,
+                            pageIndex: index == 0 ? requestedPage : 0
+                        )
+                    } catch {
+                        self?.showAlert(
+                            title: "无法打开 \(url.lastPathComponent)",
+                            message: error.localizedDescription
+                        )
+                    }
                 }
             }
         } else if arguments.contains("--show-history") {
@@ -407,28 +418,37 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
-        guard
-            let filename = filenames.first(where: {
-                URL(fileURLWithPath: $0).pathExtension.lowercased() == "pdf"
-            })
-        else {
+        let pdfURLs =
+            filenames
+            .map(URL.init(fileURLWithPath:))
+            .filter { $0.pathExtension.lowercased() == "pdf" }
+        guard !pdfURLs.isEmpty else {
             sender.reply(toOpenOrPrint: .failure)
             return
         }
 
-        do {
-            try pdfTranslationWindow.open(URL(fileURLWithPath: filename))
+        var failures: [String] = []
+        for url in pdfURLs {
+            do {
+                try pdfTranslationWindow.open(url)
+            } catch {
+                failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+            }
+        }
+        if failures.isEmpty {
             sender.reply(toOpenOrPrint: .success)
-        } catch {
+        } else {
             sender.reply(toOpenOrPrint: .failure)
-            showAlert(title: "无法打开 PDF", message: error.localizedDescription)
+            showAlert(title: "部分 PDF 无法打开", message: failures.joined(separator: "\n"))
         }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminationInProgress else { return .terminateLater }
         terminationInProgress = true
-        Task { [codex, llama] in
+        let pdfWindow = pdfTranslationWindowController
+        Task { [codex, llama, pdfWindow] in
+            await pdfWindow?.stopAndWait()
             await codex.stop()
             await llama.stop()
             NSApp.reply(toApplicationShouldTerminate: true)
@@ -897,21 +917,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openPDFTranslation() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.pdf]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.prompt = "打开并翻译"
-        panel.message = "Gloss 使用 BabelDOC 保留版式，并通过当前 provider 翻译完整文档。"
-        NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        do {
-            try pdfTranslationWindow.open(url)
-        } catch {
-            showAlert(title: "无法打开 PDF", message: error.localizedDescription)
-        }
+        pdfTranslationWindow.show()
     }
 
     @objc private func translateClipboardImage() {

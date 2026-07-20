@@ -4,6 +4,32 @@ import XCTest
 @testable import GlossCore
 
 final class BabelDOCExternalEngineTests: XCTestCase {
+    func testPersistentLayoutServiceSmokeWhenRequested() async throws {
+        guard ProcessInfo.processInfo.environment["GLOSS_RUN_BABELDOC_SERVICE_SMOKE"] == "1"
+        else {
+            throw XCTSkip(
+                "Set GLOSS_RUN_BABELDOC_SERVICE_SMOKE=1 to load the live DocLayout service."
+            )
+        }
+        let runtime = try XCTUnwrap(BabelDOCExternalEngine.resolveRuntime())
+        let session = BabelDOCServiceSession()
+        do {
+            let baseURL = try await session.start(
+                runtime: runtime,
+                timeout: .seconds(120)
+            )
+            let (data, response) = try await URLSession.shared.data(
+                from: baseURL.appendingPathComponent("healthz")
+            )
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("ok"))
+            await session.stop()
+        } catch {
+            await session.stop()
+            throw error
+        }
+    }
+
     func testLiveBenchmarkWhenRequested() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["GLOSS_RUN_BABELDOC_BENCHMARK"] == "1" else {
@@ -258,6 +284,47 @@ final class BabelDOCExternalEngineTests: XCTestCase {
 
         let index = launch.arguments.firstIndex(of: "--max-pages-per-part")
         XCTAssertEqual(index.map { launch.arguments[$0 + 1] }, "7")
+    }
+
+    func testPersistentLayoutServiceIsPassedToBabelDOC() {
+        let request = BabelDOCTranslationRequest(
+            inputURL: URL(fileURLWithPath: "/tmp/input.pdf"),
+            outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            sourceLanguageCode: "en",
+            targetLanguageCode: "zh-CN",
+            bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
+            bridgeToken: "token",
+            layoutServiceBaseURL: URL(string: "http://127.0.0.1:49152")!
+        )
+        let launch = BabelDOCExternalEngine.makeLaunch(
+            runtime: BabelDOCRuntimeLaunch(
+                executable: "/tmp/babeldoc",
+                source: "test"
+            ),
+            request: request,
+            configurationURL: URL(fileURLWithPath: "/tmp/config.toml"),
+            environment: [:]
+        )
+
+        let index = launch.arguments.firstIndex(of: "--rpc-doclayout")
+        XCTAssertEqual(
+            index.map { launch.arguments[$0 + 1] },
+            "http://127.0.0.1:49152"
+        )
+    }
+
+    func testPersistentLayoutServiceReadyPortParser() {
+        XCTAssertEqual(
+            BabelDOCServiceSession.readyPort(
+                in: "loading\n__GLOSS_BABELDOC_LAYOUT_READY__51234\n"
+            ),
+            51_234
+        )
+        XCTAssertNil(
+            BabelDOCServiceSession.readyPort(
+                in: "__GLOSS_BABELDOC_LAYOUT_READY__70000\n"
+            )
+        )
     }
 
     func testProgressParserHandlesChunkedNDJSON() throws {

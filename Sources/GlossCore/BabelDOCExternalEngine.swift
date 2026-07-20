@@ -27,6 +27,7 @@ public struct BabelDOCTranslationRequest: Sendable {
     public let maximumPagesPerPart: Int
     public let skipScannedDetection: Bool
     public let outputMode: BabelDOCOutputMode
+    public let layoutServiceBaseURL: URL?
 
     public init(
         inputURL: URL,
@@ -38,7 +39,8 @@ public struct BabelDOCTranslationRequest: Sendable {
         qps: Int = 8,
         maximumPagesPerPart: Int = 50,
         skipScannedDetection: Bool = false,
-        outputMode: BabelDOCOutputMode = .monolingual
+        outputMode: BabelDOCOutputMode = .monolingual,
+        layoutServiceBaseURL: URL? = nil
     ) {
         self.inputURL = inputURL
         self.outputDirectory = outputDirectory
@@ -50,6 +52,7 @@ public struct BabelDOCTranslationRequest: Sendable {
         self.maximumPagesPerPart = max(1, maximumPagesPerPart)
         self.skipScannedDetection = skipScannedDetection
         self.outputMode = outputMode
+        self.layoutServiceBaseURL = layoutServiceBaseURL
     }
 }
 
@@ -348,6 +351,12 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
         ]
         if request.skipScannedDetection {
             arguments.append("--skip-scanned-detection")
+        }
+        if let layoutServiceBaseURL = request.layoutServiceBaseURL {
+            arguments.append(contentsOf: [
+                "--rpc-doclayout",
+                layoutServiceBaseURL.absoluteString,
+            ])
         }
         let optionalFlags = [
             ("GLOSS_BABELDOC_SKIP_CLEAN", "--skip-clean"),

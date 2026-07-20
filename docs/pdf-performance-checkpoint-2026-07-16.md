@@ -173,9 +173,11 @@ The ONNX model is 72 MB on disk. Direct local measurements produced:
 | RSS after one page inference, then idle | about 556 MB |
 | Idle CPU over ten seconds | below 0.04% of one core |
 
-Gloss will keep this service on demand rather than permanently resident. Future UI should show
-`Starting translation service` separately from document translation and may keep the service
-alive briefly while the PDF window remains active.
+Gloss keeps this service on demand rather than permanently resident for the whole app. The batch
+PDF window now starts one loopback-only service when the module opens, reuses it across queued
+documents, and stops it when the window closes. The UI reports service startup separately from
+document translation. Documents run serially so the resident model removes repeated startup cost
+without multiplying BabelDOC memory peaks.
 
 ## Dispatch-center architecture
 
