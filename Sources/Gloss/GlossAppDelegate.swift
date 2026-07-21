@@ -59,9 +59,17 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastAccessibilityTrusted: Bool?
     private var pairingToken: String?
     private var loopbackServer: LoopbackServer?
+    private lazy var bridgePortManager = BridgePortManager()
+    private var bridgeRecoveryTask: Task<Void, Never>?
+    private var bridgeGeneration = UUID()
+    private var bridgeListenerAttempt: UUID?
+    private var bridgeDashboardState = BridgeDashboardState.inspecting
+    private var browserExtensionStatus = (
+        message: "正在准备浏览器扩展",
+        succeeded: true
+    )
     private var terminationInProgress = false
     private var lastExternalApplication: NSRunningApplication?
-    private var browserStatus = (message: "正在启动本地浏览器桥接", succeeded: true)
     private var engineStatus = (message: "正在启动翻译引擎", succeeded: Optional<Bool>.none)
     private var codexAccountAuthenticated = false
     private var codexLoginInProgress = false
@@ -137,6 +145,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.onOpenSafariExtensionSettings = { [weak self] in
             self?.openSafariExtensionSettings()
         }
+        controller.onBridgeAction = { [weak self] in
+            self?.performBridgeDashboardAction()
+        }
         controller.onRevealLogs = { [weak self] in
             self?.revealLogs()
         }
@@ -149,7 +160,11 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.onSetGlobalShortcut = { [weak self] shortcut in
             self?.setGlobalShortcut(shortcut)
         }
-        controller.showBrowserStatus(browserStatus.message, succeeded: browserStatus.succeeded)
+        controller.showBridgeState(bridgeDashboardState)
+        controller.showBrowserExtensionStatus(
+            browserExtensionStatus.message,
+            succeeded: browserExtensionStatus.succeeded
+        )
         controller.showProviderConfiguration(providerConfiguration)
         if let succeeded = engineStatus.succeeded {
             controller.showProviderResult(engineStatus.message, succeeded: succeeded)
@@ -196,7 +211,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.targetLanguage ?? "Chinese (Simplified)"
             },
             bridgeToken: { [weak self] in
-                self?.pairingToken
+                guard self?.bridgeDashboardState.isReady == true else { return nil }
+                return self?.pairingToken
             },
             translationDispatchState: dispatchState
         )
@@ -409,6 +425,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         runtimeLog.write("app", "stopping")
+        bridgeGeneration = UUID()
+        bridgeListenerAttempt = nil
+        bridgeRecoveryTask?.cancel()
         activeOCRTask?.cancel()
         pdfTranslationWindowController?.stop()
         stopAccessibilityPolling()
@@ -446,6 +465,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminationInProgress else { return .terminateLater }
         terminationInProgress = true
+        bridgeGeneration = UUID()
+        bridgeListenerAttempt = nil
+        bridgeRecoveryTask?.cancel()
         let pdfWindow = pdfTranslationWindowController
         Task { [codex, llama, pdfWindow] in
             await pdfWindow?.stopAndWait()
@@ -1561,64 +1583,283 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = buildMenu()
     }
 
-    private func startBrowserBridge() {
+    private func startBrowserBridge(
+        forcingTerminationOf forcedOccupant: BridgePortOccupant? = nil
+    ) {
+        bridgeRecoveryTask?.cancel()
+        let generation = UUID()
+        bridgeGeneration = generation
+        bridgeListenerAttempt = nil
+        updateBridgeState(.inspecting)
+        bridgeRecoveryTask = Task { [weak self] in
+            guard let self else { return }
+            await connectBrowserBridge(
+                generation: generation,
+                forcedOccupant: forcedOccupant
+            )
+        }
+    }
+
+    private func connectBrowserBridge(
+        generation: UUID,
+        forcedOccupant: BridgePortOccupant?
+    ) async {
+        let previousServer = loopbackServer
+        loopbackServer = nil
+        previousServer?.stop()
+
         do {
+            var occupant = try await inspectBridgeOccupantAfterOwnShutdown(
+                token: pairingToken
+            )
+            try Task.checkCancellation()
+            if let forcedOccupant, let activeOccupant = occupant {
+                guard activeOccupant.identifiesSameProcess(as: forcedOccupant) else {
+                    updateBridgeState(.occupied(activeOccupant))
+                    bridgeRecoveryTask = nil
+                    return
+                }
+                updateBridgeState(.reclaiming(activeOccupant))
+                try await bridgePortManager.terminate(
+                    activeOccupant,
+                    token: pairingToken,
+                    allowingUnverified: true
+                )
+            }
+
             let token = try PairingTokenStore.loadOrCreate()
             pairingToken = token
-            let extensionPreparationError: String?
-            do {
-                _ = try BrowserExtensionFiles.installBundledCopy(pairingToken: token)
-                extensionPreparationError = nil
-            } catch {
-                extensionPreparationError = error.localizedDescription
+            prepareBrowserExtension(pairingToken: token)
+            try Task.checkCancellation()
+
+            occupant = try await bridgePortManager.inspect(token: token)
+            try Task.checkCancellation()
+            if let activeOccupant = occupant {
+                guard activeOccupant.canAutomaticallyTerminate else {
+                    updateBridgeState(.occupied(activeOccupant))
+                    bridgeRecoveryTask = nil
+                    return
+                }
+                updateBridgeState(.reclaiming(activeOccupant))
+                try await bridgePortManager.terminate(
+                    activeOccupant,
+                    token: token,
+                    allowingUnverified: false
+                )
+                occupant = try await bridgePortManager.inspect(token: token)
             }
-            let server = LoopbackServer(
-                broker: broker,
+
+            try Task.checkCancellation()
+            guard generation == bridgeGeneration else { return }
+            if let occupant {
+                updateBridgeState(.occupied(occupant))
+                bridgeRecoveryTask = nil
+                return
+            }
+
+            updateBridgeState(.starting)
+            let attempt = UUID()
+            bridgeListenerAttempt = attempt
+            let server = makeLoopbackServer(
                 token: token,
-                version: applicationVersion,
-                dispatchState: dispatchState,
-                providerStatus: { [weak self] in
-                    guard let self else {
-                        return TranslationProviderStatus(
-                            provider: .codex,
-                            model: TranslationProviderConfiguration.defaultCodexModel,
-                            reasoningEffort: .low,
-                            configurationRevision: "unavailable",
-                            isWarm: false
-                        )
-                    }
-                    return await self.browserProviderStatus()
-                }
+                generation: generation,
+                attempt: attempt
             )
-            server.onStateChange = { [weak self] state in
-                Task { @MainActor in
-                    guard let self else { return }
-                    switch state {
-                    case .starting:
-                        self.updateBrowserStatus("正在启动 127.0.0.1:8787", succeeded: true)
-                    case .ready:
-                        if let extensionPreparationError {
-                            self.updateBrowserStatus(
-                                "桥接已就绪；扩展准备失败：\(extensionPreparationError)",
-                                succeeded: false
-                            )
-                        } else {
-                            self.updateBrowserStatus(
-                                "已就绪 · 扩展已自动配对",
-                                succeeded: true
-                            )
-                        }
-                    case .failed(let message):
-                        self.updateBrowserStatus(message, succeeded: false)
-                    case .stopped:
-                        self.updateBrowserStatus("浏览器桥接已停止", succeeded: false)
-                    }
+            loopbackServer = server
+            do {
+                try server.start()
+            } catch {
+                guard isCurrentBridgeListener(generation: generation, attempt: attempt)
+                else { return }
+                bridgeListenerAttempt = nil
+                loopbackServer = nil
+                throw error
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard generation == bridgeGeneration else { return }
+            if let occupant = try? await bridgePortManager.inspect(token: pairingToken),
+                occupant.processIdentifier != ProcessInfo.processInfo.processIdentifier
+            {
+                updateBridgeState(.occupied(occupant))
+            } else {
+                updateBridgeState(.failed(error.localizedDescription))
+            }
+            bridgeRecoveryTask = nil
+        }
+    }
+
+    private func makeLoopbackServer(
+        token: String,
+        generation: UUID,
+        attempt: UUID
+    ) -> LoopbackServer {
+        let server = LoopbackServer(
+            broker: broker,
+            token: token,
+            version: applicationVersion,
+            dispatchState: dispatchState,
+            providerStatus: { [weak self] in
+                guard let self else {
+                    return TranslationProviderStatus(
+                        provider: .codex,
+                        model: TranslationProviderConfiguration.defaultCodexModel,
+                        reasoningEffort: .low,
+                        configurationRevision: "unavailable",
+                        isWarm: false
+                    )
+                }
+                return await self.browserProviderStatus()
+            }
+        )
+        server.onStateChange = { [weak self] state in
+            Task { @MainActor [weak self] in
+                guard let self,
+                    isCurrentBridgeListener(generation: generation, attempt: attempt)
+                else { return }
+                switch state {
+                case .starting:
+                    break
+                case .ready:
+                    await finishBrowserBridgeStartup(
+                        token: token,
+                        generation: generation,
+                        attempt: attempt
+                    )
+                case .failed(let message):
+                    await handleBrowserBridgeFailure(
+                        message,
+                        token: token,
+                        generation: generation,
+                        attempt: attempt
+                    )
+                case .stopped:
+                    bridgeListenerAttempt = nil
+                    loopbackServer = nil
+                    updateBridgeState(.stopped)
+                    bridgeRecoveryTask = nil
                 }
             }
-            try server.start()
-            loopbackServer = server
+        }
+        return server
+    }
+
+    private func finishBrowserBridgeStartup(
+        token: String,
+        generation: UUID,
+        attempt: UUID
+    ) async {
+        guard isCurrentBridgeListener(generation: generation, attempt: attempt) else {
+            return
+        }
+        let health = await bridgePortManager.waitForHealthyBridge(token: token)
+        guard isCurrentBridgeListener(generation: generation, attempt: attempt) else {
+            return
+        }
+        guard let health else {
+            bridgeListenerAttempt = nil
+            updateBridgeState(.failed("桥接已监听端口，但健康检查没有通过。"))
+            loopbackServer?.stop()
+            loopbackServer = nil
+            bridgeRecoveryTask = nil
+            return
+        }
+        updateBridgeState(
+            .ready(
+                BridgeReadyInfo(
+                    endpoint: "127.0.0.1:\(bridgePortManager.port)",
+                    processIdentifier: ProcessInfo.processInfo.processIdentifier,
+                    version: health.version ?? applicationVersion,
+                    executablePath: Bundle.main.executableURL?.path
+                )
+            )
+        )
+        bridgeRecoveryTask = nil
+    }
+
+    private func handleBrowserBridgeFailure(
+        _ message: String,
+        token: String,
+        generation: UUID,
+        attempt: UUID
+    ) async {
+        guard isCurrentBridgeListener(generation: generation, attempt: attempt) else {
+            return
+        }
+        bridgeListenerAttempt = nil
+        updateBridgeState(.failed(message))
+        loopbackServer = nil
+        let occupant = try? await bridgePortManager.inspect(token: token)
+        guard generation == bridgeGeneration else { return }
+        if let occupant,
+            occupant.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        {
+            updateBridgeState(.occupied(occupant))
+        } else {
+            updateBridgeState(.failed(message))
+        }
+        bridgeRecoveryTask = nil
+    }
+
+    private func isCurrentBridgeListener(
+        generation: UUID,
+        attempt: UUID
+    ) -> Bool {
+        generation == bridgeGeneration && attempt == bridgeListenerAttempt
+    }
+
+    private func inspectBridgeOccupantAfterOwnShutdown(
+        token: String?
+    ) async throws -> BridgePortOccupant? {
+        for _ in 0..<12 {
+            let occupant = try await bridgePortManager.inspect(token: token)
+            if occupant?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                return occupant
+            }
+            try await Task.sleep(for: .milliseconds(80))
+        }
+        return try await bridgePortManager.inspect(token: token)
+    }
+
+    private func performBridgeDashboardAction() {
+        guard let occupant = bridgeDashboardState.occupant,
+            !occupant.canAutomaticallyTerminate
+        else {
+            startBrowserBridge()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "终止占用端口的进程？"
+        var details = [
+            "\(occupant.displayName) 正在占用 \(occupant.endpoint)。",
+            "PID：\(occupant.processIdentifier)",
+        ]
+        if let path = occupant.executablePath {
+            details.append("路径：\(path)")
+        }
+        details.append("Gloss 将在进程结束后重新建立本地连接。")
+        alert.informativeText = details.joined(separator: "\n")
+        alert.addButton(withTitle: "终止并重新连接")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        startBrowserBridge(forcingTerminationOf: occupant)
+    }
+
+    private func prepareBrowserExtension(pairingToken: String) {
+        do {
+            _ = try BrowserExtensionFiles.installBundledCopy(
+                pairingToken: pairingToken
+            )
+            updateBrowserExtensionStatus("浏览器扩展已自动配对", succeeded: true)
         } catch {
-            updateBrowserStatus(error.localizedDescription, succeeded: false)
+            updateBrowserExtensionStatus(
+                "扩展准备失败：\(error.localizedDescription)",
+                succeeded: false
+            )
         }
     }
 
@@ -1644,22 +1885,34 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
     }
 
-    private func updateBrowserStatus(_ message: String, succeeded: Bool) {
-        browserStatus = (message, succeeded)
-        runtimeLog.write("bridge", "status ok=\(succeeded) message=\(message)")
-        settingsWindowController?.showBrowserStatus(message, succeeded: succeeded)
+    private func updateBridgeState(_ state: BridgeDashboardState) {
+        bridgeDashboardState = state
+        let presentation = state.presentation
+        runtimeLog.write(
+            "bridge",
+            "dashboard state=\(String(describing: state)) message=\(presentation.headline) detail=\(presentation.detail)"
+        )
+        settingsWindowController?.showBridgeState(state)
+    }
+
+    private func updateBrowserExtensionStatus(_ message: String, succeeded: Bool) {
+        browserExtensionStatus = (message, succeeded)
+        settingsWindowController?.showBrowserExtensionStatus(
+            message,
+            succeeded: succeeded
+        )
     }
 
     private func copyBrowserToken() {
         guard let pairingToken else {
-            settingsWindow.showBrowserStatus("配对令牌不可用", succeeded: false)
+            settingsWindow.showBrowserExtensionStatus("配对令牌不可用", succeeded: false)
             return
         }
         guard let changeCount = SelectionWriter.copySensitive(pairingToken) else {
-            settingsWindow.showBrowserStatus("无法复制配对令牌", succeeded: false)
+            settingsWindow.showBrowserExtensionStatus("无法复制配对令牌", succeeded: false)
             return
         }
-        settingsWindow.showBrowserStatus("配对令牌已复制 · 60 秒后清除", succeeded: true)
+        updateBrowserExtensionStatus("配对令牌已复制 · 60 秒后清除", succeeded: true)
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(60))
             let pasteboard = NSPasteboard.general
@@ -1667,7 +1920,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 pasteboard.string(forType: .string) == pairingToken
             else { return }
             pasteboard.clearContents()
-            self?.settingsWindowController?.showBrowserStatus("配对令牌已从剪贴板清除", succeeded: true)
+            self?.updateBrowserExtensionStatus("配对令牌已从剪贴板清除", succeeded: true)
         }
     }
 

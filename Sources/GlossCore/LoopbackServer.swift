@@ -263,7 +263,7 @@ package final class LoopbackServer: @unchecked Sendable {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port)
         let listener = try NWListener(using: parameters)
-        listener.stateUpdateHandler = { [weak self] state in
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
             guard let self else { return }
             switch state {
             case .ready:
@@ -272,6 +272,7 @@ package final class LoopbackServer: @unchecked Sendable {
             case .failed(let error):
                 self.runtimeLog.write("bridge", "failed error=\(error.localizedDescription)")
                 self.onStateChange?(.failed(error.localizedDescription))
+                listener?.stateUpdateHandler = nil
                 self.stop()
             case .cancelled:
                 self.onStateChange?(.stopped)
