@@ -609,6 +609,47 @@ final class LoopbackServerTests: XCTestCase {
         XCTAssertEqual(configuration.refillDelayNanoseconds, 0)
     }
 
+    func testSecondServerReportsAnOccupiedPort() async throws {
+        let port: UInt16 = 18_789
+        let firstStates = BridgeStateRecorder()
+        let secondStates = BridgeStateRecorder()
+        let first = LoopbackServer(
+            broker: TranslationBroker(backend: BridgeBackend()),
+            token: token,
+            port: port
+        )
+        let second = LoopbackServer(
+            broker: TranslationBroker(backend: BridgeBackend()),
+            token: token,
+            port: port
+        )
+        first.onStateChange = { state in
+            Task { await firstStates.record(state) }
+        }
+        second.onStateChange = { state in
+            Task { await secondStates.record(state) }
+        }
+        defer {
+            second.stop()
+            first.stop()
+        }
+
+        try first.start()
+        await waitForBackendState {
+            await firstStates.contains(.ready)
+        }
+        try second.start()
+        await waitForBackendState {
+            await secondStates.hasFailure
+        }
+
+        let secondServerFailed = await secondStates.hasFailure
+        try await Task.sleep(for: .milliseconds(50))
+        let secondServerStopped = await secondStates.contains(.stopped)
+        XCTAssertTrue(secondServerFailed)
+        XCTAssertFalse(secondServerStopped)
+    }
+
     private func request(
         path: String,
         method: String = "GET",
@@ -654,6 +695,25 @@ final class LoopbackServerTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(5))
         }
         XCTFail("Timed out waiting for backend state.")
+    }
+}
+
+private actor BridgeStateRecorder {
+    private var states: [LoopbackServer.State] = []
+
+    var hasFailure: Bool {
+        states.contains {
+            if case .failed = $0 { return true }
+            return false
+        }
+    }
+
+    func record(_ state: LoopbackServer.State) {
+        states.append(state)
+    }
+
+    func contains(_ state: LoopbackServer.State) -> Bool {
+        states.contains(state)
     }
 }
 

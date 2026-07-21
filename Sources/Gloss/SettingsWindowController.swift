@@ -13,6 +13,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     var onCopyBrowserToken: (() -> Void)?
     var onRevealBrowserExtension: (() -> Void)?
     var onOpenSafariExtensionSettings: (() -> Void)?
+    var onBridgeAction: (() -> Void)?
     var onRevealLogs: (() -> Void)?
     var onOpenServicesSettings: (() -> Void)?
     var onSetLaunchAtLogin: ((Bool) -> Bool)?
@@ -21,7 +22,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     private let window: NSWindow
     private let accessibilityStatus = NSTextField(labelWithString: "")
     private let providerStatus = NSTextField(labelWithString: "正在启动翻译引擎")
-    private let browserStatus = NSTextField(labelWithString: "正在启动本地浏览器桥接")
+    private let bridgeStatus = NSTextField(labelWithString: "正在检查本地连接…")
+    private let bridgeDetail = NSTextField(labelWithString: "127.0.0.1:8787")
+    private let bridgePath = NSTextField(labelWithString: "")
+    private let browserExtensionStatus = NSTextField(labelWithString: "正在准备浏览器扩展")
     private let shortcutStatus = NSTextField(labelWithString: "手动翻译当前选区")
     private let launchAtLoginStatus = NSTextField(labelWithString: "关闭")
     private let verifyButton = NSButton(title: "验证", target: nil, action: nil)
@@ -37,10 +41,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     private let servicesButton = NSButton(title: "打开设置", target: nil, action: nil)
     private let shortcutButton = ShortcutRecorderButton(shortcut: .defaultValue)
     private let launchAtLoginSwitch = NSSwitch()
+    private let bridgeActionButton = NSButton(title: "正在检查…", target: nil, action: nil)
+    private let bridgeProgressIndicator = NSProgressIndicator()
 
     override init() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 790),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 840),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: true
@@ -124,7 +130,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         window.title = "Gloss"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.minSize = NSSize(width: 520, height: 760)
+        window.minSize = NSSize(width: 520, height: 810)
 
         let content = NSView()
         window.contentView = content
@@ -184,27 +190,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
 
         let providerCard = makeProviderCard()
 
-        let revealExtensionButton = NSButton(
-            title: "显示扩展",
-            target: self,
-            action: #selector(revealBrowserExtension)
-        )
-        let tokenButton = NSButton(title: "复制令牌", target: self, action: #selector(copyBrowserToken))
-        let safariButton = NSButton(
-            title: "Safari 设置",
-            target: self,
-            action: #selector(openSafariExtensionSettings)
-        )
-        let browserButtons = NSStackView(views: [safariButton, revealExtensionButton, tokenButton])
-        browserButtons.orientation = .horizontal
-        browserButtons.alignment = .centerY
-        browserButtons.spacing = 6
-        let browserCard = makeStatusCard(
-            symbol: "puzzlepiece.extension",
-            title: "浏览器扩展",
-            status: browserStatus,
-            accessory: browserButtons
-        )
+        let browserCard = makeBridgeCard()
 
         let launchAtLoginCard = makeStatusCard(
             symbol: "power",
@@ -304,6 +290,129 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -44),
             hint.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -20),
         ])
+    }
+
+    private func makeBridgeCard() -> NSView {
+        let card = NSVisualEffectView()
+        card.material = .contentBackground
+        card.blendingMode = .withinWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.image = NSImage(
+            systemSymbolName: "point.3.connected.trianglepath.dotted",
+            accessibilityDescription: "本地翻译桥接"
+        )
+        icon.contentTintColor = .secondaryLabelColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: "本地翻译桥接")
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        bridgeProgressIndicator.style = .spinning
+        bridgeProgressIndicator.controlSize = .small
+        bridgeProgressIndicator.isHidden = false
+
+        bridgeStatus.font = .systemFont(ofSize: 12, weight: .medium)
+        bridgeStatus.lineBreakMode = .byTruncatingTail
+        bridgeStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let statusStack = NSStackView(views: [bridgeProgressIndicator, bridgeStatus])
+        statusStack.orientation = .horizontal
+        statusStack.alignment = .centerY
+        statusStack.spacing = 5
+
+        bridgeActionButton.target = self
+        bridgeActionButton.action = #selector(performBridgeAction)
+        bridgeActionButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        let topRow = NSStackView(views: [titleLabel, statusStack, bridgeActionButton])
+        topRow.orientation = .horizontal
+        topRow.alignment = .centerY
+        topRow.spacing = 10
+        topRow.distribution = .fill
+
+        bridgeDetail.font = .systemFont(ofSize: 11.5)
+        bridgeDetail.textColor = .secondaryLabelColor
+        bridgeDetail.lineBreakMode = .byTruncatingMiddle
+        bridgeDetail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        bridgePath.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        bridgePath.textColor = .tertiaryLabelColor
+        bridgePath.lineBreakMode = .byTruncatingMiddle
+        bridgePath.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        bridgePath.isHidden = true
+
+        browserExtensionStatus.font = .systemFont(ofSize: 11)
+        browserExtensionStatus.textColor = .secondaryLabelColor
+        browserExtensionStatus.lineBreakMode = .byTruncatingTail
+        browserExtensionStatus.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        let revealExtensionButton = NSButton(
+            title: "显示扩展",
+            target: self,
+            action: #selector(revealBrowserExtension)
+        )
+        let tokenButton = NSButton(
+            title: "复制令牌",
+            target: self,
+            action: #selector(copyBrowserToken)
+        )
+        let safariButton = NSButton(
+            title: "Safari 设置",
+            target: self,
+            action: #selector(openSafariExtensionSettings)
+        )
+        for button in [safariButton, revealExtensionButton, tokenButton] {
+            button.controlSize = .small
+        }
+        let browserButtons = NSStackView(
+            views: [safariButton, revealExtensionButton, tokenButton]
+        )
+        browserButtons.orientation = .horizontal
+        browserButtons.alignment = .centerY
+        browserButtons.spacing = 5
+
+        let extensionRow = NSStackView(views: [browserExtensionStatus, browserButtons])
+        extensionRow.orientation = .horizontal
+        extensionRow.alignment = .centerY
+        extensionRow.spacing = 8
+        extensionRow.distribution = .fill
+
+        let content = NSStackView(
+            views: [topRow, bridgeDetail, bridgePath, extensionRow]
+        )
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 4
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(icon)
+        card.addSubview(content)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 118),
+            icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            icon.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
+            content.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
+            topRow.widthAnchor.constraint(equalTo: content.widthAnchor),
+            bridgeDetail.widthAnchor.constraint(equalTo: content.widthAnchor),
+            bridgePath.widthAnchor.constraint(equalTo: content.widthAnchor),
+            extensionRow.widthAnchor.constraint(equalTo: content.widthAnchor),
+        ])
+        bridgeProgressIndicator.startAnimation(nil)
+        return card
     }
 
     private func makeProviderCard() -> NSView {
@@ -531,6 +640,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         onOpenSafariExtensionSettings?()
     }
 
+    @objc private func performBridgeAction() {
+        onBridgeAction?()
+    }
+
     @objc private func openServicesSettings() {
         onOpenServicesSettings?()
     }
@@ -541,9 +654,37 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         sender.state = enabled ? .on : .off
     }
 
-    func showBrowserStatus(_ message: String, succeeded: Bool) {
-        browserStatus.stringValue = message
-        browserStatus.textColor = succeeded ? .systemGreen : .systemRed
+    func showBridgeState(_ state: BridgeDashboardState) {
+        let presentation = state.presentation
+        bridgeStatus.stringValue = presentation.headline
+        bridgeDetail.stringValue = presentation.detail
+        bridgeDetail.toolTip = presentation.detail
+        bridgePath.stringValue = presentation.path ?? ""
+        bridgePath.toolTip = presentation.path
+        bridgePath.isHidden = presentation.path == nil
+        bridgeActionButton.title = presentation.actionTitle
+        bridgeActionButton.isEnabled = presentation.actionEnabled
+        bridgeActionButton.contentTintColor =
+            state.occupant.map { $0.canAutomaticallyTerminate ? nil : .systemRed }
+            ?? nil
+        bridgeProgressIndicator.isHidden = !presentation.showsProgress
+        if presentation.showsProgress {
+            bridgeProgressIndicator.startAnimation(nil)
+        } else {
+            bridgeProgressIndicator.stopAnimation(nil)
+        }
+        bridgeStatus.textColor =
+            switch presentation.tone {
+            case .neutral: .secondaryLabelColor
+            case .positive: .systemGreen
+            case .warning: .systemOrange
+            case .negative: .systemRed
+            }
+    }
+
+    func showBrowserExtensionStatus(_ message: String, succeeded: Bool) {
+        browserExtensionStatus.stringValue = message
+        browserExtensionStatus.textColor = succeeded ? .secondaryLabelColor : .systemRed
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
