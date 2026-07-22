@@ -406,11 +406,43 @@ final class BabelDOCExternalEngineTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try Data().write(to: package.appendingPathComponent("__init__.py"))
+        let distribution = directory.appendingPathComponent(
+            "babeldoc-0.6.3.dist-info",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: distribution,
+            withIntermediateDirectories: true
+        )
+        try Data("Name: babeldoc\nVersion: 0.6.3\n".utf8).write(
+            to: distribution.appendingPathComponent("METADATA")
+        )
+        let assetsPackage = package.appendingPathComponent("assets", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: assetsPackage,
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: assetsPackage.appendingPathComponent("__init__.py"))
+        try Data(
+            """
+            calls = 0
+
+            def get_font_and_metadata(name):
+                global calls
+                calls += 1
+                return name
+            """.utf8
+        ).write(to: assetsPackage.appendingPathComponent("assets.py"))
         let fakeMain = """
+            from babeldoc.assets import assets
+
             def create_progress_handler(config, show_log=False):
                 raise RuntimeError("runner did not replace the handler")
 
             def cli():
+                assets.get_font_and_metadata("font-a")
+                assets.get_font_and_metadata("font-a")
+                print(f"FONT_ASSET_CALLS={assets.calls}")
                 context, handler = create_progress_handler(None)
                 with context:
                     handler({
@@ -459,6 +491,7 @@ final class BabelDOCExternalEngineTests: XCTestCase {
         let output = pipe.fileHandleForReading.readDataToEndOfFile()
 
         XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(String(decoding: output, as: UTF8.self).contains("FONT_ASSET_CALLS=1"))
         let events = BabelDOCExternalEngine.ProgressOutputParser().append(output)
         XCTAssertEqual(events.count, 1)
         XCTAssertEqual(events[0].stage, "Translate Paragraphs")

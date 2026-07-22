@@ -465,6 +465,8 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
         let url = directory.appendingPathComponent(".gloss-babeldoc-progress.py")
         let contents = #"""
             import contextlib
+            import functools
+            import importlib.metadata
             import json
             import multiprocessing
 
@@ -494,7 +496,20 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
                     print(PREFIX + json.dumps(payload, separators=(",", ":")), flush=True)
                 return contextlib.nullcontext(), handle
 
+            def install_font_asset_cache():
+                try:
+                    if importlib.metadata.version("babeldoc") != "0.6.3":
+                        return
+                    from babeldoc.assets import assets
+                except (ImportError, AttributeError, importlib.metadata.PackageNotFoundError):
+                    return
+                loader = getattr(assets, "get_font_and_metadata", None)
+                if loader is None or hasattr(loader, "cache_info"):
+                    return
+                assets.get_font_and_metadata = functools.lru_cache(maxsize=None)(loader)
+
             babeldoc.main.create_progress_handler = create_progress_handler
+            install_font_asset_cache()
 
             if __name__ == "__main__":
                 multiprocessing.freeze_support()
