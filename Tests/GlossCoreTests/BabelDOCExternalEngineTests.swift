@@ -51,42 +51,81 @@ final class BabelDOCExternalEngineTests: XCTestCase {
         let outputMode =
             environment["GLOSS_BABELDOC_BENCHMARK_OUTPUT_MODE"]
             .flatMap(BabelDOCOutputMode.init(rawValue:)) ?? .monolingual
+        let repeatCount = max(
+            1,
+            environment["GLOSS_BABELDOC_BENCHMARK_REPEAT"].flatMap(Int.init) ?? 1
+        )
+        let usePersistentLayout =
+            environment["GLOSS_BABELDOC_BENCHMARK_PERSISTENT_LAYOUT"] == "1"
+        let useLayoutCache =
+            environment["GLOSS_BABELDOC_BENCHMARK_LAYOUT_CACHE"] != "0"
         let outputURL = URL(fileURLWithPath: outputPath, isDirectory: true)
         try FileManager.default.createDirectory(
             at: outputURL,
             withIntermediateDirectories: true
         )
-
-        let start = ContinuousClock.now
-        let result = try await BabelDOCExternalEngine().translate(
-            BabelDOCTranslationRequest(
-                inputURL: URL(fileURLWithPath: inputPath),
-                outputDirectory: outputURL,
-                sourceLanguageCode: "en",
-                targetLanguageCode: "zh-CN",
-                bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
-                bridgeToken: token,
-                qps: qps,
-                maximumPagesPerPart: pageGroupSize,
-                skipScannedDetection: true,
-                outputMode: outputMode
+        let runtime = try XCTUnwrap(BabelDOCExternalEngine.resolveRuntime())
+        let service = usePersistentLayout ? BabelDOCServiceSession() : nil
+        do {
+            let layoutServiceBaseURL = try await service?.start(
+                runtime: runtime,
+                timeout: .seconds(120)
             )
-        )
-        let elapsed = start.duration(to: .now)
-        try Data(result.log.utf8).write(
-            to: outputURL.appendingPathComponent("benchmark.log"),
-            options: .atomic
-        )
+            let layoutCacheDirectoryURL =
+                useLayoutCache ? await service?.layoutCacheDirectoryURL : nil
+            for run in 1...repeatCount {
+                let runOutputURL =
+                    repeatCount == 1
+                    ? outputURL
+                    : outputURL.appendingPathComponent("run-\(run)", isDirectory: true)
+                try FileManager.default.createDirectory(
+                    at: runOutputURL,
+                    withIntermediateDirectories: true
+                )
+                let start = ContinuousClock.now
+                let result = try await BabelDOCExternalEngine().translate(
+                    BabelDOCTranslationRequest(
+                        inputURL: URL(fileURLWithPath: inputPath),
+                        outputDirectory: runOutputURL,
+                        sourceLanguageCode: "en",
+                        targetLanguageCode: "zh-CN",
+                        bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
+                        bridgeToken: token,
+                        qps: qps,
+                        maximumPagesPerPart: pageGroupSize,
+                        skipScannedDetection: true,
+                        outputMode: outputMode,
+                        layoutServiceBaseURL: layoutServiceBaseURL,
+                        layoutCacheDirectoryURL: layoutCacheDirectoryURL
+                    ),
+                    runtime: runtime,
+                    onOutput: { output in
+                        if environment["GLOSS_BABELDOC_BENCHMARK_VERBOSE"] == "1" {
+                            print(output, terminator: "")
+                        }
+                    }
+                )
+                let elapsed = start.duration(to: .now)
+                try Data(result.log.utf8).write(
+                    to: runOutputURL.appendingPathComponent("benchmark.log"),
+                    options: .atomic
+                )
 
-        switch outputMode {
-        case .monolingual:
-            XCTAssertNotNil(result.monolingualPDF)
-        case .bilingual:
-            XCTAssertNotNil(result.bilingualPDF)
+                switch outputMode {
+                case .monolingual:
+                    XCTAssertNotNil(result.monolingualPDF)
+                case .bilingual:
+                    XCTAssertNotNil(result.bilingualPDF)
+                }
+                print(
+                    "BABELDOC_BENCHMARK run=\(run)/\(repeatCount) elapsed=\(elapsed) qps=\(qps) page_group=\(pageGroupSize) mode=\(outputMode.rawValue) launching_ms=\(result.timings.launchingMilliseconds) parsing_ms=\(result.timings.parsingMilliseconds) translating_ms=\(result.timings.translatingMilliseconds) typesetting_ms=\(result.timings.typesettingMilliseconds) saving_ms=\(result.timings.savingMilliseconds) layout_cache=\(result.layoutCacheStatus ?? "disabled") output=\(runOutputURL.path)"
+                )
+            }
+            await service?.stop()
+        } catch {
+            await service?.stop()
+            throw error
         }
-        print(
-            "BABELDOC_BENCHMARK elapsed=\(elapsed) qps=\(qps) page_group=\(pageGroupSize) mode=\(outputMode.rawValue) launching_ms=\(result.timings.launchingMilliseconds) parsing_ms=\(result.timings.parsingMilliseconds) translating_ms=\(result.timings.translatingMilliseconds) typesetting_ms=\(result.timings.typesettingMilliseconds) saving_ms=\(result.timings.savingMilliseconds) output=\(outputURL.path)"
-        )
     }
 
     func testReliableTextLayerRequiresTextAcrossMostSampledPages() {
@@ -313,6 +352,110 @@ final class BabelDOCExternalEngineTests: XCTestCase {
         )
     }
 
+    func testLayoutCacheKeyTracksContentAndLanguage() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let input = directory.appendingPathComponent("input.pdf")
+        try Data("first".utf8).write(to: input)
+        func request(
+            target: String = "zh-CN",
+            maximumPagesPerPart: Int = 50
+        ) -> BabelDOCTranslationRequest {
+            BabelDOCTranslationRequest(
+                inputURL: input,
+                outputDirectory: directory,
+                sourceLanguageCode: "en",
+                targetLanguageCode: target,
+                bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
+                bridgeToken: "token",
+                maximumPagesPerPart: maximumPagesPerPart,
+                skipScannedDetection: true,
+                layoutCacheDirectoryURL: directory
+            )
+        }
+
+        let first = try BabelDOCExternalEngine.layoutCacheKey(for: request())
+        XCTAssertEqual(first, try BabelDOCExternalEngine.layoutCacheKey(for: request()))
+        XCTAssertNotEqual(
+            first,
+            try BabelDOCExternalEngine.layoutCacheKey(for: request(target: "ja"))
+        )
+        XCTAssertNotEqual(
+            first,
+            try BabelDOCExternalEngine.layoutCacheKey(
+                for: request(maximumPagesPerPart: 25)
+            )
+        )
+
+        try Data("second".utf8).write(to: input)
+        XCTAssertNotEqual(
+            first,
+            try BabelDOCExternalEngine.layoutCacheKey(for: request())
+        )
+    }
+
+    func testLayoutCacheEnvironmentRequiresComputedKey() {
+        let cacheDirectory = URL(fileURLWithPath: "/tmp/layout-cache")
+        let request = BabelDOCTranslationRequest(
+            inputURL: URL(fileURLWithPath: "/tmp/input.pdf"),
+            outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            sourceLanguageCode: "en",
+            targetLanguageCode: "zh-CN",
+            bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
+            bridgeToken: "token",
+            skipScannedDetection: true,
+            layoutCacheDirectoryURL: cacheDirectory
+        )
+        let runtime = BabelDOCRuntimeLaunch(executable: "/tmp/babeldoc", source: "test")
+        let withoutKey = BabelDOCExternalEngine.makeLaunch(
+            runtime: runtime,
+            request: request,
+            configurationURL: URL(fileURLWithPath: "/tmp/config.toml"),
+            environment: [
+                "GLOSS_BABELDOC_LAYOUT_CACHE_DIR": "/tmp/untrusted-cache",
+                "GLOSS_BABELDOC_LAYOUT_CACHE_KEY": String(repeating: "f", count: 64),
+            ]
+        )
+        let withKey = BabelDOCExternalEngine.makeLaunch(
+            runtime: runtime,
+            request: request,
+            configurationURL: URL(fileURLWithPath: "/tmp/config.toml"),
+            environment: [:],
+            layoutCacheKey: String(repeating: "a", count: 64)
+        )
+
+        XCTAssertNil(withoutKey.environment["GLOSS_BABELDOC_LAYOUT_CACHE_DIR"])
+        XCTAssertNil(withoutKey.environment["GLOSS_BABELDOC_LAYOUT_CACHE_KEY"])
+        XCTAssertEqual(
+            withKey.environment["GLOSS_BABELDOC_LAYOUT_CACHE_DIR"],
+            cacheDirectory.path
+        )
+        XCTAssertEqual(
+            withKey.environment["GLOSS_BABELDOC_LAYOUT_CACHE_KEY"],
+            String(repeating: "a", count: 64)
+        )
+    }
+
+    func testLayoutCacheStatusUsesLastRunnerEvent() {
+        let prefix = BabelDOCExternalEngine.layoutCacheLinePrefix
+        XCTAssertEqual(
+            BabelDOCExternalEngine.layoutCacheStatus(
+                in: "\(prefix)miss\n\(prefix)stored\n"
+            ),
+            "stored"
+        )
+        XCTAssertEqual(
+            BabelDOCExternalEngine.layoutCacheStatus(in: "\(prefix)hit\n"),
+            "hit"
+        )
+        XCTAssertNil(BabelDOCExternalEngine.layoutCacheStatus(in: "ordinary log\n"))
+    }
+
     func testPersistentLayoutServiceReadyPortParser() {
         XCTAssertEqual(
             BabelDOCServiceSession.readyPort(
@@ -406,11 +549,43 @@ final class BabelDOCExternalEngineTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try Data().write(to: package.appendingPathComponent("__init__.py"))
+        let distribution = directory.appendingPathComponent(
+            "babeldoc-0.6.3.dist-info",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: distribution,
+            withIntermediateDirectories: true
+        )
+        try Data("Name: babeldoc\nVersion: 0.6.3\n".utf8).write(
+            to: distribution.appendingPathComponent("METADATA")
+        )
+        let assetsPackage = package.appendingPathComponent("assets", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: assetsPackage,
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: assetsPackage.appendingPathComponent("__init__.py"))
+        try Data(
+            """
+            calls = 0
+
+            def get_font_and_metadata(name):
+                global calls
+                calls += 1
+                return name
+            """.utf8
+        ).write(to: assetsPackage.appendingPathComponent("assets.py"))
         let fakeMain = """
+            from babeldoc.assets import assets
+
             def create_progress_handler(config, show_log=False):
                 raise RuntimeError("runner did not replace the handler")
 
             def cli():
+                assets.get_font_and_metadata("font-a")
+                assets.get_font_and_metadata("font-a")
+                print(f"FONT_ASSET_CALLS={assets.calls}")
                 context, handler = create_progress_handler(None)
                 with context:
                     handler({
@@ -459,12 +634,366 @@ final class BabelDOCExternalEngineTests: XCTestCase {
         let output = pipe.fileHandleForReading.readDataToEndOfFile()
 
         XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(String(decoding: output, as: UTF8.self).contains("FONT_ASSET_CALLS=1"))
         let events = BabelDOCExternalEngine.ProgressOutputParser().append(output)
         XCTAssertEqual(events.count, 1)
         XCTAssertEqual(events[0].stage, "Translate Paragraphs")
         XCTAssertEqual(events[0].overallProgress, 51.5)
         XCTAssertEqual(events[0].partIndex, 2)
         XCTAssertEqual(events[0].totalParts, 3)
+    }
+
+    func testProgressRunnerReusesCachedLayoutIR() throws {
+        let interpreter = [
+            "/usr/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+        ].first(where: FileManager.default.isExecutableFile(atPath:))
+        guard let interpreter else {
+            throw XCTSkip("Python is unavailable for the BabelDOC runner integration test.")
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        func writePackageFile(_ relativePath: String, _ contents: String = "") throws {
+            let url = directory.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data(contents.utf8).write(to: url)
+        }
+        for packagePath in [
+            "babeldoc/__init__.py",
+            "babeldoc/format/__init__.py",
+            "babeldoc/format/pdf/__init__.py",
+            "babeldoc/format/pdf/new_parser/__init__.py",
+            "babeldoc/format/pdf/document_il/__init__.py",
+            "babeldoc/format/pdf/document_il/midend/__init__.py",
+        ] {
+            try writePackageFile(packagePath)
+        }
+        try writePackageFile(
+            "babeldoc-0.6.3.dist-info/METADATA",
+            "Name: babeldoc\nVersion: 0.6.3\n"
+        )
+        try writePackageFile(
+            "babeldoc/format/pdf/document_il/il_version_1.py",
+            """
+            from dataclasses import dataclass
+
+            @dataclass
+            class Page:
+                page_number: int
+
+            @dataclass
+            class Document:
+                page: list
+                total_pages: int = None
+            """
+        )
+        try writePackageFile(
+            "babeldoc/format/pdf/new_parser/native_parse.py",
+            """
+            from babeldoc.format.pdf.document_il.il_version_1 import Document, Page
+
+            calls = 0
+
+            def parse_prepared_pdf_with_new_parser_to_legacy_ir(*args, **kwargs):
+                global calls
+                calls += 1
+                context = kwargs["config"].shared_context_cross_split_part
+                context.valid_char_count_total = 123
+                context.total_valid_text_token_count = 45
+                return Document([Page(0), Page(1)], total_pages=2)
+            """
+        )
+        try writePackageFile(
+            "fitz.py",
+            """
+            class InputDocument:
+                page_count = 2
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+            def open(_path):
+                return InputDocument()
+            """
+        )
+        try writePackageFile(
+            "babeldoc/format/pdf/document_il/midend/layout_parser.py",
+            """
+            calls = 0
+
+            class LayoutParser:
+                stage_name = "Parse Page Layout"
+
+                def __init__(self, translation_config):
+                    self.translation_config = translation_config
+
+                def process(self, document, _mupdf_document):
+                    global calls
+                    calls += 1
+                    document.layout_complete = True
+                    return document
+            """
+        )
+        try writePackageFile(
+            "babeldoc/format/pdf/document_il/midend/paragraph_finder.py",
+            """
+            calls = 0
+
+            class ParagraphFinder:
+                stage_name = "Parse Paragraphs"
+
+                def __init__(self, translation_config):
+                    self.translation_config = translation_config
+
+                def process(self, document):
+                    global calls
+                    calls += 1
+                    document.paragraphs_complete = True
+            """
+        )
+        try writePackageFile(
+            "babeldoc/format/pdf/document_il/midend/styles_and_formulas.py",
+            """
+            calls = 0
+
+            class StylesAndFormulas:
+                stage_name = "Parse Formulas and Styles"
+
+                def __init__(self, translation_config):
+                    self.translation_config = translation_config
+
+                def process(self, document):
+                    global calls
+                    calls += 1
+                    document.styles_complete = True
+            """
+        )
+        try writePackageFile(
+            "babeldoc/main.py",
+            """
+            from babeldoc.format.pdf.document_il.midend import layout_parser
+            from babeldoc.format.pdf.document_il.midend import paragraph_finder
+            from babeldoc.format.pdf.document_il.midend import styles_and_formulas
+            from babeldoc.format.pdf.new_parser import native_parse
+
+            class Stage:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+            class Monitor:
+                stage = {
+                    "Parse Page Layout": object(),
+                    "Parse Paragraphs": object(),
+                    "Parse Formulas and Styles": object(),
+                }
+
+                def stage_start(self, _name, _total):
+                    return Stage()
+
+            class Config:
+                progress_monitor = Monitor()
+
+                class SharedContext:
+                    valid_char_count_total = 0
+                    total_valid_text_token_count = 0
+
+                shared_context_cross_split_part = SharedContext()
+
+            def create_progress_handler(config, show_log=False):
+                raise RuntimeError("runner did not replace the handler")
+
+            def cli():
+                config = Config()
+                document = native_parse.parse_prepared_pdf_with_new_parser_to_legacy_ir(
+                    config=config
+                )
+                document = layout_parser.LayoutParser(config).process(document, None)
+                paragraph_finder.ParagraphFinder(config).process(document)
+                styles_and_formulas.StylesAndFormulas(config).process(document)
+                print(
+                    "PIPELINE_CALLS="
+                    f"{native_parse.calls},"
+                    f"{layout_parser.calls},"
+                    f"{paragraph_finder.calls},"
+                    f"{styles_and_formulas.calls}"
+                )
+                context = config.shared_context_cross_split_part
+                print(
+                    "VALID_COUNTS="
+                    f"{context.valid_char_count_total},"
+                    f"{context.total_valid_text_token_count}"
+                )
+            """
+        )
+        let executable = directory.appendingPathComponent("babeldoc-cli")
+        try Data("#!\(interpreter)\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: executable.path
+        )
+        let runtime = BabelDOCRuntimeLaunch(executable: executable.path, source: "test")
+        let runner = try XCTUnwrap(
+            BabelDOCExternalEngine.writeProgressRunner(for: runtime, in: directory)
+        )
+        let cacheDirectory = directory.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: cacheDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let abandonedTemporaryFile = cacheDirectory.appendingPathComponent(
+            ".layout-ir-2147483647-abandoned.tmp"
+        )
+        try Data("abandoned".utf8).write(to: abandonedTemporaryFile)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: abandonedTemporaryFile.path
+        )
+        let cacheKey = String(repeating: "a", count: 64)
+        let input = directory.appendingPathComponent("input.pdf")
+        try Data("fake pdf".utf8).write(to: input)
+
+        func run(cacheKey: String = cacheKey) throws -> String {
+            let launch = BabelDOCExternalEngine.progressLaunch(
+                base: (
+                    executable.path,
+                    [
+                        "--files", input.path,
+                        "--max-pages-per-part", "50",
+                        "--skip-scanned-detection",
+                    ],
+                    [
+                        "PYTHONPATH": directory.path,
+                        "GLOSS_BABELDOC_LAYOUT_CACHE_DIR": cacheDirectory.path,
+                        "GLOSS_BABELDOC_LAYOUT_CACHE_KEY": cacheKey,
+                    ]
+                ),
+                runtime: runtime,
+                runnerURL: runner
+            )
+            let process = Process()
+            let pipe = Pipe()
+            process.executableURL = URL(fileURLWithPath: launch.executable)
+            process.arguments = launch.arguments
+            process.environment = launch.environment
+            process.standardOutput = pipe
+            process.standardError = pipe
+            try process.run()
+            process.waitUntilExit()
+            let output = String(
+                decoding: pipe.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+            XCTAssertEqual(process.terminationStatus, 0, output)
+            return output
+        }
+
+        let first = try run()
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: abandonedTemporaryFile.path)
+        )
+        XCTAssertTrue(first.contains("PIPELINE_CALLS=1,1,1,1"), first)
+        XCTAssertTrue(first.contains("__GLOSS_BABELDOC_LAYOUT_CACHE__stored"), first)
+
+        let second = try run()
+        XCTAssertTrue(second.contains("PIPELINE_CALLS=0,0,0,0"), second)
+        XCTAssertTrue(second.contains("VALID_COUNTS=123,45"), second)
+        XCTAssertTrue(second.contains("__GLOSS_BABELDOC_LAYOUT_CACHE__hit"), second)
+
+        let marker = directory.appendingPathComponent("unsafe-pickle-executed")
+        let cacheFile = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: cacheDirectory,
+                includingPropertiesForKeys: nil
+            ).first(where: { $0.pathExtension == "pickle" })
+        )
+        let cacheDirectoryPermissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: cacheDirectory.path)[
+                .posixPermissions
+            ] as? NSNumber
+        )
+        let cacheFilePermissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: cacheFile.path)[
+                .posixPermissions
+            ] as? NSNumber
+        )
+        XCTAssertEqual(cacheDirectoryPermissions.intValue & 0o777, 0o700)
+        XCTAssertEqual(cacheFilePermissions.intValue & 0o777, 0o600)
+        let maliciousPickleWriter = directory.appendingPathComponent("write-malicious.py")
+        try Data(
+            """
+            import os
+            import pickle
+            import sys
+
+            class Exploit:
+                def __reduce__(self):
+                    return (os.system, (f"touch {sys.argv[2]}",))
+
+            with open(sys.argv[1], "wb") as handle:
+                pickle.dump(Exploit(), handle, protocol=5)
+            """.utf8
+        ).write(to: maliciousPickleWriter)
+        let maliciousWriter = Process()
+        maliciousWriter.executableURL = URL(fileURLWithPath: interpreter)
+        maliciousWriter.arguments = [
+            maliciousPickleWriter.path,
+            cacheFile.path,
+            marker.path,
+        ]
+        try maliciousWriter.run()
+        maliciousWriter.waitUntilExit()
+        XCTAssertEqual(maliciousWriter.terminationStatus, 0)
+
+        let afterUnsafeCache = try run()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(
+            afterUnsafeCache.contains("__GLOSS_BABELDOC_LAYOUT_CACHE__invalidated"),
+            afterUnsafeCache
+        )
+        XCTAssertTrue(afterUnsafeCache.contains("PIPELINE_CALLS=1,1,1,1"), afterUnsafeCache)
+
+        let stylesModule = directory.appendingPathComponent(
+            "babeldoc/format/pdf/document_il/midend/styles_and_formulas.py"
+        )
+        let stylesContents = try String(contentsOf: stylesModule, encoding: .utf8)
+        try Data((stylesContents + "\n# runtime fingerprint changed\n").utf8).write(
+            to: stylesModule,
+            options: .atomic
+        )
+        let afterRuntimeChange = try run()
+        XCTAssertTrue(afterRuntimeChange.contains("PIPELINE_CALLS=1,1,1,1"))
+        XCTAssertTrue(
+            afterRuntimeChange.contains("__GLOSS_BABELDOC_LAYOUT_CACHE__miss"),
+            afterRuntimeChange
+        )
+        XCTAssertFalse(afterRuntimeChange.contains("__GLOSS_BABELDOC_LAYOUT_CACHE__hit"))
+
+        for index in 0..<9 {
+            let boundedKey = String(repeating: "0", count: 63) + String(index)
+            let output = try run(cacheKey: boundedKey)
+            XCTAssertTrue(
+                output.contains("__GLOSS_BABELDOC_LAYOUT_CACHE__stored"),
+                output
+            )
+        }
+        let boundedCacheFiles = try FileManager.default.contentsOfDirectory(
+            at: cacheDirectory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "pickle" }
+        XCTAssertLessThanOrEqual(boundedCacheFiles.count, 8)
     }
 
     func testWritesBridgeTokenToPrivateConfigurationFile() throws {

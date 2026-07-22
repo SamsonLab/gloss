@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum BabelDOCServiceError: LocalizedError, Equatable, Sendable {
@@ -22,6 +23,10 @@ public enum BabelDOCServiceError: LocalizedError, Equatable, Sendable {
 /// loopback-only inference service through `--rpc-doclayout`.
 public actor BabelDOCServiceSession {
     static let readyPrefix = "__GLOSS_BABELDOC_LAYOUT_READY__"
+    static let workingDirectoryPrefix = "Gloss-BabelDOC-Layout-"
+    static let ownerPIDFileName = ".owner-pid"
+    static let legacyCleanupGraceInterval: TimeInterval = 24 * 60 * 60
+    private static let layoutCacheDirectoryName = "layout-ir-cache"
 
     private final class OutputBuffer: @unchecked Sendable {
         private let lock = NSLock()
@@ -62,6 +67,14 @@ public actor BabelDOCServiceSession {
         process?.isRunning == true && serviceBaseURL != nil
     }
 
+    public var layoutCacheDirectoryURL: URL? {
+        guard isRunning, let workingDirectory else { return nil }
+        return workingDirectory.appendingPathComponent(
+            Self.layoutCacheDirectoryName,
+            isDirectory: true
+        )
+    }
+
     public func start(
         runtime: BabelDOCRuntimeLaunch,
         timeout: Duration = .seconds(90)
@@ -70,6 +83,7 @@ public actor BabelDOCServiceSession {
             return serviceBaseURL
         }
         await stop()
+        Self.cleanupStaleWorkingDirectories()
 
         guard
             let interpreter = BabelDOCExternalEngine.pythonInterpreter(
@@ -79,14 +93,38 @@ public actor BabelDOCServiceSession {
             throw BabelDOCServiceError.pythonUnavailable
         }
 
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "Gloss-BabelDOC-Layout-\(UUID().uuidString)",
+        let temporaryRoot = FileManager.default.temporaryDirectory
+        let directory =
+            temporaryRoot.appendingPathComponent(
+                "\(Self.workingDirectoryPrefix)\(UUID().uuidString)",
                 isDirectory: true
             )
+        var shouldRemoveDirectory = true
+        defer {
+            if shouldRemoveDirectory {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let ownerPIDURL = directory.appendingPathComponent(Self.ownerPIDFileName)
+        try Data("\(ProcessInfo.processInfo.processIdentifier)\n".utf8).write(
+            to: ownerPIDURL,
+            options: .atomic
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: ownerPIDURL.path
+        )
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent(
+                Self.layoutCacheDirectoryName,
+                isDirectory: true
+            ),
+            withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700]
         )
         let scriptURL = directory.appendingPathComponent("layout_service.py")
@@ -121,34 +159,38 @@ public actor BabelDOCServiceSession {
             try serviceProcess.run()
         } catch {
             pipe.fileHandleForReading.readabilityHandler = nil
-            try? FileManager.default.removeItem(at: directory)
             throw BabelDOCServiceError.launchFailed(error.localizedDescription)
         }
 
         process = serviceProcess
         outputPipe = pipe
         workingDirectory = directory
+        shouldRemoveDirectory = false
 
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if Task.isCancelled {
-                await stop()
-                throw CancellationError()
+        do {
+            while clock.now < deadline {
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+                if let port = Self.readyPort(in: output.string()) {
+                    let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+                    serviceBaseURL = baseURL
+                    return baseURL
+                }
+                if !serviceProcess.isRunning {
+                    let message = Self.tail(of: output.string())
+                    await stop()
+                    throw BabelDOCServiceError.launchFailed(
+                        message.isEmpty ? "进程已退出" : message
+                    )
+                }
+                try await Task.sleep(for: .milliseconds(150))
             }
-            if let port = Self.readyPort(in: output.string()) {
-                let baseURL = URL(string: "http://127.0.0.1:\(port)")!
-                serviceBaseURL = baseURL
-                return baseURL
-            }
-            if !serviceProcess.isRunning {
-                let message = Self.tail(of: output.string())
-                await stop()
-                throw BabelDOCServiceError.launchFailed(
-                    message.isEmpty ? "进程已退出" : message
-                )
-            }
-            try await Task.sleep(for: .milliseconds(150))
+        } catch is CancellationError {
+            await stop()
+            throw CancellationError()
         }
 
         let message = Self.tail(of: output.string())
@@ -187,6 +229,71 @@ public actor BabelDOCServiceSession {
         return port
     }
 
+    public static func cleanupStaleWorkingDirectories() {
+        cleanupStaleWorkingDirectories(in: FileManager.default.temporaryDirectory)
+    }
+
+    static func cleanupStaleWorkingDirectories(
+        in root: URL,
+        now: Date = Date(),
+        legacyGraceInterval: TimeInterval = legacyCleanupGraceInterval
+    ) {
+        let keys: Set<URLResourceKey> = [
+            .contentModificationDateKey,
+            .isDirectoryKey,
+            .isSymbolicLinkKey,
+        ]
+        guard
+            let candidates = try? FileManager.default.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: Array(keys),
+                options: [.skipsHiddenFiles]
+            )
+        else { return }
+
+        for candidate in candidates {
+            let name = candidate.lastPathComponent
+            guard name.hasPrefix(workingDirectoryPrefix) else { continue }
+            let suffix = String(name.dropFirst(workingDirectoryPrefix.count))
+            var fileInfo = stat()
+            guard UUID(uuidString: suffix) != nil,
+                lstat(candidate.path, &fileInfo) == 0,
+                fileInfo.st_mode & S_IFMT == S_IFDIR,
+                fileInfo.st_uid == getuid(),
+                fileInfo.st_mode & 0o077 == 0,
+                let values = try? candidate.resourceValues(forKeys: keys),
+                values.isDirectory == true,
+                values.isSymbolicLink != true
+            else { continue }
+
+            let ownerPIDURL = candidate.appendingPathComponent(ownerPIDFileName)
+            var ownerPIDInfo = stat()
+            if lstat(ownerPIDURL.path, &ownerPIDInfo) == 0,
+                ownerPIDInfo.st_mode & S_IFMT == S_IFREG,
+                ownerPIDInfo.st_uid == getuid(),
+                ownerPIDInfo.st_mode & 0o077 == 0,
+                (1...32).contains(ownerPIDInfo.st_size),
+                let value = try? String(contentsOf: ownerPIDURL, encoding: .utf8),
+                let ownerPID = Int32(value.trimmingCharacters(in: .whitespacesAndNewlines)),
+                ownerPID > 0
+            {
+                guard !processExists(ownerPID) else { continue }
+            } else {
+                guard let modificationDate = values.contentModificationDate,
+                    now.timeIntervalSince(modificationDate) >= legacyGraceInterval
+                else { continue }
+            }
+            try? FileManager.default.removeItem(at: candidate)
+        }
+    }
+
+    private static func processExists(_ processIdentifier: Int32) -> Bool {
+        if kill(pid_t(processIdentifier), 0) == 0 {
+            return true
+        }
+        return errno == EPERM
+    }
+
     private static func tail(of output: String) -> String {
         output
             .split(separator: "\n", omittingEmptySubsequences: true)
@@ -220,7 +327,7 @@ public actor BabelDOCServiceSession {
 
         def result_payload(result):
             names = {
-                int(key): str(value)
+                str(key): str(value)
                 for key, value in dict(result.names).items()
             }
             boxes = []
