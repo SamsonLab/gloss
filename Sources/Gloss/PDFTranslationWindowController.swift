@@ -417,6 +417,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     private var serviceStartupTask: Task<Void, Never>?
     private var serviceState: ServiceState = .stopped
     private var layoutServiceBaseURL: URL?
+    private var layoutCacheDirectoryURL: URL?
     private var activePerformanceRunID: UUID?
     private var isUpdatingQueueSelection = false
 
@@ -473,6 +474,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         activePerformanceRunID = nil
         Task { await babelDOCService.stop() }
         layoutServiceBaseURL = nil
+        layoutCacheDirectoryURL = nil
         serviceState = .stopped
     }
 
@@ -486,6 +488,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         activePerformanceRunID = nil
         await babelDOCService.stop()
         layoutServiceBaseURL = nil
+        layoutCacheDirectoryURL = nil
         serviceState = .stopped
     }
 
@@ -1222,12 +1225,14 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
                 let baseURL = try await babelDOCService.start(runtime: runtime)
                 guard !Task.isCancelled else { return }
                 layoutServiceBaseURL = baseURL
+                layoutCacheDirectoryURL = await babelDOCService.layoutCacheDirectoryURL
                 serviceState = .ready
             } catch is CancellationError {
                 serviceState = .stopped
             } catch {
                 serviceState = .failed(error.localizedDescription)
                 layoutServiceBaseURL = nil
+                layoutCacheDirectoryURL = nil
             }
             serviceStartupTask = nil
             refreshInterface()
@@ -1413,12 +1418,17 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             item.document.page(at: $0)?.string
         }
         let sourceText = sampledPageTexts.compactMap { $0 }.joined(separator: "\n")
+        let hasReliableTextLayer = BabelDOCExternalEngine.hasReliableTextLayer(
+            sampledPageTexts
+        )
+        let maximumPagesPerPart = Self.babelDOCMaximumPagesPerPart()
         let detectedSource =
             TranslationLanguages.detectedSourceLanguageCode(
                 in: sourceText
             ) ?? "en"
         let destination = destinationURL(for: item)
         var completedTimings: BabelDOCPhaseTimings?
+        var resultLayoutCacheStatus: String?
 
         defer {
             try? FileManager.default.removeItem(at: temporaryOutput)
@@ -1433,12 +1443,14 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
                     bridgeBaseURL: URL(string: "http://127.0.0.1:8787/v1")!,
                     bridgeToken: bridgeToken,
                     qps: 8,
-                    maximumPagesPerPart: Self.babelDOCMaximumPagesPerPart(),
-                    skipScannedDetection: BabelDOCExternalEngine.hasReliableTextLayer(
-                        sampledPageTexts
-                    ),
+                    maximumPagesPerPart: maximumPagesPerPart,
+                    skipScannedDetection: hasReliableTextLayer,
                     outputMode: item.outputMode,
-                    layoutServiceBaseURL: layoutServiceBaseURL
+                    layoutServiceBaseURL: layoutServiceBaseURL,
+                    layoutCacheDirectoryURL:
+                        hasReliableTextLayer && item.document.pageCount <= maximumPagesPerPart
+                        ? layoutCacheDirectoryURL
+                        : nil
                 ),
                 runtime: runtime,
                 onProgress: { [weak self] progress in
@@ -1448,6 +1460,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
                 }
             )
             completedTimings = result.timings
+            resultLayoutCacheStatus = result.layoutCacheStatus
             try Task.checkCancellation()
             let generated =
                 item.outputMode == .monolingual
@@ -1489,7 +1502,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
                 } ?? 0
             GlossRuntimeLog.shared.write(
                 "pdf",
-                "translation_complete file=\(item.sourceURL.lastPathComponent) mode=\(item.outputMode.rawValue) wall_ms=\(wallMilliseconds) launching_ms=\(completedTimings.launchingMilliseconds) parsing_ms=\(completedTimings.parsingMilliseconds) translating_ms=\(completedTimings.translatingMilliseconds) typesetting_ms=\(completedTimings.typesettingMilliseconds) saving_ms=\(completedTimings.savingMilliseconds) model_prepare_ms=\(performance.preparationMilliseconds) model_wait_ms=\(performance.modelWaitMilliseconds) model_output_stream_ms=\(performance.outputStreamMilliseconds) model_turn_ms=\(performance.totalTurnMilliseconds) model_turns=\(performance.completedTurns) persistent_layout=\(layoutServiceBaseURL != nil)"
+                "translation_complete file=\(item.sourceURL.lastPathComponent) mode=\(item.outputMode.rawValue) wall_ms=\(wallMilliseconds) launching_ms=\(completedTimings.launchingMilliseconds) parsing_ms=\(completedTimings.parsingMilliseconds) translating_ms=\(completedTimings.translatingMilliseconds) typesetting_ms=\(completedTimings.typesettingMilliseconds) saving_ms=\(completedTimings.savingMilliseconds) model_prepare_ms=\(performance.preparationMilliseconds) model_wait_ms=\(performance.modelWaitMilliseconds) model_output_stream_ms=\(performance.outputStreamMilliseconds) model_turn_ms=\(performance.totalTurnMilliseconds) model_turns=\(performance.completedTurns) persistent_layout=\(layoutServiceBaseURL != nil) layout_cache=\(resultLayoutCacheStatus ?? "disabled")"
             )
         }
         if activePerformanceRunID == runID {
