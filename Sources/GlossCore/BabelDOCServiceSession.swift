@@ -220,7 +220,7 @@ public actor BabelDOCServiceSession {
 
         def result_payload(result):
             names = {
-                int(key): str(value)
+                str(key): str(value)
                 for key, value in dict(result.names).items()
             }
             boxes = []
