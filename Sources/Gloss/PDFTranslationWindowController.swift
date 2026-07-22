@@ -146,6 +146,41 @@ enum PDFTranslationToolCopy {
         sourceURL.deletingPathExtension().lastPathComponent
             + outputSuffix(for: outputMode)
     }
+
+    static func timingDescription(
+        timings: BabelDOCPhaseTimings,
+        performance: TranslationDispatchState.DocumentPerformanceSnapshot,
+        elapsedMilliseconds: Int? = nil
+    ) -> String {
+        var components: [String] = []
+        if timings.launchingMilliseconds > 0 {
+            components.append("准备 \(formattedDuration(timings.launchingMilliseconds))")
+        }
+        if timings.parsingMilliseconds > 0 {
+            components.append("解析 \(formattedDuration(timings.parsingMilliseconds))")
+        }
+        if performance.completedTurns > 0 {
+            components.append(
+                "模型等待累计 \(formattedDuration(performance.modelWaitMilliseconds))"
+            )
+        } else if timings.translatingMilliseconds > 0 {
+            components.append("翻译 \(formattedDuration(timings.translatingMilliseconds))")
+        }
+        if timings.typesettingMilliseconds > 0 {
+            components.append("排版 \(formattedDuration(timings.typesettingMilliseconds))")
+        }
+        if timings.savingMilliseconds > 0 {
+            components.append("保存 \(formattedDuration(timings.savingMilliseconds))")
+        }
+        if components.isEmpty, let elapsedMilliseconds {
+            components.append("已用时 \(formattedDuration(elapsedMilliseconds))")
+        }
+        return components.joined(separator: " · ")
+    }
+
+    private static func formattedDuration(_ milliseconds: Int) -> String {
+        String(format: "%.1fs", Double(max(0, milliseconds)) / 1_000)
+    }
 }
 
 @MainActor
@@ -1583,28 +1618,13 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
 
     private func timingDescription(for item: PDFQueueItem) -> String {
         let timings = item.latestProgress?.timings ?? BabelDOCPhaseTimings()
-        var components: [String] = []
-        if timings.parsingMilliseconds > 0 {
-            components.append("解析 \(formattedDuration(timings.parsingMilliseconds))")
-        }
-        if item.latestPerformance.completedTurns > 0 {
-            components.append(
-                "模型等待 \(formattedDuration(item.latestPerformance.modelWaitMilliseconds))"
-            )
-        }
-        if timings.typesettingMilliseconds > 0 {
-            components.append("排版 \(formattedDuration(timings.typesettingMilliseconds))")
-        }
-        if components.isEmpty, let started = item.translationStartedAt {
-            components.append(
-                "已用时 \(formattedDuration(Int(Date().timeIntervalSince(started) * 1_000)))"
-            )
-        }
-        return components.joined(separator: " · ")
-    }
-
-    private func formattedDuration(_ milliseconds: Int) -> String {
-        String(format: "%.1fs", Double(max(0, milliseconds)) / 1_000)
+        return PDFTranslationToolCopy.timingDescription(
+            timings: timings,
+            performance: item.latestPerformance,
+            elapsedMilliseconds: item.translationStartedAt.map {
+                Int(Date().timeIntervalSince($0) * 1_000)
+            }
+        )
     }
 
     @objc private func retranslateSelected() {
