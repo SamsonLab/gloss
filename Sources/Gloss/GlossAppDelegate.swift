@@ -331,6 +331,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? runtimeLog.prepare()
         runtimeLog.write("app", "started version=\(applicationVersion)")
+        Task.detached(priority: .utility) {
+            BabelDOCServiceSession.cleanupStaleWorkingDirectories()
+        }
         NSApp.setActivationPolicy(.accessory)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
             self?.configureStatusItem()
