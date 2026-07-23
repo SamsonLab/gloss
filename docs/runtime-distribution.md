@@ -99,20 +99,19 @@ active runtime。
 6. Release 上传成功后，dispatch `SunChJ/homebrew-tap` 的 `update-cask.yml`，由公开 tap
    下载并二次校验 Release，再更新 `Casks/gloss.rb`。
 
-完整 App 会同时检出并构建私有浏览器扩展仓库。Release workflow 使用两个职责分离的
-fine-grained token：
+完整 App 会同时检出并构建私有浏览器扩展仓库。Release workflow 使用两个职责分离的凭据：
 
 | Secret | 用途 |
 | --- | --- |
-| `GLOSS_EXTENSION_TOKEN` | 只读检出私有 `SunChJ/personal-immersive-translator` |
+| `GLOSS_EXTENSION_SSH_KEY` | 只读检出私有 `SunChJ/personal-immersive-translator` |
 | `GLOSS_DISTRIBUTION_TOKEN` | 向公开 binary repo 上传 Release，并 dispatch 公开 tap workflow |
 
-workflow 的第一个 job 始终检查 `GLOSS_EXTENSION_TOKEN`；tag 事件还会检查
+workflow 的第一个 job 始终检查 `GLOSS_EXTENSION_SSH_KEY`；tag 事件还会检查
 `GLOSS_DISTRIBUTION_TOKEN`。缺失即 fail closed，不会开始正式构建。手工
 `workflow_dispatch` 不走 public publication 路径，因此不需要 distribution token，但仍需
-只读 extension token 才能构建完整 App。
+只读 extension deploy key 才能构建完整 App。
 
-### 公开仓库与 token 初始化
+### 公开仓库与凭据初始化
 
 公开分发使用两个独立仓库，私有 `SunChJ/gloss` 不承载匿名下载：
 
@@ -137,10 +136,10 @@ workflow 的第一个 job 始终检查 `GLOSS_EXTENSION_TOKEN`；tag 事件还�
 权限的并集。Token 不需要访问私有 `SunChJ/gloss`；workflow 通过该仓库自己的
 `GITHUB_TOKEN` 只读检出源码。
 
-另建一个 fine-grained token，只选择私有
-`SunChJ/personal-immersive-translator`，仅授予 `Contents: Read-only`，并保存为
-`GLOSS_EXTENSION_TOKEN`。不要让这个只读 token 访问公开发行仓库，也不要让
-`GLOSS_DISTRIBUTION_TOKEN` 访问私有扩展源码。
+为私有 `SunChJ/personal-immersive-translator` 创建独立 Ed25519 SSH key pair，把 public
+key 添加为该仓库的 read-only deploy key，把 private key 保存为
+`GLOSS_EXTENSION_SSH_KEY`。不要为 deploy key 启用 write access，也不要复用个人 SSH key。
+`GLOSS_DISTRIBUTION_TOKEN` 不应访问私有扩展源码。
 
 `homebrew-tap` 的 `update-cask.yml` 必须声明两个 required `workflow_dispatch` inputs：
 `release_tag` 和 `release_repository`。它应只接受
@@ -194,7 +193,7 @@ brew upgrade --cask sunchj/tap/gloss
 
 1. 先发布兼容的 `SunChJ/BabelDOC` signed runtime，并确认 stable manifest 可下载。
 2. 合并 Gloss 的发行提交，确认 `Resources/Info.plist` 版本与准备创建的 `v*` tag 完全一致。
-3. 确认两个公开仓库、`update-cask.yml`、`GLOSS_EXTENSION_TOKEN`、
+3. 确认两个公开仓库、`update-cask.yml`、`GLOSS_EXTENSION_SSH_KEY`、
    `GLOSS_DISTRIBUTION_TOKEN` 和 tap 的 Actions/branch protection 设置均已就绪。
 4. 在私有 Gloss 仓库的目标 commit 上创建并推送 tag，例如 `v0.8.0`。
 5. 等待 Gloss Release workflow 完成 ad-hoc 签名；workflow 会先创建 draft Release，上传全部
