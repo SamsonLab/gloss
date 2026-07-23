@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Swift format and lint
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Show toolchain
+        run: swift --version
+      - name: Lint changed Swift formatting
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha }}
+        run: Scripts/lint_changed_swift.sh "${BASE_REF:-HEAD^}"
+      - name: Validate package manifest
+        run: swift package describe >/dev/null
+      - name: Lint release scripts
+        run: bash -n Scripts/*.sh
+      - name: Smoke-test release metadata and Homebrew cask
+        run: |
+          temporary_directory="$(mktemp -d)"
+          trap 'rm -rf "$temporary_directory"' EXIT
+          mkdir -p "$temporary_directory/release"
+          printf 'arm64 archive' >"$temporary_directory/release/Gloss-macos-arm64.zip"
+          printf 'x86_64 archive' >"$temporary_directory/release/Gloss-macos-x86_64.zip"
+          Scripts/generate_release_metadata.sh \
+            "$temporary_directory/release/Gloss-macos-arm64.zip" \
+            "$temporary_directory/release/Gloss-macos-x86_64.zip" \
+            0.0.0 \
+            "$temporary_directory/release" \
+            v0.0.0 \
+            SunChJ/gloss-releases
+          grep -F \
+            'https://github.com/SunChJ/gloss-releases/releases/download/v0.0.0/' \
+            "$temporary_directory/release/gloss-release-manifest.json"
+          grep -F \
+            'https://github.com/SunChJ/gloss-releases/releases/download/v0.0.0/' \
+            "$temporary_directory/release/Casks/gloss.rb"
+          (
+            cd "$temporary_directory/release"
+            shasum -a 256 --check SHA256SUMS
+          )
+
+  test:
+    name: Swift tests
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: swift test --parallel
+
+  release-build:
+    name: Release build (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: macos-15
+          - architecture: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "${{ matrix.architecture }}"
+      - name: Build release products
+        run: swift build --configuration release

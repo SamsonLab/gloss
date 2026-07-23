@@ -50,6 +50,10 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var glossaryWindowController: GlossaryWindowController?
     private var appExclusionsWindowController: AppExclusionsWindowController?
     private var pdfTranslationWindowController: PDFTranslationWindowController?
+    private var pdfRuntimeObservationTask: Task<Void, Never>?
+    private var pdfRuntimeActionTask: Task<Void, Never>?
+    private var pdfRuntimeActionID: UUID?
+    private lazy var pdfRuntimeController = PDFRuntimeController()
     private var selectionMonitor: SelectionMonitor?
     private var currentSelection: SelectionSnapshot?
     private var activeTranslationID: UUID?
@@ -148,6 +152,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.onBridgeAction = { [weak self] in
             self?.performBridgeDashboardAction()
         }
+        controller.onPDFRuntimeAction = { [weak self] action in
+            self?.performPDFRuntimeAction(action)
+        }
         controller.onRevealLogs = { [weak self] in
             self?.revealLogs()
         }
@@ -161,6 +168,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.setGlobalShortcut(shortcut)
         }
         controller.showBridgeState(bridgeDashboardState)
+        controller.showPDFRuntimeState(pdfRuntimeController.dashboardState)
         controller.showBrowserExtensionStatus(
             browserExtensionStatus.message,
             succeeded: browserExtensionStatus.succeeded
@@ -214,7 +222,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard self?.bridgeDashboardState.isReady == true else { return nil }
                 return self?.pairingToken
             },
-            translationDispatchState: dispatchState
+            translationDispatchState: dispatchState,
+            runtimeController: pdfRuntimeController
         )
         pdfTranslationWindowController = controller
         return controller
@@ -331,9 +340,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? runtimeLog.prepare()
         runtimeLog.write("app", "started version=\(applicationVersion)")
-        Task.detached(priority: .utility) {
-            BabelDOCServiceSession.cleanupStaleWorkingDirectories()
-        }
+        startObservingPDFRuntime()
+        pdfRuntimeController.prepareAtLaunch()
         NSApp.setActivationPolicy(.accessory)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
             self?.configureStatusItem()
@@ -432,7 +440,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         bridgeListenerAttempt = nil
         bridgeRecoveryTask?.cancel()
         activeOCRTask?.cancel()
-        pdfTranslationWindowController?.stop()
+        pdfRuntimeObservationTask?.cancel()
+        pdfRuntimeActionTask?.cancel()
         stopAccessibilityPolling()
         selectionMonitor?.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -471,9 +480,16 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         bridgeGeneration = UUID()
         bridgeListenerAttempt = nil
         bridgeRecoveryTask?.cancel()
+        let pendingPDFRuntimeAction = pdfRuntimeActionTask
+        pendingPDFRuntimeAction?.cancel()
+        pdfRuntimeActionTask = nil
+        pdfRuntimeActionID = nil
         let pdfWindow = pdfTranslationWindowController
-        Task { [codex, llama, pdfWindow] in
+        let pdfRuntime = pdfRuntimeController
+        Task { [codex, llama, pendingPDFRuntimeAction, pdfWindow, pdfRuntime] in
+            await pendingPDFRuntimeAction?.value
             await pdfWindow?.stopAndWait()
+            await pdfRuntime.shutdown()
             await codex.stop()
             await llama.stop()
             NSApp.reply(toApplicationShouldTerminate: true)
@@ -1719,29 +1735,29 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         server.onStateChange = { [weak self] state in
             Task { @MainActor [weak self] in
                 guard let self,
-                    isCurrentBridgeListener(generation: generation, attempt: attempt)
+                    self.isCurrentBridgeListener(generation: generation, attempt: attempt)
                 else { return }
                 switch state {
                 case .starting:
                     break
                 case .ready:
-                    await finishBrowserBridgeStartup(
+                    await self.finishBrowserBridgeStartup(
                         token: token,
                         generation: generation,
                         attempt: attempt
                     )
                 case .failed(let message):
-                    await handleBrowserBridgeFailure(
+                    await self.handleBrowserBridgeFailure(
                         message,
                         token: token,
                         generation: generation,
                         attempt: attempt
                     )
                 case .stopped:
-                    bridgeListenerAttempt = nil
-                    loopbackServer = nil
-                    updateBridgeState(.stopped)
-                    bridgeRecoveryTask = nil
+                    self.bridgeListenerAttempt = nil
+                    self.loopbackServer = nil
+                    self.updateBridgeState(.stopped)
+                    self.bridgeRecoveryTask = nil
                 }
             }
         }
@@ -1823,6 +1839,48 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try await Task.sleep(for: .milliseconds(80))
         }
         return try await bridgePortManager.inspect(token: token)
+    }
+
+    private func startObservingPDFRuntime() {
+        guard pdfRuntimeObservationTask == nil else { return }
+        let controller = pdfRuntimeController
+        pdfRuntimeObservationTask = Task { @MainActor [weak self, controller] in
+            for await state in controller.stateChanges() {
+                guard let self, !Task.isCancelled else { return }
+                settingsWindowController?.showPDFRuntimeState(state)
+            }
+        }
+    }
+
+    private func performPDFRuntimeAction(_ action: PDFRuntimeDashboardAction) {
+        let previousTask = pdfRuntimeActionTask
+        previousTask?.cancel()
+        let actionID = UUID()
+        pdfRuntimeActionID = actionID
+        pdfRuntimeActionTask = Task { [weak self] in
+            await previousTask?.value
+            guard let self, !Task.isCancelled else { return }
+            if action == .cancel,
+                let pdfTranslationWindowController
+            {
+                await pdfTranslationWindowController.prepareForRuntimeMaintenance(
+                    releaseWhenComplete: true
+                )
+                guard !Task.isCancelled else { return }
+                if pdfRuntimeActionID == actionID {
+                    pdfRuntimeActionTask = nil
+                    pdfRuntimeActionID = nil
+                }
+                return
+            }
+            await pdfTranslationWindowController?.prepareForRuntimeMaintenance()
+            guard !Task.isCancelled else { return }
+            pdfRuntimeController.perform(action)
+            if pdfRuntimeActionID == actionID {
+                pdfRuntimeActionTask = nil
+                pdfRuntimeActionID = nil
+            }
+        }
     }
 
     private func performBridgeDashboardAction() {

@@ -1,0 +1,217 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to package without publishing
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GLOSS_RELEASE_REPOSITORY: SunChJ/gloss-releases
+  GLOSS_HOMEBREW_TAP_REPOSITORY: SunChJ/homebrew-tap
+  GLOSS_HOMEBREW_WORKFLOW: update-cask.yml
+
+concurrency:
+  group: release-${{ github.ref_name }}-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate publication credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require release credentials
+        env:
+          DISTRIBUTION_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
+          EXTENSION_TOKEN: ${{ secrets.GLOSS_EXTENSION_TOKEN }}
+        run: |
+          missing=()
+          [[ -n "$EXTENSION_TOKEN" ]] || missing+=("GLOSS_EXTENSION_TOKEN")
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            [[ -n "$DISTRIBUTION_TOKEN" ]] || missing+=("GLOSS_DISTRIBUTION_TOKEN")
+          fi
+          if [[ ${#missing[@]} -ne 0 ]]; then
+            printf 'Release workflow requires secret: %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build macOS ${{ matrix.architecture }}
+    needs:
+      - preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: macos-15
+          - architecture: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+      GLOSS_SIGN_IDENTITY: "-"
+    steps:
+      - name: Check out Gloss
+        uses: actions/checkout@v4
+        with:
+          path: gloss
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.release_tag }}
+      - name: Check out browser extensions
+        uses: actions/checkout@v4
+        with:
+          repository: SunChJ/personal-immersive-translator
+          ref: 3e9c7c8cb75ce4b08e56a714ee0e4eb7ebaa652e
+          path: personal-immersive-translator
+          token: ${{ secrets.GLOSS_EXTENSION_TOKEN }}
+          persist-credentials: false
+      - name: Validate release version and runner architecture
+        working-directory: gloss
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          plist_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          if [[ "$version" != "$plist_version" ]]; then
+            echo "Tag version $version does not match Info.plist version $plist_version." >&2
+            exit 1
+          fi
+          if [[ "$(uname -m)" != "$EXPECTED_ARCHITECTURE" ]]; then
+            echo "Runner architecture $(uname -m) does not match $EXPECTED_ARCHITECTURE." >&2
+            exit 1
+          fi
+      - name: Build Gloss.app
+        working-directory: gloss
+        run: Scripts/build_app.sh
+      - name: Verify app architecture and ad-hoc signature
+        working-directory: gloss
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          lipo -verify_arch "$EXPECTED_ARCHITECTURE" dist/Gloss.app/Contents/MacOS/Gloss
+          codesign --verify --deep --strict --verbose=2 dist/Gloss.app
+          codesign --display --verbose=4 dist/Gloss.app 2>&1 \
+            | grep -F "Signature=adhoc"
+      - name: Package architecture-specific app
+        working-directory: gloss
+        env:
+          GLOSS_RELEASE_ARCHITECTURE: ${{ matrix.architecture }}
+        run: Scripts/package_release.sh
+      - name: Upload architecture artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gloss-${{ matrix.architecture }}
+          path: gloss/dist/release/Gloss-macos-${{ matrix.architecture }}.zip
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble release metadata
+    needs:
+      - build
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+    steps:
+      - name: Check out Gloss
+        uses: actions/checkout@v4
+        with:
+          path: gloss
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.release_tag }}
+      - name: Download architecture artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Gloss-*
+          path: release-input
+          merge-multiple: true
+      - name: Generate checksums, manifest, and Homebrew cask
+        working-directory: gloss
+        run: |
+          version="${RELEASE_TAG#v}"
+          mkdir -p dist/release
+          cp ../release-input/Gloss-macos-arm64.zip dist/release/
+          cp ../release-input/Gloss-macos-x86_64.zip dist/release/
+          Scripts/generate_release_metadata.sh \
+            dist/release/Gloss-macos-arm64.zip \
+            dist/release/Gloss-macos-x86_64.zip \
+            "$version" \
+            dist/release \
+            "$RELEASE_TAG" \
+            "$GLOSS_RELEASE_REPOSITORY"
+      - name: Upload combined workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gloss-release-${{ env.RELEASE_TAG }}
+          path: |
+            gloss/dist/release/Gloss-macos-arm64.zip
+            gloss/dist/release/Gloss-macos-x86_64.zip
+            gloss/dist/release/SHA256SUMS
+            gloss/dist/release/gloss-release-manifest.json
+            gloss/dist/release/Casks/gloss.rb
+          if-no-files-found: error
+      - name: Publish GitHub release assets
+        if: github.event_name == 'push'
+        working-directory: gloss
+        env:
+          GH_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if release_is_draft="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GLOSS_RELEASE_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft' 2>/dev/null
+          )"; then
+            if [[ "$release_is_draft" != "true" ]]; then
+              echo "Release $RELEASE_TAG is already published and must remain immutable." >&2
+              exit 1
+            fi
+          else
+            notes_file="docs/release-notes/v$version.md"
+            if [[ -f "$notes_file" ]]; then
+              gh release create "$RELEASE_TAG" \
+                --repo "$GLOSS_RELEASE_REPOSITORY" \
+                --target main \
+                --draft \
+                --title "Gloss $version" \
+                --notes-file "$notes_file"
+            else
+              gh release create "$RELEASE_TAG" \
+                --repo "$GLOSS_RELEASE_REPOSITORY" \
+                --target main \
+                --draft \
+                --title "Gloss $version" \
+                --notes "Checksum-pinned, ad-hoc signed macOS release of Gloss $version."
+            fi
+          fi
+          gh release upload "$RELEASE_TAG" \
+            --repo "$GLOSS_RELEASE_REPOSITORY" \
+            dist/release/Gloss-macos-arm64.zip \
+            dist/release/Gloss-macos-x86_64.zip \
+            dist/release/SHA256SUMS \
+            dist/release/gloss-release-manifest.json \
+            dist/release/Casks/gloss.rb \
+            --clobber
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GLOSS_RELEASE_REPOSITORY" \
+            --draft=false
+      - name: Start Homebrew cask update
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
+        run: |
+          gh workflow run "$GLOSS_HOMEBREW_WORKFLOW" \
+            --repo "$GLOSS_HOMEBREW_TAP_REPOSITORY" \
+            --ref main \
+            -f release_tag="$RELEASE_TAG" \
+            -f release_repository="$GLOSS_RELEASE_REPOSITORY"

@@ -4,6 +4,16 @@ import XCTest
 @testable import GlossCore
 
 final class BabelDOCExternalEngineTests: XCTestCase {
+    func testRuntimeUnavailablePointsToGlossManagedInstallation() {
+        let message = BabelDOCExternalEngineError.runtimeUnavailable.errorDescription
+
+        XCTAssertEqual(
+            message,
+            "PDF 运行时尚未安装。请在 Gloss 设置的“PDF 运行时”中安装或重试。"
+        )
+        XCTAssertFalse(message?.contains("uv tool install") == true)
+    }
+
     func testPersistentLayoutServiceSmokeWhenRequested() async throws {
         guard ProcessInfo.processInfo.environment["GLOSS_RUN_BABELDOC_SERVICE_SMOKE"] == "1"
         else {

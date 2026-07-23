@@ -343,6 +343,91 @@ private final class PDFQueueCellView: NSTableCellView {
 }
 
 @MainActor
+final class PDFBatchTaskCoordinator {
+    private var activeTask: Task<Void, Never>?
+    private var activeID: UUID?
+    private var terminalTask: Task<Void, Never>?
+    private var terminalID: UUID?
+    private var isDraining = false
+
+    var onChange: (() -> Void)?
+
+    var isActive: Bool {
+        activeTask != nil
+    }
+
+    var preventsStarting: Bool {
+        activeTask != nil || isDraining
+    }
+
+    @discardableResult
+    func start(_ operation: @escaping @MainActor () async -> Void) -> Bool {
+        guard activeTask == nil, !isDraining else { return false }
+        let previousTask = terminalTask
+        let operationID = UUID()
+        let task = Task { [weak self] in
+            await previousTask?.value
+            guard let self else { return }
+            if !Task.isCancelled {
+                await operation()
+            }
+            finish(operationID)
+        }
+        activeID = operationID
+        activeTask = task
+        terminalID = operationID
+        terminalTask = task
+        onChange?()
+        return true
+    }
+
+    func cancel() {
+        activeTask?.cancel()
+    }
+
+    func cancelAndDetach() {
+        activeTask?.cancel()
+        activeTask = nil
+        activeID = nil
+        onChange?()
+    }
+
+    func cancelAndWait() async {
+        if isDraining {
+            await terminalTask?.value
+            return
+        }
+        isDraining = true
+        let task = terminalTask
+        activeTask?.cancel()
+        onChange?()
+        await task?.value
+        isDraining = false
+        onChange?()
+    }
+
+    func waitForTerminal() async {
+        await terminalTask?.value
+    }
+
+    private func finish(_ operationID: UUID) {
+        var changed = false
+        if activeID == operationID {
+            activeTask = nil
+            activeID = nil
+            changed = true
+        }
+        if terminalID == operationID {
+            terminalTask = nil
+            terminalID = nil
+        }
+        if changed {
+            onChange?()
+        }
+    }
+}
+
+@MainActor
 final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     private enum QueueRow {
         case section(String)
@@ -359,8 +444,9 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     private let targetLanguage: () -> String
     private let bridgeToken: () -> String?
     private let translationDispatchState: TranslationDispatchState
-    private let babelDOCExternalEngine = BabelDOCExternalEngine()
-    private let babelDOCService = BabelDOCServiceSession()
+    private let runtimeController: PDFRuntimeController
+    private let babelDOCExternalEngine: BabelDOCExternalEngine
+    private let babelDOCService: BabelDOCServiceSession
 
     private let window: NSWindow
     private let queueTableView = NSTableView()
@@ -412,10 +498,15 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     private var selectedItemID: UUID?
     private var defaultOutputDirectoryURL =
         PDFTranslationWindowController.defaultOutputDirectory()
-    private var batchTranslationTask: Task<Void, Never>?
+    private let batchCoordinator = PDFBatchTaskCoordinator()
     private var progressRefreshTask: Task<Void, Never>?
     private var serviceStartupTask: Task<Void, Never>?
+    private var serviceStartupGeneration = 0
     private var serviceState: ServiceState = .stopped
+    private var runtimeState = PDFRuntimeDashboardState.checking
+    private var runtimeObservationTask: Task<Void, Never>?
+    private var runtimeMaintenancePending = false
+    private var runtimeMaintenancePreparationInFlight = false
     private var layoutServiceBaseURL: URL?
     private var layoutCacheDirectoryURL: URL?
     private var activePerformanceRunID: UUID?
@@ -424,11 +515,17 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     init(
         targetLanguage: @escaping () -> String,
         bridgeToken: @escaping () -> String?,
-        translationDispatchState: TranslationDispatchState
+        translationDispatchState: TranslationDispatchState,
+        runtimeController: PDFRuntimeController
     ) {
         self.targetLanguage = targetLanguage
         self.bridgeToken = bridgeToken
         self.translationDispatchState = translationDispatchState
+        self.runtimeController = runtimeController
+        babelDOCService = runtimeController.service
+        babelDOCExternalEngine = BabelDOCExternalEngine(
+            executorManager: runtimeController.service
+        )
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1_320, height: 820),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -436,7 +533,16 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             defer: true
         )
         super.init()
+        runtimeState = runtimeController.dashboardState
+        batchCoordinator.onChange = { [weak self] in
+            self?.refreshInterface()
+        }
+        startObservingRuntime()
         configureWindow()
+    }
+
+    deinit {
+        runtimeObservationTask?.cancel()
     }
 
     func show() {
@@ -465,31 +571,70 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     }
 
     func stop() {
+        serviceStartupGeneration &+= 1
         serviceStartupTask?.cancel()
         serviceStartupTask = nil
-        batchTranslationTask?.cancel()
-        batchTranslationTask = nil
+        batchCoordinator.cancelAndDetach()
         progressRefreshTask?.cancel()
         progressRefreshTask = nil
         activePerformanceRunID = nil
-        Task { await babelDOCService.stop() }
+        runtimeController.closeModule()
         layoutServiceBaseURL = nil
         layoutCacheDirectoryURL = nil
         serviceState = .stopped
     }
 
     func stopAndWait() async {
-        serviceStartupTask?.cancel()
+        serviceStartupGeneration &+= 1
+        let startupTask = serviceStartupTask
+        startupTask?.cancel()
         serviceStartupTask = nil
-        batchTranslationTask?.cancel()
-        batchTranslationTask = nil
+        let serviceCancellation = Task { [babelDOCService] in
+            try? await babelDOCService.cancelCurrent()
+        }
         progressRefreshTask?.cancel()
         progressRefreshTask = nil
         activePerformanceRunID = nil
-        await babelDOCService.stop()
+        await runtimeController.cancelModulePreparationAndWait()
+        await batchCoordinator.cancelAndWait()
+        await serviceCancellation.value
+        await startupTask?.value
+        await runtimeController.closeModuleAndWait()
         layoutServiceBaseURL = nil
         layoutCacheDirectoryURL = nil
         serviceState = .stopped
+    }
+
+    func cancelActiveTranslation() {
+        batchCoordinator.cancel()
+    }
+
+    func cancelActiveTranslationAndWait() async {
+        let serviceCancellation = Task { [babelDOCService] in
+            try? await babelDOCService.cancelCurrent()
+        }
+        await batchCoordinator.cancelAndWait()
+        await serviceCancellation.value
+    }
+
+    func prepareForRuntimeMaintenance(
+        releaseWhenComplete: Bool = false
+    ) async {
+        runtimeMaintenancePending = true
+        runtimeMaintenancePreparationInFlight = true
+        refreshInterface()
+        serviceStartupGeneration &+= 1
+        let startupTask = serviceStartupTask
+        startupTask?.cancel()
+        serviceStartupTask = nil
+        await runtimeController.cancelModulePreparationAndWait()
+        await startupTask?.value
+        await cancelActiveTranslationAndWait()
+        runtimeMaintenancePreparationInFlight = false
+        if releaseWhenComplete {
+            runtimeMaintenancePending = false
+        }
+        refreshInterface()
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -1051,8 +1196,9 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         let hasItem = item != nil
         pdfView.isHidden = !hasItem
         emptyStateView.isHidden = hasItem
-        clearCompletedButton.isEnabled = !completedItems.isEmpty && batchTranslationTask == nil
-        addFilesButton.isEnabled = batchTranslationTask == nil
+        clearCompletedButton.isEnabled =
+            !completedItems.isEmpty && !batchCoordinator.preventsStarting
+        addFilesButton.isEnabled = !batchCoordinator.isActive
 
         documentTitleLabel.stringValue = item?.sourceURL.lastPathComponent ?? "未选择 PDF"
         if let item, pdfView.document !== item.document {
@@ -1131,7 +1277,10 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     }
 
     private func updateInspector(for item: PDFQueueItem?) {
-        let controlsEnabled = item != nil && item?.state != .running && batchTranslationTask == nil
+        let controlsEnabled =
+            item != nil
+            && item?.state != .running
+            && !batchCoordinator.preventsStarting
         targetLanguagePopup.isEnabled = controlsEnabled
         outputModeControl.isEnabled = controlsEnabled
         outputFolderButton.isEnabled = controlsEnabled
@@ -1155,25 +1304,30 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
 
         engineLabel.stringValue = serviceDescription
         let runnableCount = runnableItems.count
-        if batchTranslationTask != nil {
+        if batchCoordinator.isActive {
             translateButton.title = "停止批量翻译"
             translateButton.bezelColor = .systemRed
             translateButton.isEnabled = true
+        } else if batchCoordinator.preventsStarting {
+            translateButton.title = "正在停止批量翻译…"
+            translateButton.bezelColor = nil
+            translateButton.isEnabled = false
         } else if runnableCount > 0 {
             translateButton.title =
                 runnableCount == 1
                 ? "开始翻译"
                 : "开始批量翻译（\(runnableCount)）"
-            translateButton.bezelColor = .controlAccentColor
-            translateButton.isEnabled = true
+            translateButton.bezelColor =
+                runtimeAllowsNewBatch ? .controlAccentColor : nil
+            translateButton.isEnabled = runtimeAllowsNewBatch
         } else if item?.outputURL != nil {
             translateButton.title = "打开译文"
             translateButton.bezelColor = .controlAccentColor
             translateButton.isEnabled = true
-        } else if BabelDOCExternalEngine.resolveRuntime() == nil {
-            translateButton.title = "安装 BabelDOC…"
+        } else if runtimeController.currentRuntimeLaunch == nil {
+            translateButton.title = "正在准备 PDF 运行时…"
             translateButton.bezelColor = nil
-            translateButton.isEnabled = true
+            translateButton.isEnabled = false
         } else {
             translateButton.title = "开始批量翻译"
             translateButton.bezelColor = nil
@@ -1185,19 +1339,106 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     }
 
     private var serviceDescription: String {
-        let runtime = BabelDOCExternalEngine.resolveRuntime()
-        return switch (runtime, serviceState) {
-        case (nil, _):
-            "需要安装 BabelDOC"
-        case (.some(let runtime), .stopped):
-            "BabelDOC · \(runtime.source) · PDF 服务未启动"
-        case (.some(let runtime), .starting):
-            "BabelDOC · \(runtime.source) · 正在启动常驻 PDF 服务…"
-        case (.some(let runtime), .ready):
-            "BabelDOC · \(runtime.source) · PDF 服务已就绪"
-        case (.some(let runtime), .failed(let message)):
-            "BabelDOC · \(runtime.source) · 服务回退：\(message)"
+        let presentation = runtimeState.presentation
+        return switch serviceState {
+        case .stopped:
+            presentation.headline
+        case .starting:
+            "正在启动常驻 PDF 服务…"
+        case .ready:
+            presentation.headline
+        case .failed(let message):
+            "PDF 服务不可用：\(message)"
         }
+    }
+
+    private var runtimeAllowsNewBatch: Bool {
+        let serviceIsReady =
+            if case .ready = serviceState {
+                true
+            } else {
+                false
+            }
+        return Self.canStartBatch(
+            runtimeState: runtimeState,
+            serviceIsReady: serviceIsReady,
+            maintenancePending: runtimeMaintenancePending
+        )
+    }
+
+    nonisolated static func canStartBatch(
+        runtimeState: PDFRuntimeDashboardState,
+        serviceIsReady: Bool,
+        maintenancePending: Bool
+    ) -> Bool {
+        serviceIsReady
+            && !maintenancePending
+            && runtimeAllowsNewBatch(runtimeState)
+    }
+
+    nonisolated static func runtimeAllowsNewBatch(
+        _ state: PDFRuntimeDashboardState
+    ) -> Bool {
+        switch state {
+        case .ready, .updateAvailable:
+            true
+        case .checking, .notInstalled, .installing, .starting, .translating,
+            .reconnecting, .stopping, .failed, .stopped:
+            false
+        }
+    }
+
+    private func startObservingRuntime() {
+        runtimeObservationTask = Task { [weak self, runtimeController] in
+            for await state in runtimeController.stateChanges() {
+                guard let self, !Task.isCancelled else { return }
+                await applyRuntimeState(state)
+            }
+        }
+    }
+
+    private func applyRuntimeState(_ state: PDFRuntimeDashboardState) async {
+        runtimeState = state
+        switch state {
+        case .ready(let info), .updateAvailable(let info, _):
+            if !runtimeMaintenancePreparationInFlight {
+                runtimeMaintenancePending = false
+            }
+            layoutServiceBaseURL = URL(string: info.endpoint)
+            serviceState = .ready
+            let cacheURL = await babelDOCService.layoutCacheDirectoryURL
+            guard runtimeState == state else { return }
+            layoutCacheDirectoryURL = cacheURL
+        case .translating(let info, _, _):
+            layoutServiceBaseURL = URL(string: info.endpoint)
+            serviceState = .ready
+            let cacheURL = await babelDOCService.layoutCacheDirectoryURL
+            guard runtimeState == state else { return }
+            layoutCacheDirectoryURL = cacheURL
+        case .checking, .installing, .starting, .reconnecting:
+            layoutServiceBaseURL = nil
+            layoutCacheDirectoryURL = nil
+            serviceState = .starting
+        case .failed(let message, _, _):
+            if !runtimeMaintenancePreparationInFlight {
+                runtimeMaintenancePending = false
+            }
+            layoutServiceBaseURL = nil
+            layoutCacheDirectoryURL = nil
+            serviceState = .failed(message)
+        case .stopping:
+            layoutServiceBaseURL = nil
+            layoutCacheDirectoryURL = nil
+            serviceState = .stopped
+        case .notInstalled, .stopped:
+            if !runtimeMaintenancePreparationInFlight {
+                runtimeMaintenancePending = false
+            }
+            layoutServiceBaseURL = nil
+            layoutCacheDirectoryURL = nil
+            serviceState = .stopped
+        }
+        refreshInterface()
     }
 
     private func selectLanguage(_ targetName: String) {
@@ -1213,30 +1454,38 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     }
 
     private func startPDFServiceIfNeeded() {
-        guard serviceStartupTask == nil,
-            layoutServiceBaseURL == nil,
-            let runtime = BabelDOCExternalEngine.resolveRuntime()
+        guard !runtimeMaintenancePending,
+            serviceStartupTask == nil,
+            layoutServiceBaseURL == nil
         else { return }
         serviceState = .starting
         engineLabel.stringValue = serviceDescription
-        serviceStartupTask = Task { [weak self] in
+        serviceStartupGeneration &+= 1
+        let generation = serviceStartupGeneration
+        let startupTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let baseURL = try await babelDOCService.start(runtime: runtime)
-                guard !Task.isCancelled else { return }
-                layoutServiceBaseURL = baseURL
-                layoutCacheDirectoryURL = await babelDOCService.layoutCacheDirectoryURL
+                try Task.checkCancellation()
+                let prepared = try await runtimeController.prepareModule()
+                try Task.checkCancellation()
+                guard serviceStartupGeneration == generation else { return }
+                layoutServiceBaseURL = prepared.layoutServiceBaseURL
+                layoutCacheDirectoryURL = prepared.layoutCacheDirectoryURL
                 serviceState = .ready
             } catch is CancellationError {
+                guard serviceStartupGeneration == generation else { return }
                 serviceState = .stopped
             } catch {
+                guard serviceStartupGeneration == generation else { return }
                 serviceState = .failed(error.localizedDescription)
                 layoutServiceBaseURL = nil
                 layoutCacheDirectoryURL = nil
             }
+            guard serviceStartupGeneration == generation else { return }
             serviceStartupTask = nil
             refreshInterface()
         }
+        serviceStartupTask = startupTask
     }
 
     @objc private func choosePDFFiles() {
@@ -1326,28 +1575,25 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func primaryAction() {
-        if let batchTranslationTask {
-            batchTranslationTask.cancel()
+        if batchCoordinator.isActive {
+            cancelActiveTranslation()
             return
         }
         if !runnableItems.isEmpty {
-            beginBatchTranslation()
+            if runtimeAllowsNewBatch {
+                beginBatchTranslation()
+            }
             return
         }
         if let outputURL = selectedItem?.outputURL {
             NSWorkspace.shared.open(outputURL)
             return
         }
-        if BabelDOCExternalEngine.resolveRuntime() == nil {
-            showBabelDOCInstallationHelp()
-        }
+        startPDFServiceIfNeeded()
     }
 
     private func beginBatchTranslation() {
-        guard let runtime = BabelDOCExternalEngine.resolveRuntime() else {
-            showBabelDOCInstallationHelp()
-            return
-        }
+        guard runtimeAllowsNewBatch else { return }
         guard let token = bridgeToken() else {
             showAlert(
                 title: "翻译服务尚未就绪",
@@ -1357,23 +1603,35 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         }
         let queue = runnableItems
         guard !queue.isEmpty else { return }
-        batchTranslationTask = Task { [weak self] in
+        batchCoordinator.start { [weak self] in
             guard let self else { return }
-            if layoutServiceBaseURL == nil {
-                startPDFServiceIfNeeded()
-                await serviceStartupTask?.value
+            guard runtimeAllowsNewBatch,
+                let runtime = runtimeController.currentRuntimeLaunch,
+                layoutServiceBaseURL != nil
+            else {
+                let message =
+                    if case .failed(let reason) = serviceState {
+                        reason
+                    } else {
+                        "PDF 服务尚未就绪"
+                    }
+                for item in queue where item.state != .completed {
+                    item.state = .failed
+                    item.progress = nil
+                    item.statusText = message
+                }
+                refreshInterface()
+                return
             }
             for item in queue {
                 guard !Task.isCancelled else { break }
                 await translate(item, runtime: runtime, bridgeToken: token)
             }
-            batchTranslationTask = nil
             activePerformanceRunID = nil
             progressRefreshTask?.cancel()
             progressRefreshTask = nil
             refreshInterface()
         }
-        refreshInterface()
     }
 
     private func translate(
@@ -1402,6 +1660,12 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             layoutServiceBaseURL == nil
             ? "正在启动 BabelDOC…"
             : "正在连接常驻 PDF 服务…"
+        runtimeController.translationDidStart(fileName: item.sourceURL.lastPathComponent)
+        defer {
+            runtimeController.translationDidFinish(
+                fileName: item.sourceURL.lastPathComponent
+            )
+        }
         select(item)
         refreshInterface()
 
@@ -1729,22 +1993,6 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             return
         }
         zoomLabel.stringValue = "\(Int((pdfView.scaleFactor * 100).rounded()))%"
-    }
-
-    private func showBabelDOCInstallationHelp() {
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "需要安装 BabelDOC"
-        alert.informativeText = """
-            PDF 翻译使用独立安装的 BabelDOC。
-
-            安装命令：
-            uv tool install --python 3.12 BabelDOC
-
-            也可以通过 GLOSS_BABELDOC_BIN 指定可执行文件。
-            """
-        alert.addButton(withTitle: "好")
-        alert.beginSheetModal(for: window)
     }
 
     private func showAlert(title: String, message: String) {
