@@ -22,7 +22,15 @@ final class BabelDOCExternalEngineTests: XCTestCase {
             )
         }
         let runtime = try XCTUnwrap(BabelDOCExternalEngine.resolveRuntime())
-        let session = BabelDOCServiceSession()
+        let stateDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "Gloss-BabelDOC-Service-Smoke-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: stateDirectory) }
+        let session = BabelDOCServiceSession(
+            persistedStateDirectoryURL: stateDirectory
+        )
         do {
             let baseURL = try await session.start(
                 runtime: runtime,
@@ -75,7 +83,18 @@ final class BabelDOCExternalEngineTests: XCTestCase {
             withIntermediateDirectories: true
         )
         let runtime = try XCTUnwrap(BabelDOCExternalEngine.resolveRuntime())
-        let service = usePersistentLayout ? BabelDOCServiceSession() : nil
+        let stateDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "Gloss-BabelDOC-Benchmark-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: stateDirectory) }
+        let service =
+            usePersistentLayout
+            ? BabelDOCServiceSession(
+                persistedStateDirectoryURL: stateDirectory
+            )
+            : nil
         do {
             let layoutServiceBaseURL = try await service?.start(
                 runtime: runtime,
