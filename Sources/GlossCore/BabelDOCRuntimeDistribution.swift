@@ -188,23 +188,33 @@ public struct BabelDOCRuntimeTransport: Sendable {
     public static let live = ephemeral()
 
     public static func ephemeral(
-        policy: BabelDOCRuntimeNetworkPolicy = BabelDOCRuntimeNetworkPolicy()
+        policy: BabelDOCRuntimeNetworkPolicy
     ) -> Self {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = policy.requestTimeout
-        configuration.timeoutIntervalForResource = policy.resourceTimeout
-        configuration.waitsForConnectivity = policy.waitsForConnectivity
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        let session = URLSession(configuration: configuration)
+        ephemeral(
+            metadataPolicy: policy,
+            downloadPolicy: policy
+        )
+    }
+
+    public static func ephemeral(
+        metadataPolicy: BabelDOCRuntimeNetworkPolicy = .metadata,
+        downloadPolicy: BabelDOCRuntimeNetworkPolicy = .runtimeArchive
+    ) -> Self {
+        let metadataSession = URLSession(
+            configuration: sessionConfiguration(for: metadataPolicy)
+        )
+        let downloadSession = URLSession(
+            configuration: sessionConfiguration(for: downloadPolicy)
+        )
 
         return Self(
             fetchData: { url in
-                let (data, response) = try await session.data(from: url)
+                let (data, response) = try await metadataSession.data(from: url)
                 try validateHTTPResponse(response, for: url)
                 return data
             },
             download: { url, destination in
-                let (temporaryURL, response) = try await session.download(from: url)
+                let (temporaryURL, response) = try await downloadSession.download(from: url)
                 try validateHTTPResponse(response, for: url)
 
                 let fileManager = FileManager.default
@@ -214,6 +224,17 @@ public struct BabelDOCRuntimeTransport: Sendable {
                 try fileManager.moveItem(at: temporaryURL, to: destination)
             }
         )
+    }
+
+    static func sessionConfiguration(
+        for policy: BabelDOCRuntimeNetworkPolicy
+    ) -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = policy.requestTimeout
+        configuration.timeoutIntervalForResource = policy.resourceTimeout
+        configuration.waitsForConnectivity = policy.waitsForConnectivity
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return configuration
     }
 
     private static func validateHTTPResponse(_ response: URLResponse, for url: URL) throws {
@@ -230,6 +251,12 @@ public struct BabelDOCRuntimeTransport: Sendable {
 }
 
 public struct BabelDOCRuntimeNetworkPolicy: Equatable, Sendable {
+    public static let metadata = Self()
+    public static let runtimeArchive = Self(
+        requestTimeout: 60,
+        resourceTimeout: 60 * 60
+    )
+
     public let requestTimeout: TimeInterval
     public let resourceTimeout: TimeInterval
     public let waitsForConnectivity: Bool

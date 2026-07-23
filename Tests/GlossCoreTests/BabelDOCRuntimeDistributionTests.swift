@@ -68,13 +68,71 @@ struct BabelDOCRuntimeDistributionTests {
         )
     }
 
-    @Test("live transport uses bounded offline timeouts")
-    func liveNetworkPolicyIsBounded() {
-        let policy = BabelDOCRuntimeNetworkPolicy()
+    @Test("live transport keeps metadata fast and allows large archive downloads")
+    func liveNetworkPoliciesMatchPayloadSize() {
+        let metadataPolicy = BabelDOCRuntimeNetworkPolicy.metadata
+        let archivePolicy = BabelDOCRuntimeNetworkPolicy.runtimeArchive
+        let metadataConfiguration = BabelDOCRuntimeTransport.sessionConfiguration(
+            for: metadataPolicy
+        )
+        let archiveConfiguration = BabelDOCRuntimeTransport.sessionConfiguration(
+            for: archivePolicy
+        )
 
-        #expect(policy.requestTimeout == 12)
-        #expect(policy.resourceTimeout == 60)
-        #expect(!policy.waitsForConnectivity)
+        #expect(metadataConfiguration.timeoutIntervalForRequest == 12)
+        #expect(metadataConfiguration.timeoutIntervalForResource == 60)
+        #expect(!metadataConfiguration.waitsForConnectivity)
+        #expect(archiveConfiguration.timeoutIntervalForRequest == 60)
+        #expect(archiveConfiguration.timeoutIntervalForResource == 60 * 60)
+        #expect(!archiveConfiguration.waitsForConnectivity)
+    }
+
+    @Test(
+        "public runtime release installs and restores end to end",
+        .enabled(
+            if: ProcessInfo.processInfo.environment[
+                "GLOSS_RUN_BABELDOC_RUNTIME_SMOKE"
+            ] == "1",
+            "Set GLOSS_RUN_BABELDOC_RUNTIME_SMOKE=1 to download the public runtime."
+        )
+    )
+    func publicRuntimeReleaseInstallsEndToEnd() async throws {
+        let currentGlossVersion = try #require(
+            ProcessInfo.processInfo.environment[
+                "GLOSS_RUNTIME_SMOKE_APP_VERSION"
+            ]
+        )
+
+        let root = try temporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+        }
+        let manager = try BabelDOCRuntimeManager(
+            rootDirectory: root,
+            currentGlossVersion: currentGlossVersion
+        )
+
+        let installed = try await manager.update { progress in
+            print(
+                "BabelDOC runtime smoke: \(progress.operation.rawValue)"
+                    + (progress.version.map { " \($0)" } ?? "")
+            )
+        }
+        let installedVersion = try #require(installed.currentVersion)
+        let executableURL = try #require(installed.currentExecutableURL)
+        #expect(installed.operation == .ready)
+        #expect(installed.lastError == nil)
+        #expect(FileManager.default.isExecutableFile(atPath: executableURL.path))
+
+        let restoredManager = try BabelDOCRuntimeManager(
+            rootDirectory: root,
+            currentGlossVersion: currentGlossVersion
+        )
+        let restored = await restoredManager.snapshot()
+        #expect(restored.currentVersion == installedVersion)
+        #expect(restored.currentExecutableURL == executableURL)
+        #expect(restored.operation == .idle)
+        #expect(restored.lastError == nil)
     }
 
     @Test("raw runtime install verifies SHA, permissions, and persisted state")
