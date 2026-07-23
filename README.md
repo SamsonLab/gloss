@@ -156,6 +156,37 @@ GLOSS_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./Scripts/build_app.
 
 正式分发时使用 `Developer ID Application` 证书执行同一命令；脚本会自动启用 Hardened Runtime 与可信时间戳。随后仍需用 Apple `notarytool` 公证并对 App 执行 `stapler staple`。
 
+### BabelDOC runtime 更新
+
+Gloss 可以管理来自 `SunChJ/BabelDOC` GitHub Releases 的固定版本 runtime。更新 manifest 使用
+内置 Ed25519 public key 验证 detached signature，runtime archive 再做 SHA-256 校验；签名或
+校验失败不会替换当前版本。安装器当前开放 stable 通道，并支持版本 pin 和一键 rollback；
+beta、nightly 会在对应的已签名 release alias 上线后再开放。安装过程通过 staging directory 与
+atomic state file 防止半安装状态。完整 manifest schema、安全边界和发布 secret 见
+[Gloss 与 BabelDOC 发行链路](docs/runtime-distribution.md)。
+
+### GitHub Release 与 Homebrew
+
+推送与 `Resources/Info.plist` 一致的 `v*` tag 会运行 Release workflow，产出
+arm64 与 x86_64 两套 `Gloss.app` zip、`SHA256SUMS`、release manifest 和带
+`on_arm` / `on_intel` 校验的 Homebrew cask。Release 完成后，自动化会在本仓库创建
+`Casks/gloss.rb` 更新 PR；不依赖额外的外部 tap 仓库。
+
+当前 Gloss 仓库仍是 private，匿名 Homebrew 安装需要先提供 public GitHub Release 或其他公共
+binary host。公开发行地址就绪后，首次安装以及后续升级为：
+
+```bash
+brew tap sunchj/gloss https://github.com/SunChJ/gloss
+brew install --cask sunchj/gloss/gloss
+brew update
+brew upgrade --cask gloss
+```
+
+正式 tag Release 必须同时具备 Developer ID 与 Apple 公证 secrets，否则 workflow 会在上传
+public Release 和 Homebrew cask 前 fail closed。没有签名凭据时，手工 workflow 只会生成适合
+内部验证的 ad-hoc artifact。具体变量、私有仓库限制与本地打包命令见
+[发行文档](docs/runtime-distribution.md)。
+
 ## 代码结构
 
 ```text
