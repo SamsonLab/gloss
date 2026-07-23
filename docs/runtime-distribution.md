@@ -31,29 +31,30 @@ Manifest schema v1 示例：
 {
   "schemaVersion": 1,
   "channel": "stable",
-  "version": "0.6.4+gloss.3",
-  "releaseTag": "v0.6.4-gloss.3",
-  "publishedAt": "2026-07-22T00:00:00Z",
+  "version": "0.6.4+gloss.4",
+  "releaseTag": "v0.6.4-gloss.4",
+  "publishedAt": "2026-07-23T10:16:56Z",
   "minimumGlossVersion": "0.8.0",
-  "releaseNotesURL": "https://github.com/SunChJ/BabelDOC/releases/tag/v0.6.4-gloss.3",
+  "releaseNotesURL": "https://github.com/SunChJ/BabelDOC/blob/v0.6.4-gloss.4/docs/release-notes/v0.6.4-gloss.4.md",
   "assets": [
     {
       "operatingSystem": "macos",
       "architecture": "arm64",
-      "url": "https://github.com/SunChJ/BabelDOC/releases/download/v0.6.4-gloss.3/gloss-babeldoc-macos-arm64.tar.gz",
-      "sha256": "64-character-lowercase-hex",
-      "size": 123456,
+      "url": "https://github.com/SunChJ/BabelDOC/releases/download/v0.6.4-gloss.4/gloss-babeldoc-0.6.4-gloss.4-macos-arm64.tar.gz",
+      "sha256": "8eb8b5b7f629a39715e9e317306861fd1adb6b67b483b7cab89589b986595436",
+      "size": 228709309,
       "archiveFormat": "tar.gz",
-      "executablePath": "gloss-babeldoc"
+      "executablePath": "gloss-babeldoc-runtime/gloss-babeldoc"
     }
   ]
 }
 ```
 
-Runtime archive 的入口必须命名为 `gloss-babeldoc`。安装器在解包前拒绝绝对路径、`..` 和
-Windows drive 路径，在激活前拒绝符号链接/硬链接并验证可执行权限。下载与解包发生在相同
-filesystem 的 staging 目录，完整校验后才移动到版本目录；`state.json` 使用 atomic replace，
-因此下载中断或进程崩溃不会切换 active runtime。
+Runtime archive 的入口必须位于 manifest 声明的 `executablePath`，且文件名为
+`gloss-babeldoc`。安装器在解包前拒绝绝对路径、`..` 和 Windows drive 路径，在激活前拒绝
+符号链接/硬链接并验证可执行权限。下载与解包发生在相同 filesystem 的 staging 目录，完整
+校验后才移动到版本目录；`state.json` 使用 atomic replace，因此下载中断或进程崩溃不会切换
+active runtime。
 
 ## App 内的状态与控制
 
@@ -74,7 +75,7 @@ filesystem 的 staging 目录，完整校验后才移动到版本目录；`state
 ├── state.json
 └── versions/
     ├── 0.6.4+gloss.2-<sha-prefix>/
-    └── 0.6.4+gloss.3-<sha-prefix>/
+    └── 0.6.4+gloss.4-<sha-prefix>/
 ```
 
 测试和受控企业分发可以向 manager 注入 manifest URL、transport 和 Ed25519 public key，不需要
