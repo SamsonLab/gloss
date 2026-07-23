@@ -32,10 +32,10 @@ jobs:
       - name: Require release credentials
         env:
           DISTRIBUTION_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
-          EXTENSION_TOKEN: ${{ secrets.GLOSS_EXTENSION_TOKEN }}
+          EXTENSION_SSH_KEY: ${{ secrets.GLOSS_EXTENSION_SSH_KEY }}
         run: |
           missing=()
-          [[ -n "$EXTENSION_TOKEN" ]] || missing+=("GLOSS_EXTENSION_TOKEN")
+          [[ -n "$EXTENSION_SSH_KEY" ]] || missing+=("GLOSS_EXTENSION_SSH_KEY")
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             [[ -n "$DISTRIBUTION_TOKEN" ]] || missing+=("GLOSS_DISTRIBUTION_TOKEN")
           fi
@@ -73,7 +73,8 @@ jobs:
           repository: SunChJ/personal-immersive-translator
           ref: 3e9c7c8cb75ce4b08e56a714ee0e4eb7ebaa652e
           path: personal-immersive-translator
-          token: ${{ secrets.GLOSS_EXTENSION_TOKEN }}
+          ssh-key: ${{ secrets.GLOSS_EXTENSION_SSH_KEY }}
+          ssh-strict: true
           persist-credentials: false
       - name: Validate release version and runner architecture
         working-directory: gloss

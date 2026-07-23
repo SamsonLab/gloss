@@ -182,9 +182,9 @@ brew update
 brew upgrade --cask sunchj/tap/gloss
 ```
 
-Release workflow 使用只读 `GLOSS_EXTENSION_TOKEN` 检出私有浏览器扩展；正式 tag 另外要求
-跨仓库 `GLOSS_DISTRIBUTION_TOKEN`。缺失时 workflow 会在构建和上传前 fail closed。手工
-workflow 不发布，但仍需要 extension token 才能生成完整 App artifact。
+Release workflow 使用只读 `GLOSS_EXTENSION_SSH_KEY` 检出私有浏览器扩展；正式 tag 另外
+要求跨仓库 `GLOSS_DISTRIBUTION_TOKEN`。缺失时 workflow 会在构建和上传前 fail closed。
+手工 workflow 不发布，但仍需要 extension deploy key 才能生成完整 App artifact。
 Cask 的 `postflight` 会重新 ad-hoc 签名、移除 quarantine 并验证签名，让安装后启动不弹
 Gatekeeper 交互；这也意味着 macOS 无法验证 Apple 开发者身份或公证票据。公开仓库初始化、
 fine-grained token 权限、完整安全取舍、发行顺序与恢复步骤见
