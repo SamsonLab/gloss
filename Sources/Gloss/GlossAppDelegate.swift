@@ -1735,29 +1735,29 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         server.onStateChange = { [weak self] state in
             Task { @MainActor [weak self] in
                 guard let self,
-                    isCurrentBridgeListener(generation: generation, attempt: attempt)
+                    self.isCurrentBridgeListener(generation: generation, attempt: attempt)
                 else { return }
                 switch state {
                 case .starting:
                     break
                 case .ready:
-                    await finishBrowserBridgeStartup(
+                    await self.finishBrowserBridgeStartup(
                         token: token,
                         generation: generation,
                         attempt: attempt
                     )
                 case .failed(let message):
-                    await handleBrowserBridgeFailure(
+                    await self.handleBrowserBridgeFailure(
                         message,
                         token: token,
                         generation: generation,
                         attempt: attempt
                     )
                 case .stopped:
-                    bridgeListenerAttempt = nil
-                    loopbackServer = nil
-                    updateBridgeState(.stopped)
-                    bridgeRecoveryTask = nil
+                    self.bridgeListenerAttempt = nil
+                    self.loopbackServer = nil
+                    self.updateBridgeState(.stopped)
+                    self.bridgeRecoveryTask = nil
                 }
             }
         }
