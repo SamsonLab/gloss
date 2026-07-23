@@ -14,6 +14,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     var onRevealBrowserExtension: (() -> Void)?
     var onOpenSafariExtensionSettings: (() -> Void)?
     var onBridgeAction: (() -> Void)?
+    var onPDFRuntimeAction: ((PDFRuntimeDashboardAction) -> Void)?
     var onRevealLogs: (() -> Void)?
     var onOpenServicesSettings: (() -> Void)?
     var onSetLaunchAtLogin: ((Bool) -> Bool)?
@@ -25,6 +26,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     private let bridgeStatus = NSTextField(labelWithString: "正在检查本地连接…")
     private let bridgeDetail = NSTextField(labelWithString: "127.0.0.1:8787")
     private let bridgePath = NSTextField(labelWithString: "")
+    private let pdfRuntimeStatus = NSTextField(labelWithString: "正在检查 PDF 运行时…")
+    private let pdfRuntimeDetail = NSTextField(
+        labelWithString: "正在验证已安装版本与残留进程"
+    )
+    private let pdfRuntimePath = NSTextField(labelWithString: "")
     private let browserExtensionStatus = NSTextField(labelWithString: "正在准备浏览器扩展")
     private let shortcutStatus = NSTextField(labelWithString: "手动翻译当前选区")
     private let launchAtLoginStatus = NSTextField(labelWithString: "关闭")
@@ -43,6 +49,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     private let launchAtLoginSwitch = NSSwitch()
     private let bridgeActionButton = NSButton(title: "正在检查…", target: nil, action: nil)
     private let bridgeProgressIndicator = NSProgressIndicator()
+    private let pdfRuntimeActionButton = NSButton(
+        title: "正在检查…",
+        target: nil,
+        action: nil
+    )
+    private let pdfRuntimeProgressIndicator = NSProgressIndicator()
+    private var pdfRuntimeState = PDFRuntimeDashboardState.checking
 
     override init() {
         window = NSWindow(
@@ -132,8 +145,34 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         window.delegate = self
         window.minSize = NSSize(width: 520, height: 810)
 
+        let root = NSView()
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(scrollView)
+        window.contentView = root
+
         let content = NSView()
-        window.contentView = content
+        content.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = content
+
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: root.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            content.leadingAnchor.constraint(
+                equalTo: scrollView.contentView.leadingAnchor
+            ),
+            content.trailingAnchor.constraint(
+                equalTo: scrollView.contentView.trailingAnchor
+            ),
+            content.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            content.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+        ])
 
         let icon = NSImageView()
         icon.image = GlossBrand.markImage(pointSize: 36)
@@ -191,6 +230,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         let providerCard = makeProviderCard()
 
         let browserCard = makeBridgeCard()
+        let pdfRuntimeCard = makePDFRuntimeCard()
 
         let launchAtLoginCard = makeStatusCard(
             symbol: "power",
@@ -244,6 +284,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             servicesCard,
             providerCard,
             browserCard,
+            pdfRuntimeCard,
             launchAtLoginCard,
             actionButtons,
             hint,
@@ -278,7 +319,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             browserCard.leadingAnchor.constraint(equalTo: providerCard.leadingAnchor),
             browserCard.trailingAnchor.constraint(equalTo: providerCard.trailingAnchor),
 
-            launchAtLoginCard.topAnchor.constraint(equalTo: browserCard.bottomAnchor, constant: 10),
+            pdfRuntimeCard.topAnchor.constraint(
+                equalTo: browserCard.bottomAnchor,
+                constant: 10
+            ),
+            pdfRuntimeCard.leadingAnchor.constraint(equalTo: browserCard.leadingAnchor),
+            pdfRuntimeCard.trailingAnchor.constraint(equalTo: browserCard.trailingAnchor),
+
+            launchAtLoginCard.topAnchor.constraint(
+                equalTo: pdfRuntimeCard.bottomAnchor,
+                constant: 10
+            ),
             launchAtLoginCard.leadingAnchor.constraint(equalTo: browserCard.leadingAnchor),
             launchAtLoginCard.trailingAnchor.constraint(equalTo: browserCard.trailingAnchor),
 
@@ -288,8 +339,106 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             hint.topAnchor.constraint(equalTo: actionButtons.bottomAnchor, constant: 16),
             hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 44),
             hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -44),
-            hint.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -20),
+            hint.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
         ])
+    }
+
+    private func makePDFRuntimeCard() -> NSView {
+        let card = NSVisualEffectView()
+        card.material = .contentBackground
+        card.blendingMode = .withinWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.image = NSImage(
+            systemSymbolName: "doc.richtext",
+            accessibilityDescription: "PDF 运行时"
+        )
+        icon.contentTintColor = .secondaryLabelColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: "PDF 运行时")
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        pdfRuntimeProgressIndicator.style = .spinning
+        pdfRuntimeProgressIndicator.controlSize = .small
+
+        pdfRuntimeStatus.font = .systemFont(ofSize: 12, weight: .medium)
+        pdfRuntimeStatus.lineBreakMode = .byTruncatingTail
+        pdfRuntimeStatus.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        let statusStack = NSStackView(
+            views: [pdfRuntimeProgressIndicator, pdfRuntimeStatus]
+        )
+        statusStack.orientation = .horizontal
+        statusStack.alignment = .centerY
+        statusStack.spacing = 5
+
+        pdfRuntimeActionButton.target = self
+        pdfRuntimeActionButton.action = #selector(performPDFRuntimeAction)
+        pdfRuntimeActionButton.setContentHuggingPriority(
+            .required,
+            for: .horizontal
+        )
+
+        let topRow = NSStackView(
+            views: [titleLabel, statusStack, pdfRuntimeActionButton]
+        )
+        topRow.orientation = .horizontal
+        topRow.alignment = .centerY
+        topRow.spacing = 10
+        topRow.distribution = .fill
+
+        pdfRuntimeDetail.font = .systemFont(ofSize: 11.5)
+        pdfRuntimeDetail.textColor = .secondaryLabelColor
+        pdfRuntimeDetail.lineBreakMode = .byTruncatingMiddle
+        pdfRuntimeDetail.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        pdfRuntimePath.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        pdfRuntimePath.textColor = .tertiaryLabelColor
+        pdfRuntimePath.lineBreakMode = .byTruncatingMiddle
+        pdfRuntimePath.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+        pdfRuntimePath.isHidden = true
+
+        let content = NSStackView(
+            views: [topRow, pdfRuntimeDetail, pdfRuntimePath]
+        )
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 4
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(icon)
+        card.addSubview(content)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 92),
+            icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            icon.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
+            content.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
+            topRow.widthAnchor.constraint(equalTo: content.widthAnchor),
+            pdfRuntimeDetail.widthAnchor.constraint(equalTo: content.widthAnchor),
+            pdfRuntimePath.widthAnchor.constraint(equalTo: content.widthAnchor),
+        ])
+        showPDFRuntimeState(pdfRuntimeState)
+        return card
     }
 
     private func makeBridgeCard() -> NSView {
@@ -644,6 +793,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         onBridgeAction?()
     }
 
+    @objc private func performPDFRuntimeAction() {
+        guard let action = pdfRuntimeState.action else { return }
+        onPDFRuntimeAction?(action)
+    }
+
     @objc private func openServicesSettings() {
         onOpenServicesSettings?()
     }
@@ -674,6 +828,34 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             bridgeProgressIndicator.stopAnimation(nil)
         }
         bridgeStatus.textColor =
+            switch presentation.tone {
+            case .neutral: .secondaryLabelColor
+            case .positive: .systemGreen
+            case .warning: .systemOrange
+            case .negative: .systemRed
+            }
+    }
+
+    func showPDFRuntimeState(_ state: PDFRuntimeDashboardState) {
+        pdfRuntimeState = state
+        let presentation = state.presentation
+        pdfRuntimeStatus.stringValue = presentation.headline
+        pdfRuntimeDetail.stringValue = presentation.detail
+        pdfRuntimeDetail.toolTip = presentation.detail
+        pdfRuntimePath.stringValue = presentation.path ?? ""
+        pdfRuntimePath.toolTip = presentation.path
+        pdfRuntimePath.isHidden = presentation.path == nil
+        pdfRuntimeActionButton.title = presentation.actionTitle
+        pdfRuntimeActionButton.isEnabled = presentation.actionEnabled
+        pdfRuntimeActionButton.contentTintColor =
+            presentation.actionIsDestructive ? .systemRed : nil
+        pdfRuntimeProgressIndicator.isHidden = !presentation.showsProgress
+        if presentation.showsProgress {
+            pdfRuntimeProgressIndicator.startAnimation(nil)
+        } else {
+            pdfRuntimeProgressIndicator.stopAnimation(nil)
+        }
+        pdfRuntimeStatus.textColor =
             switch presentation.tone {
             case .neutral: .secondaryLabelColor
             case .positive: .systemGreen
