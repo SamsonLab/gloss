@@ -5,10 +5,16 @@ import Foundation
 public struct BabelDOCRuntimeLaunch: Equatable, Sendable {
     public let executable: String
     public let source: String
+    public let executorExecutable: String?
 
-    public init(executable: String, source: String) {
+    public init(
+        executable: String,
+        source: String,
+        executorExecutable: String? = nil
+    ) {
         self.executable = executable
         self.source = source
+        self.executorExecutable = executorExecutable
     }
 }
 
@@ -91,7 +97,7 @@ public enum BabelDOCExternalEngineError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .runtimeUnavailable:
-            "未找到 BabelDOC。请先执行：uv tool install --python 3.12 BabelDOC"
+            "PDF 运行时尚未安装。请在 Gloss 设置的“PDF 运行时”中安装或重试。"
         case .launchFailed(let reason):
             "无法启动 BabelDOC：\(reason)"
         case .processFailed(let status, let log):
@@ -152,11 +158,29 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
         }
     }
 
-    public init() {}
+    private let executorManager: (any BabelDOCExecutorManaging)?
+    private let injectedExecutorConnection: BabelDOCExecutorConnection?
+    private let legacyFallbackPolicy: BabelDOCLegacyFallbackPolicy
+
+    public init(
+        executorManager: (any BabelDOCExecutorManaging)? = nil,
+        executorConnection: BabelDOCExecutorConnection? = nil,
+        legacyFallbackPolicy: BabelDOCLegacyFallbackPolicy = .unsupportedRuntimeOnly
+    ) {
+        self.executorManager = executorManager
+        self.injectedExecutorConnection = executorConnection
+        self.legacyFallbackPolicy = legacyFallbackPolicy
+    }
 
     public static func resolveRuntime(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> BabelDOCRuntimeLaunch? {
+        let configuredExecutor = environment["GLOSS_BABELDOC_EXECUTOR_BIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let validConfiguredExecutor =
+            configuredExecutor.flatMap {
+                FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil
+            }
         if let configured = environment["GLOSS_BABELDOC_BIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !configured.isEmpty,
@@ -164,7 +188,10 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
         {
             return BabelDOCRuntimeLaunch(
                 executable: configured,
-                source: "configured"
+                source: "configured",
+                executorExecutable:
+                    validConfiguredExecutor
+                    ?? siblingExecutor(forLegacyExecutable: configured)
             )
         }
 
@@ -184,7 +211,21 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
         where seen.insert(candidate).inserted
             && FileManager.default.isExecutableFile(atPath: candidate)
         {
-            return BabelDOCRuntimeLaunch(executable: candidate, source: source)
+            return BabelDOCRuntimeLaunch(
+                executable: candidate,
+                source: source,
+                executorExecutable:
+                    validConfiguredExecutor
+                    ?? siblingExecutor(forLegacyExecutable: candidate)
+                    ?? resolveExecutor(environment: environment)
+            )
+        }
+        if let executor = validConfiguredExecutor ?? resolveExecutor(environment: environment) {
+            return BabelDOCRuntimeLaunch(
+                executable: executor,
+                source: validConfiguredExecutor == nil ? "executor" : "configured",
+                executorExecutable: executor
+            )
         }
         return nil
     }
@@ -199,6 +240,70 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
             throw BabelDOCExternalEngineError.runtimeUnavailable
         }
 
+        if let connection = try await executorConnection(
+            for: request,
+            runtime: runtime
+        ) {
+            return try await BabelDOCExecutorClient(connection: connection).translate(
+                request,
+                onOutput: onOutput,
+                onProgress: onProgress
+            )
+        }
+        guard legacyFallbackPolicy == .unsupportedRuntimeOnly else {
+            throw BabelDOCExecutorError.unsupportedRuntime
+        }
+        return try await translateWithLegacyCLI(
+            request,
+            runtime: runtime,
+            onOutput: onOutput,
+            onProgress: onProgress
+        )
+    }
+
+    private func executorConnection(
+        for request: BabelDOCTranslationRequest,
+        runtime: BabelDOCRuntimeLaunch
+    ) async throws -> BabelDOCExecutorConnection? {
+        if let injectedExecutorConnection {
+            return injectedExecutorConnection
+        }
+        if let executorManager {
+            do {
+                return try await executorManager.executorConnection(
+                    runtime: runtime,
+                    timeout: .seconds(90)
+                )
+            } catch BabelDOCExecutorError.unsupportedRuntime {
+                guard runtime.executorExecutable == nil else {
+                    throw BabelDOCExecutorError.incompatibleRuntime(
+                        "托管 BabelDOC 运行时未建立 executor 连接"
+                    )
+                }
+                return nil
+            }
+        }
+        if let layoutServiceBaseURL = request.layoutServiceBaseURL,
+            let connection = await BabelDOCExecutorConnectionRegistry.shared.connection(
+                layoutServiceBaseURL: layoutServiceBaseURL
+            )
+        {
+            return connection
+        }
+        guard runtime.executorExecutable != nil else {
+            return nil
+        }
+        throw BabelDOCExecutorError.unavailable(
+            "运行时支持 executor，但当前 PDF 会话尚未建立连接"
+        )
+    }
+
+    private func translateWithLegacyCLI(
+        _ request: BabelDOCTranslationRequest,
+        runtime: BabelDOCRuntimeLaunch,
+        onOutput: (@Sendable (String) -> Void)?,
+        onProgress: (@Sendable (BabelDOCProgressUpdate) -> Void)?
+    ) async throws -> BabelDOCTranslationResult {
         let layoutCacheKey: String?
         if request.layoutCacheDirectoryURL != nil {
             let keyTask = Task.detached(priority: .utility) {
@@ -335,6 +440,36 @@ public final class BabelDOCExternalEngine: @unchecked Sendable {
             timings: completedProgress.timings,
             layoutCacheStatus: layoutCacheStatus
         )
+    }
+
+    private static func siblingExecutor(
+        forLegacyExecutable executable: String
+    ) -> String? {
+        let candidate = URL(fileURLWithPath: executable)
+            .deletingLastPathComponent()
+            .appendingPathComponent("gloss-babeldoc").path
+        return FileManager.default.isExecutableFile(atPath: candidate)
+            ? candidate
+            : nil
+    }
+
+    private static func resolveExecutor(
+        environment: [String: String]
+    ) -> String? {
+        var candidates = (environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map { String($0) + "/gloss-babeldoc" }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        candidates.append(contentsOf: [
+            "/opt/homebrew/bin/gloss-babeldoc",
+            "/usr/local/bin/gloss-babeldoc",
+            home.appendingPathComponent(".local/bin/gloss-babeldoc").path,
+        ])
+        var seen = Set<String>()
+        return candidates.first {
+            seen.insert($0).inserted
+                && FileManager.default.isExecutableFile(atPath: $0)
+        }
     }
 
     public static func hasReliableTextLayer(_ pageTexts: [String?]) -> Bool {
