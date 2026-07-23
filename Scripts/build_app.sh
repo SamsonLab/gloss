@@ -40,15 +40,7 @@ case "$CODEX_RUNTIME_MODE" in
     exit 1
     ;;
 esac
-SIGN_IDENTITY="${GLOSS_SIGN_IDENTITY:-}"
-if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
-  SIGN_IDENTITY="$(
-    security find-identity -v -p codesigning \
-      | sed -nE 's/.*"(Apple Development: [^"]+)".*/\1/p' \
-      | sed -n '1p'
-  )"
-fi
-SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+SIGN_IDENTITY="${GLOSS_SIGN_IDENTITY:--}"
 
 if [[ ! -x "$PLUGIN_DIR/node_modules/.bin/wxt" ]]; then
   npm --prefix "$PLUGIN_DIR" ci

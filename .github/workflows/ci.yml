@@ -46,7 +46,13 @@ jobs:
             0.0.0 \
             "$temporary_directory/release" \
             v0.0.0 \
-            "${GITHUB_REPOSITORY}"
+            SunChJ/gloss-releases
+          grep -F \
+            'https://github.com/SunChJ/gloss-releases/releases/download/v0.0.0/' \
+            "$temporary_directory/release/gloss-release-manifest.json"
+          grep -F \
+            'https://github.com/SunChJ/gloss-releases/releases/download/v0.0.0/' \
+            "$temporary_directory/release/Casks/gloss.rb"
           (
             cd "$temporary_directory/release"
             shasum -a 256 --check SHA256SUMS

@@ -12,16 +12,42 @@ on:
         type: string
 
 permissions:
-  actions: write
-  contents: write
+  contents: read
+
+env:
+  GLOSS_RELEASE_REPOSITORY: SunChJ/gloss-releases
+  GLOSS_HOMEBREW_TAP_REPOSITORY: SunChJ/homebrew-tap
+  GLOSS_HOMEBREW_WORKFLOW: update-cask.yml
 
 concurrency:
   group: release-${{ github.ref_name }}-${{ inputs.release_tag }}
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    name: Validate publication credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require release credentials
+        env:
+          DISTRIBUTION_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
+          EXTENSION_TOKEN: ${{ secrets.GLOSS_EXTENSION_TOKEN }}
+        run: |
+          missing=()
+          [[ -n "$EXTENSION_TOKEN" ]] || missing+=("GLOSS_EXTENSION_TOKEN")
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            [[ -n "$DISTRIBUTION_TOKEN" ]] || missing+=("GLOSS_DISTRIBUTION_TOKEN")
+          fi
+          if [[ ${#missing[@]} -ne 0 ]]; then
+            printf 'Release workflow requires secret: %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
   build:
     name: Build macOS ${{ matrix.architecture }}
+    needs:
+      - preflight
     strategy:
       fail-fast: false
       matrix:
@@ -34,43 +60,21 @@ jobs:
     timeout-minutes: 90
     env:
       RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
-      HAS_DEVELOPER_ID_CERTIFICATE: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 != '' }}
-      HAS_NOTARY_CREDENTIALS: ${{ secrets.APPLE_NOTARY_PASSWORD != '' }}
+      GLOSS_SIGN_IDENTITY: "-"
     steps:
       - name: Check out Gloss
         uses: actions/checkout@v4
         with:
           path: gloss
           ref: ${{ github.event_name == 'push' && github.ref || inputs.release_tag }}
-      - name: Require signing and notarization for published releases
-        if: github.event_name == 'push'
-        env:
-          CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
-          SIGN_IDENTITY: ${{ secrets.DEVELOPER_ID_APPLICATION }}
-          KEYCHAIN_PASSWORD: ${{ secrets.RELEASE_KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          missing=()
-          [[ -n "$CERTIFICATE_BASE64" ]] || missing+=("DEVELOPER_ID_CERTIFICATE_BASE64")
-          [[ -n "$CERTIFICATE_PASSWORD" ]] || missing+=("DEVELOPER_ID_CERTIFICATE_PASSWORD")
-          [[ -n "$SIGN_IDENTITY" ]] || missing+=("DEVELOPER_ID_APPLICATION")
-          [[ -n "$KEYCHAIN_PASSWORD" ]] || missing+=("RELEASE_KEYCHAIN_PASSWORD")
-          [[ -n "$APPLE_ID" ]] || missing+=("APPLE_NOTARY_APPLE_ID")
-          [[ -n "$APPLE_NOTARY_PASSWORD" ]] || missing+=("APPLE_NOTARY_PASSWORD")
-          [[ -n "$APPLE_TEAM_ID" ]] || missing+=("APPLE_TEAM_ID")
-          if [[ ${#missing[@]} -ne 0 ]]; then
-            printf 'Published releases require secret: %s\n' "${missing[@]}" >&2
-            exit 1
-          fi
       - name: Check out browser extensions
         uses: actions/checkout@v4
         with:
           repository: SunChJ/personal-immersive-translator
           ref: 3e9c7c8cb75ce4b08e56a714ee0e4eb7ebaa652e
           path: personal-immersive-translator
+          token: ${{ secrets.GLOSS_EXTENSION_TOKEN }}
+          persist-credentials: false
       - name: Validate release version and runner architecture
         working-directory: gloss
         env:
@@ -86,62 +90,18 @@ jobs:
             echo "Runner architecture $(uname -m) does not match $EXPECTED_ARCHITECTURE." >&2
             exit 1
           fi
-      - name: Import Developer ID certificate
-        if: env.HAS_DEVELOPER_ID_CERTIFICATE == 'true'
-        env:
-          CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.RELEASE_KEYCHAIN_PASSWORD }}
-          SIGN_IDENTITY: ${{ secrets.DEVELOPER_ID_APPLICATION }}
-        run: |
-          certificate="$RUNNER_TEMP/developer-id.p12"
-          keychain="$RUNNER_TEMP/gloss-release.keychain-db"
-          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode >"$certificate"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security import "$certificate" \
-            -k "$keychain" \
-            -P "$CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign \
-            -T /usr/bin/security
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s \
-            -k "$KEYCHAIN_PASSWORD" \
-            "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain-db
-          echo "GLOSS_SIGN_IDENTITY=$SIGN_IDENTITY" >>"$GITHUB_ENV"
       - name: Build Gloss.app
         working-directory: gloss
         run: Scripts/build_app.sh
-      - name: Verify app architecture and Developer ID signature
+      - name: Verify app architecture and ad-hoc signature
         working-directory: gloss
         env:
           EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
         run: |
           lipo -verify_arch "$EXPECTED_ARCHITECTURE" dist/Gloss.app/Contents/MacOS/Gloss
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            codesign --verify --deep --strict --verbose=2 dist/Gloss.app
-            codesign --display --verbose=4 dist/Gloss.app 2>&1 \
-              | grep -F "Authority=Developer ID Application:"
-          fi
-      - name: Notarize and staple
-        if: env.HAS_NOTARY_CREDENTIALS == 'true'
-        working-directory: gloss
-        env:
-          APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          /usr/bin/ditto -c -k --keepParent dist/Gloss.app "$RUNNER_TEMP/Gloss-notary.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/Gloss-notary.zip" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_NOTARY_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait
-          xcrun stapler staple dist/Gloss.app
-          xcrun stapler validate dist/Gloss.app
+          codesign --verify --deep --strict --verbose=2 dist/Gloss.app
+          codesign --display --verbose=4 dist/Gloss.app 2>&1 \
+            | grep -F "Signature=adhoc"
       - name: Package architecture-specific app
         working-directory: gloss
         env:
@@ -187,7 +147,7 @@ jobs:
             "$version" \
             dist/release \
             "$RELEASE_TAG" \
-            "$GITHUB_REPOSITORY"
+            "$GLOSS_RELEASE_REPOSITORY"
       - name: Upload combined workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -203,12 +163,28 @@ jobs:
         if: github.event_name == 'push'
         working-directory: gloss
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
         run: |
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --generate-notes
+          version="${RELEASE_TAG#v}"
+          if ! gh release view "$RELEASE_TAG" \
+            --repo "$GLOSS_RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            notes_file="docs/release-notes/v$version.md"
+            if [[ -f "$notes_file" ]]; then
+              gh release create "$RELEASE_TAG" \
+                --repo "$GLOSS_RELEASE_REPOSITORY" \
+                --target main \
+                --title "Gloss $version" \
+                --notes-file "$notes_file"
+            else
+              gh release create "$RELEASE_TAG" \
+                --repo "$GLOSS_RELEASE_REPOSITORY" \
+                --target main \
+                --title "Gloss $version" \
+                --notes "Checksum-pinned, ad-hoc signed macOS release of Gloss $version."
+            fi
           fi
           gh release upload "$RELEASE_TAG" \
+            --repo "$GLOSS_RELEASE_REPOSITORY" \
             dist/release/Gloss-macos-arm64.zip \
             dist/release/Gloss-macos-x86_64.zip \
             dist/release/SHA256SUMS \
@@ -217,7 +193,11 @@ jobs:
             --clobber
       - name: Start Homebrew cask update
         if: github.event_name == 'push'
-        working-directory: gloss
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run homebrew-cask.yml --ref main -f release_tag="$RELEASE_TAG"
+          GH_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
+        run: |
+          gh workflow run "$GLOSS_HOMEBREW_WORKFLOW" \
+            --repo "$GLOSS_HOMEBREW_TAP_REPOSITORY" \
+            --ref main \
+            -f release_tag="$RELEASE_TAG" \
+            -f release_repository="$GLOSS_RELEASE_REPOSITORY"

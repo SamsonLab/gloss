@@ -11,7 +11,7 @@ X86_64_ARCHIVE="$2"
 VERSION="$3"
 OUTPUT_DIRECTORY="$4"
 RELEASE_TAG="$5"
-REPOSITORY="${6:-${GITHUB_REPOSITORY:-SunChJ/gloss}}"
+REPOSITORY="${6:-${GLOSS_RELEASE_REPOSITORY:-SunChJ/gloss-releases}}"
 ASSET_BASE_URL="${7:-https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG}"
 
 for archive in "$ARM64_ARCHIVE" "$X86_64_ARCHIVE"; do
@@ -144,7 +144,7 @@ MANIFEST_SHA256="$(shasum -a 256 "$MANIFEST_PATH" | awk '{print $1}')"
 } >"$CHECKSUMS_PATH"
 
 GLOSS_CASK_DOWNLOAD_BASE_URL="$ASSET_BASE_URL" \
-  "$(dirname "$0")/generate_homebrew_cask.sh" \
+  bash "$(dirname "$0")/generate_homebrew_cask.sh" \
   "$VERSION" \
   "$ARM64_SHA256" \
   "$X86_64_SHA256" \
@@ -153,7 +153,7 @@ GLOSS_CASK_DOWNLOAD_BASE_URL="$ASSET_BASE_URL" \
   "$REPOSITORY" \
   "$ARM64_NAME" \
   "$X86_64_NAME"
-"$(dirname "$0")/validate_homebrew_cask.sh" \
+bash "$(dirname "$0")/validate_homebrew_cask.sh" \
   "$OUTPUT_DIRECTORY/Casks/gloss.rb"
 
 echo "$MANIFEST_PATH"
