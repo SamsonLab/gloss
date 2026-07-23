@@ -84,4 +84,9 @@ jobs:
       - name: Verify runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - name: Build release products
-        run: swift build --configuration release
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          swift build --configuration release
+          release_binary="$(swift build --configuration release --show-bin-path)/Gloss"
+          lipo "$release_binary" -verify_arch "$EXPECTED_ARCHITECTURE"

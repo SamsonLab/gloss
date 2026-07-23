@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing tag to package without publishing
+        description: Existing tag to package
         required: true
         type: string
+      publish_release:
+        description: Publish the existing tag and update the Homebrew tap
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -33,10 +38,11 @@ jobs:
         env:
           DISTRIBUTION_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
           EXTENSION_SSH_KEY: ${{ secrets.GLOSS_EXTENSION_SSH_KEY }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'push' || inputs.publish_release }}
         run: |
           missing=()
           [[ -n "$EXTENSION_SSH_KEY" ]] || missing+=("GLOSS_EXTENSION_SSH_KEY")
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
             [[ -n "$DISTRIBUTION_TOKEN" ]] || missing+=("GLOSS_DISTRIBUTION_TOKEN")
           fi
           if [[ ${#missing[@]} -ne 0 ]]; then
@@ -99,7 +105,7 @@ jobs:
         env:
           EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
         run: |
-          lipo -verify_arch "$EXPECTED_ARCHITECTURE" dist/Gloss.app/Contents/MacOS/Gloss
+          lipo dist/Gloss.app/Contents/MacOS/Gloss -verify_arch "$EXPECTED_ARCHITECTURE"
           codesign --verify --deep --strict --verbose=2 dist/Gloss.app
           codesign --display --verbose=4 dist/Gloss.app 2>&1 \
             | grep -F "Signature=adhoc"
@@ -161,7 +167,7 @@ jobs:
             gloss/dist/release/Casks/gloss.rb
           if-no-files-found: error
       - name: Publish GitHub release assets
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || inputs.publish_release
         working-directory: gloss
         env:
           GH_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
@@ -207,7 +213,7 @@ jobs:
             --repo "$GLOSS_RELEASE_REPOSITORY" \
             --draft=false
       - name: Start Homebrew cask update
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || inputs.publish_release
         env:
           GH_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
         run: |
