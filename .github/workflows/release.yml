@@ -166,19 +166,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GLOSS_DISTRIBUTION_TOKEN }}
         run: |
           version="${RELEASE_TAG#v}"
-          if ! gh release view "$RELEASE_TAG" \
-            --repo "$GLOSS_RELEASE_REPOSITORY" >/dev/null 2>&1; then
+          if release_is_draft="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GLOSS_RELEASE_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft' 2>/dev/null
+          )"; then
+            if [[ "$release_is_draft" != "true" ]]; then
+              echo "Release $RELEASE_TAG is already published and must remain immutable." >&2
+              exit 1
+            fi
+          else
             notes_file="docs/release-notes/v$version.md"
             if [[ -f "$notes_file" ]]; then
               gh release create "$RELEASE_TAG" \
                 --repo "$GLOSS_RELEASE_REPOSITORY" \
                 --target main \
+                --draft \
                 --title "Gloss $version" \
                 --notes-file "$notes_file"
             else
               gh release create "$RELEASE_TAG" \
                 --repo "$GLOSS_RELEASE_REPOSITORY" \
                 --target main \
+                --draft \
                 --title "Gloss $version" \
                 --notes "Checksum-pinned, ad-hoc signed macOS release of Gloss $version."
             fi
@@ -191,6 +202,9 @@ jobs:
             dist/release/gloss-release-manifest.json \
             dist/release/Casks/gloss.rb \
             --clobber
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GLOSS_RELEASE_REPOSITORY" \
+            --draft=false
       - name: Start Homebrew cask update
         if: github.event_name == 'push'
         env:

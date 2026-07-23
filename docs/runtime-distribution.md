@@ -196,11 +196,16 @@ brew upgrade --cask sunchj/tap/gloss
 3. 确认两个公开仓库、`update-cask.yml`、`GLOSS_EXTENSION_TOKEN`、
    `GLOSS_DISTRIBUTION_TOKEN` 和 tap 的 Actions/branch protection 设置均已就绪。
 4. 在私有 Gloss 仓库的目标 commit 上创建并推送 tag，例如 `v0.8.0`。
-5. 等待 Gloss Release workflow 完成 ad-hoc 签名、公开资产上传和 tap dispatch。
+5. 等待 Gloss Release workflow 完成 ad-hoc 签名；workflow 会先创建 draft Release，上传全部
+   资产后再发布，最后 dispatch tap 更新。
 6. 在 `SunChJ/gloss-releases` 验证两种架构 zip、`SHA256SUMS`、
    `gloss-release-manifest.json` 与 `Casks/gloss.rb` 均存在且 URL 指向该公开 Release。
 7. 审阅并合并 `SunChJ/homebrew-tap` 生成的 Cask PR，然后在 arm64 与 x86_64 Mac 上分别执行
    `brew install --cask sunchj/tap/gloss` smoke test。
+
+`SunChJ/gloss-releases` 必须启用 GitHub release immutability。已发布 Release 的 tag 与资产
+不可覆盖；相同 tag 的 workflow 重跑会 fail closed。上传中断时 Release 仍保持 draft，
+重跑可以修复 draft 资产并重新发布。
 
 如果公开 Release 已成功但 tap dispatch 失败，可以从 `SunChJ/homebrew-tap` Actions 页面手工
 运行 `update-cask.yml`，输入相同的 tag 和固定 repository
