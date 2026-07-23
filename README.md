@@ -138,7 +138,7 @@ swift run gloss-cli --provider llama 'Hello from local Gloss.'
 open dist/Gloss.app
 ```
 
-构建脚本会按 `CodexRuntime.lock` 下载并校验固定版本的官方 Rust app-server，把它与许可证一起嵌入 App；本地 provider 当前复用系统安装的 `llama-server`。随后脚本在相邻的 `personal-immersive-translator` 仓库中生成 Chrome/Safari 产物，并把 Chrome 资源与 Safari `.appex` 嵌入 App。结果位于 `dist/Gloss.app`。脚本会优先使用钥匙串中的第一个 Apple Development 身份；没有可用证书时退回临时签名，此时 Safari 配对不可用。正式分发前需要换成 Developer ID 签名和公证。
+构建脚本会按 `CodexRuntime.lock` 下载并校验固定版本的官方 Rust app-server，把它与许可证一起嵌入 App；本地 provider 当前复用系统安装的 `llama-server`。随后脚本在相邻的 `personal-immersive-translator` 仓库中生成 Chrome/Safari 产物，并把 Chrome 资源与 Safari `.appex` 嵌入 App。结果位于 `dist/Gloss.app`。脚本默认使用 `-` 做 ad-hoc codesign；这种签名没有 Apple 开发者身份，Safari 配对不可用。
 
 如果不希望下载或嵌入固定 Rust app-server，可构建依赖用户 Codex CLI 的轻量版本：
 
@@ -148,13 +148,13 @@ open dist/Gloss.app
 
 该脚本会先确认当前环境中的 `codex app-server` 可用，但不会把 Codex runtime、许可证或版本锁文件放入 App。运行时 Gloss 会查找 `GLOSS_CODEX_BIN`、`PATH`、Homebrew 与常用本地安装路径，并执行 `codex app-server --listen stdio://`。进程与 thread 仍统一经过 `CodexAppServerClient`，因此会复用相同的静态模型目录、隔离工作目录和 MCP/skills/tools 禁用配置，不会退回较慢的默认启动方式。
 
-需要稳定的本机开发签名时，可显式传入钥匙串中的证书：
+本机调试 Safari 配对时，可显式传入钥匙串中的 Apple Development 证书：
 
 ```bash
 GLOSS_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./Scripts/build_app.sh
 ```
 
-正式分发时使用 `Developer ID Application` 证书执行同一命令；脚本会自动启用 Hardened Runtime 与可信时间戳。随后仍需用 Apple `notarytool` 公证并对 App 执行 `stapler staple`。
+当前公开 Homebrew 发行也明确使用 ad-hoc 签名，不要求 Developer ID 或 Apple 公证。
 
 ### BabelDOC runtime 更新
 
@@ -169,22 +169,25 @@ atomic state file 防止半安装状态。完整 manifest schema、安全边界�
 
 推送与 `Resources/Info.plist` 一致的 `v*` tag 会运行 Release workflow，产出
 arm64 与 x86_64 两套 `Gloss.app` zip、`SHA256SUMS`、release manifest 和带
-`on_arm` / `on_intel` 校验的 Homebrew cask。Release 完成后，自动化会在本仓库创建
-`Casks/gloss.rb` 更新 PR；不依赖额外的外部 tap 仓库。
+`on_arm` / `on_intel` 校验的 Homebrew cask。私有 `SunChJ/gloss` 只负责构建；ad-hoc
+签名后的资产发布到公开 `SunChJ/gloss-releases`，随后自动 dispatch
+`SunChJ/homebrew-tap` 更新 Cask。下载 URL 不会指向私有主仓。
 
-当前 Gloss 仓库仍是 private，匿名 Homebrew 安装需要先提供 public GitHub Release 或其他公共
-binary host。公开发行地址就绪后，首次安装以及后续升级为：
+首次安装以及后续升级为：
 
 ```bash
-brew tap sunchj/gloss https://github.com/SunChJ/gloss
-brew install --cask sunchj/gloss/gloss
+brew tap sunchj/tap
+brew install --cask sunchj/tap/gloss
 brew update
-brew upgrade --cask gloss
+brew upgrade --cask sunchj/tap/gloss
 ```
 
-正式 tag Release 必须同时具备 Developer ID 与 Apple 公证 secrets，否则 workflow 会在上传
-public Release 和 Homebrew cask 前 fail closed。没有签名凭据时，手工 workflow 只会生成适合
-内部验证的 ad-hoc artifact。具体变量、私有仓库限制与本地打包命令见
+Release workflow 使用只读 `GLOSS_EXTENSION_TOKEN` 检出私有浏览器扩展；正式 tag 另外要求
+跨仓库 `GLOSS_DISTRIBUTION_TOKEN`。缺失时 workflow 会在构建和上传前 fail closed。手工
+workflow 不发布，但仍需要 extension token 才能生成完整 App artifact。
+Cask 的 `postflight` 会重新 ad-hoc 签名、移除 quarantine 并验证签名，让安装后启动不弹
+Gatekeeper 交互；这也意味着 macOS 无法验证 Apple 开发者身份或公证票据。公开仓库初始化、
+fine-grained token 权限、完整安全取舍、发行顺序与恢复步骤见
 [发行文档](docs/runtime-distribution.md)。
 
 ## 代码结构
