@@ -803,6 +803,9 @@ public struct BabelDOCExecutorClient: Sendable {
                     timeline: timeline,
                     onProgress: onProgress
                 )
+                try await waitForWorkerToFinish(
+                    executionID: created.executionID
+                )
                 connection.stateHandler(
                     .init(
                         taskID: taskID,
@@ -873,6 +876,27 @@ public struct BabelDOCExecutorClient: Sendable {
             Task {
                 _ = try? await cancel(executionID: value)
             }
+        }
+    }
+
+    func waitForWorkerToFinish(
+        executionID: String,
+        timeout: Duration = .seconds(30),
+        pollInterval: Duration = .milliseconds(100)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            let snapshot = try await execution(id: executionID)
+            if snapshot.workerFinished {
+                return
+            }
+            guard clock.now < deadline else {
+                throw BabelDOCExecutorError.unavailable(
+                    "PDF worker 完成后未能及时释放执行槽"
+                )
+            }
+            try await Task.sleep(for: pollInterval)
         }
     }
 
