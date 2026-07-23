@@ -270,6 +270,13 @@ final class BabelDOCExecutorClientTests: XCTestCase {
                         connection: fixture.connection
                     ),
                 ])
+            case ("GET", "/v1/executions/execution-1"):
+                return .json(
+                    Self.executionSnapshot(
+                        executionID: "execution-1",
+                        status: "succeeded"
+                    )
+                )
             default:
                 return .json(["code": "not_found", "message": "not found"], status: 404)
             }
@@ -321,6 +328,37 @@ final class BabelDOCExecutorClientTests: XCTestCase {
         XCTAssertTrue(String(decoding: encodedBody, as: UTF8.self).contains("bridge-secret"))
     }
 
+    func testTranslationWaitsUntilWorkerReleasesExecutionSlot() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let attempts = LockedValues<Int>()
+
+        StubExecutorURLProtocol.setHandler { request in
+            guard
+                request.httpMethod == "GET",
+                request.url?.path == "/v1/executions/execution-cleanup"
+            else {
+                return .json(["code": "not_found", "message": "not found"], status: 404)
+            }
+            attempts.append(1)
+            return .json(
+                Self.executionSnapshot(
+                    executionID: "execution-cleanup",
+                    status: "succeeded",
+                    workerFinished: attempts.snapshot().count >= 3
+                )
+            )
+        }
+
+        try await fixture.client().waitForWorkerToFinish(
+            executionID: "execution-cleanup",
+            timeout: .seconds(1),
+            pollInterval: .milliseconds(1)
+        )
+
+        XCTAssertEqual(attempts.snapshot().count, 3)
+    }
+
     func testReplayGapRecoversSucceededOutputFromAuthoritativeSnapshot() async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -365,6 +403,13 @@ final class BabelDOCExecutorClientTests: XCTestCase {
                             lastSequence: 24
                         ),
                     ], status: 410)
+            case ("GET", "/v1/executions/execution-gap"):
+                return .json(
+                    Self.executionSnapshot(
+                        executionID: "execution-gap",
+                        status: "succeeded"
+                    )
+                )
             default:
                 return .json(["code": "not_found", "message": "not found"], status: 404)
             }
@@ -571,7 +616,8 @@ final class BabelDOCExecutorClientTests: XCTestCase {
         taskID: String = "task-1",
         initialSequence: Int = 10,
         firstAvailableSequence: Int? = 11,
-        lastSequence: Int = 12
+        lastSequence: Int = 12,
+        workerFinished: Bool? = nil
     ) -> [String: Any] {
         [
             "execution_id": executionID,
@@ -582,7 +628,9 @@ final class BabelDOCExecutorClientTests: XCTestCase {
                 firstAvailableSequence.map { $0 as Any }
                 ?? (NSNull() as Any),
             "last_sequence": lastSequence,
-            "worker_finished": status != "running" && status != "cancelling",
+            "worker_finished":
+                workerFinished
+                ?? (status != "running" && status != "cancelling"),
             "created_at": 1_000.0,
             "finished_at": status == "running" ? NSNull() : 1_001.0,
         ]
