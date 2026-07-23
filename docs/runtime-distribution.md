@@ -106,10 +106,10 @@ active runtime。
 | `GLOSS_EXTENSION_SSH_KEY` | 只读检出私有 `SunChJ/personal-immersive-translator` |
 | `GLOSS_DISTRIBUTION_TOKEN` | 向公开 binary repo 上传 Release，并 dispatch 公开 tap workflow |
 
-workflow 的第一个 job 始终检查 `GLOSS_EXTENSION_SSH_KEY`；tag 事件还会检查
-`GLOSS_DISTRIBUTION_TOKEN`。缺失即 fail closed，不会开始正式构建。手工
-`workflow_dispatch` 不走 public publication 路径，因此不需要 distribution token，但仍需
-只读 extension deploy key 才能构建完整 App。
+workflow 的第一个 job 始终检查 `GLOSS_EXTENSION_SSH_KEY`；tag 事件以及显式开启
+`publish_release` 的手工恢复任务还会检查 `GLOSS_DISTRIBUTION_TOKEN`。缺失即 fail closed，
+不会开始正式构建。手工 `workflow_dispatch` 默认不走 public publication 路径，因此不需要
+distribution token，但仍需只读 extension deploy key 才能构建完整 App。
 
 ### 公开仓库与凭据初始化
 
@@ -211,6 +211,11 @@ brew upgrade --cask sunchj/tap/gloss
 运行 `update-cask.yml`，输入相同的 tag 和固定 repository
 `SunChJ/gloss-releases`。不要从私有 Gloss Release 或未经 `SHA256SUMS` 验证的临时 URL
 生成公开 Cask。
+
+如果 tag 触发的工作流在公开 Release 创建前因工作流本身失败，先在 `main` 修复工作流，再从
+Gloss 的 Actions 页面手工运行 Release，输入原 `release_tag` 并显式开启
+`publish_release`。恢复任务仍检出原 tag、校验 tag 与 App 版本完全一致，并拒绝覆盖已经发布的
+不可变 Release；不要移动或重建失败的 tag。
 
 ### Ad-hoc 分发的安全取舍
 
