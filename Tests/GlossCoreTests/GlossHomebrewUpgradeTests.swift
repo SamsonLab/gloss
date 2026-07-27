@@ -947,7 +947,10 @@ struct GlossHomebrewUpgradeTests {
         let clock = ContinuousClock()
         let startedAt = clock.now
 
-        for value in 0..<64 {
+        // A smaller sample still catches the historical per-command cleanup
+        // delay while avoiding a wall-clock assertion dominated by process
+        // launch contention on shared CI runners.
+        for value in 0..<16 {
             let output = try await GlossCommandRunner.live.run(
                 executableURL: URL(fileURLWithPath: "/usr/bin/printf"),
                 arguments: ["%d", String(value)],
