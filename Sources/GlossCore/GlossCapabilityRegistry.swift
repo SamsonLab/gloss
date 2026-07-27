@@ -156,6 +156,11 @@ public struct GlossCLICommandMapping: Codable, Equatable, Sendable {
 }
 
 public struct GlossCapabilityRegistry: Equatable, Sendable {
+    private static let browserAdapterCapabilities: Set<GlossCapability> = [
+        .chromeExtension,
+        .safariExtension,
+    ]
+
     /// The focused product surface. Secondary scenarios remain defined and can be
     /// restored by constructing a registry with a larger set.
     public static let defaultEnabledScenarios: Set<GlossBusinessScenario> = [
@@ -190,19 +195,39 @@ public struct GlossCapabilityRegistry: Equatable, Sendable {
         .pdfExport,
     ]
 
-    public static let current = GlossCapabilityRegistry()
+    public static let current = GlossCapabilityRegistry(
+        distributionProfile: .current
+    )
 
-    public let enabledScenarios: Set<GlossBusinessScenario>
+    private let configuredScenarios: Set<GlossBusinessScenario>
+    public let unavailableCapabilities: Set<GlossCapability>
 
     public init(
-        enabledScenarios: Set<GlossBusinessScenario> = Self.defaultEnabledScenarios
+        enabledScenarios: Set<GlossBusinessScenario> = Self.defaultEnabledScenarios,
+        distributionProfile: GlossDistributionProfile = .current
     ) {
-        self.enabledScenarios = enabledScenarios
+        configuredScenarios = enabledScenarios
+        unavailableCapabilities =
+            distributionProfile.safariExtensionAvailable
+            ? []
+            : [.safariExtension]
+    }
+
+    public var enabledScenarios: Set<GlossBusinessScenario> {
+        configuredScenarios.filter(isAvailable)
+    }
+
+    public var availableCoreCapabilities: Set<GlossCapability> {
+        Self.coreExecutionCapabilities.subtracting(unavailableCapabilities)
     }
 
     public var enabledCapabilities: Set<GlossCapability> {
-        enabledScenarios.reduce(into: Self.infrastructureCapabilities) {
-            $0.formUnion($1.requiredCapabilities)
+        enabledScenarios.reduce(
+            into: Self.infrastructureCapabilities.subtracting(
+                unavailableCapabilities
+            )
+        ) {
+            $0.formUnion(availableCapabilities(for: $1))
         }
     }
 
@@ -217,7 +242,7 @@ public struct GlossCapabilityRegistry: Equatable, Sendable {
                 $0.rawValue < $1.rawValue
             }
             let scenarioCapabilities =
-                scenario?.requiredCapabilities.sorted {
+                scenario.map(availableCapabilities(for:))?.sorted {
                     $0.rawValue < $1.rawValue
                 } ?? []
             return GlossCLICommandMapping(
@@ -236,7 +261,34 @@ public struct GlossCapabilityRegistry: Equatable, Sendable {
     }
 
     public func isEnabled(_ scenario: GlossBusinessScenario) -> Bool {
-        enabledScenarios.contains(scenario)
+        configuredScenarios.contains(scenario) && isAvailable(scenario)
+    }
+
+    public func isAvailable(_ scenario: GlossBusinessScenario) -> Bool {
+        let required = scenario.requiredCapabilities
+        let unavailableRequired = required.intersection(
+            unavailableCapabilities
+        )
+        guard scenario == .browserTranslation else {
+            return unavailableRequired.isEmpty
+        }
+
+        let unavailableBase = unavailableRequired.subtracting(
+            Self.browserAdapterCapabilities
+        )
+        let availableAdapters = Self.browserAdapterCapabilities
+            .intersection(required)
+            .subtracting(unavailableCapabilities)
+        return unavailableBase.isEmpty && !availableAdapters.isEmpty
+    }
+
+    public func availableCapabilities(
+        for scenario: GlossBusinessScenario
+    ) -> Set<GlossCapability> {
+        guard isAvailable(scenario) else { return [] }
+        return scenario.requiredCapabilities.subtracting(
+            unavailableCapabilities
+        )
     }
 
     public func supports(_ capability: GlossCapability) -> Bool {

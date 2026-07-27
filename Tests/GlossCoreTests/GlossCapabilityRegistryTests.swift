@@ -22,6 +22,43 @@ final class GlossCapabilityRegistryTests: XCTestCase {
         XCTAssertTrue(registry.supports(.safariExtension))
     }
 
+    func testAdHocDistributionKeepsBrowserScenarioWithChromeOnly() {
+        let registry = GlossCapabilityRegistry(
+            distributionProfile: GlossDistributionProfile(
+                safariExtensionAvailable: false
+            )
+        )
+
+        XCTAssertTrue(registry.isEnabled(.browserTranslation))
+        XCTAssertTrue(registry.supports(.browserBridge))
+        XCTAssertTrue(registry.supports(.chromeExtension))
+        XCTAssertFalse(registry.supports(.safariExtension))
+        XCTAssertFalse(
+            registry.availableCoreCapabilities.contains(.safariExtension)
+        )
+
+        let browser = registry.commandMappings.first {
+            $0.command == .browser
+        }
+        XCTAssertEqual(browser?.enabled, true)
+        XCTAssertEqual(
+            browser?.scenarioCapabilities.contains(.chromeExtension),
+            true
+        )
+        XCTAssertEqual(
+            browser?.scenarioCapabilities.contains(.safariExtension),
+            false
+        )
+
+        let report = GlossCapabilitiesReport(registry: registry)
+        XCTAssertTrue(
+            report.enabledScenarios.contains(.browserTranslation)
+        )
+        XCTAssertFalse(
+            report.availableCoreCapabilities.contains(.safariExtension)
+        )
+    }
+
     func testDefaultPDFScenarioSupportsRuntimeAndBatchQueue() {
         let registry = GlossCapabilityRegistry()
 

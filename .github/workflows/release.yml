@@ -108,6 +108,12 @@ jobs:
           EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
         run: |
           lipo dist/Gloss.app/Contents/MacOS/Gloss -verify_arch "$EXPECTED_ARCHITECTURE"
+          test ! -e "dist/Gloss.app/Contents/PlugIns/Gloss Extension.appex"
+          test "$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :GlossSafariExtensionAvailable' \
+              dist/Gloss.app/Contents/Info.plist
+          )" = "false"
           codesign --verify --deep --strict --verbose=2 dist/Gloss.app
           codesign --display --verbose=4 dist/Gloss.app 2>&1 \
             | grep -F "Signature=adhoc"

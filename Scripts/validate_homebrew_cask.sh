@@ -29,7 +29,6 @@ required = [
   /^  postflight do$/,
   %r{^    system_command "/usr/bin/codesign",$},
   %r{^      system_command "/usr/bin/codesign",$},
-  %r{#\{app_path\}/Contents/PlugIns/Gloss Extension\.appex},
   %r{#\{app_path\}/Contents/Helpers/gloss-codex-app-server},
   %r{#\{app_path\}/Contents/Helpers/gloss-cli},
   %r{#\{app_path\}/Contents/Helpers/gloss-update-helper},
@@ -48,11 +47,13 @@ required = [
 ]
 missing = required.reject { |pattern| content.match?(pattern) }
 abort "Cask is missing required declarations: #{missing.join(", ")}" unless missing.empty?
+if content.include?("Gloss Extension.appex")
+  abort "Ad-hoc Homebrew cask must not contain a Safari App Extension"
+end
 
 code_paths = content.match(%r{^    code_paths = \[$(.*?)^    \]$}m)&.[](1)
 abort "Cask explicit signing paths are missing" unless code_paths
 expected_order = [
-  "extension_path,",
   '"#{app_path}/Contents/Helpers/gloss-codex-app-server",',
   '"#{app_path}/Contents/Helpers/gloss-cli",',
   '"#{app_path}/Contents/Helpers/gloss-update-helper",',

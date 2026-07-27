@@ -375,19 +375,20 @@ public struct GlossCapabilitiesReport: Codable, Equatable, Sendable {
         registry: GlossCapabilityRegistry = .current
     ) {
         schemaVersion = 1
-        availableCoreCapabilities =
-            GlossCapabilityRegistry.coreExecutionCapabilities.sorted {
-                $0.rawValue < $1.rawValue
-            }
+        availableCoreCapabilities = registry.availableCoreCapabilities.sorted {
+            $0.rawValue < $1.rawValue
+        }
         enabledCoreCapabilities = registry.enabledCoreCapabilities.sorted {
             $0.rawValue < $1.rawValue
         }
         enabledCapabilities = registry.enabledCapabilities.sorted {
             $0.rawValue < $1.rawValue
         }
-        availableScenarios = GlossBusinessScenario.allCases.sorted {
-            $0.rawValue < $1.rawValue
-        }
+        availableScenarios = GlossBusinessScenario.allCases
+            .filter(registry.isAvailable)
+            .sorted {
+                $0.rawValue < $1.rawValue
+            }
         enabledScenarios = registry.enabledScenarios.sorted {
             $0.rawValue < $1.rawValue
         }

@@ -1,7 +1,7 @@
 # Gloss
 
 Gloss 是一款 macOS 原生翻译工具。当前默认产品面聚焦两条已经闭环的业务场景：
-Safari/Chrome 浏览器翻译，以及保留版式的 PDF 批量翻译。
+Chrome 浏览器翻译（Apple 签名构建同时支持 Safari），以及保留版式的 PDF 批量翻译。
 
 ## 核心能力与业务场景
 
@@ -11,10 +11,11 @@ Gloss 不再按窗口堆叠功能，而是由可复用核心能力拼装业务�
 
 | 默认场景 | 组合的主要能力 | macOS 入口 | CLI 映射 |
 | --- | --- | --- | --- |
-| 浏览器翻译 | 文本翻译、Provider/语言路由、本机回环桥接、Safari/Chrome 适配 | Safari 与 Chrome 扩展 | `gloss-cli browser` |
+| 浏览器翻译 | 文本翻译、Provider/语言路由、本机回环桥接、Chrome 适配与 Apple 签名构建的 Safari 适配 | Chrome 扩展；Apple 签名构建另含 Safari 扩展 | `gloss-cli browser` |
 | PDF 翻译 | 文档翻译、版面分析、翻译桥接、BabelDOC runtime、批量队列、PDF 导出 | PDF 模块、Finder 打开与拖拽 | `gloss-cli pdf` |
 
-可使用 `gloss-cli capabilities --json` 获取稳定、机器可读的核心能力、启用场景和命令映射。
+可使用 `gloss-cli capabilities --json` 获取稳定、机器可读的核心能力、启用场景和命令映射；
+结果会反映当前分发包实际可用的浏览器适配器。
 剪贴板、OCR/截图、系统选区、术语表和历史记录的实现仍保留在代码中，但默认不启动相关监听，
 也不在主菜单和设置中展示。
 
@@ -31,7 +32,7 @@ Gloss 不再按窗口堆叠功能，而是由可复用核心能力拼装业务�
 - 本地选项使用 `Hy-MT2-1.8B-GGUF:Q4_K_M`，通过 Metal 运行，原文和译文都留在设备上
 - 使用结构化输出、只读沙盒和禁用工具的临时线程
 - 译文与原文在同一结果卡片中直接对照，并支持复制译文、替换原文和追加双语
-- 提供分开的 macOS 文本与图片“服务”入口，避免被系统归入错误分类
+- 保留 macOS 文本与图片“服务”的处理实现，但当前聚焦发行不向系统注册入口
 - 可翻译剪贴板图片、交互式截图及系统“服务”传入的图片或图片文件
 - 截图写入权限隔离的临时目录并在读取后立即删除，不占用系统剪贴板
 - 复制式选区与替换回退会恢复普通剪贴板；遇到密码管理器、临时内容、文件承诺或超大内容时不执行破坏性回退
@@ -44,8 +45,8 @@ Gloss 不再按窗口堆叠功能，而是由可复用核心能力拼装业务�
 - 缓存重复内容，并合并并发的相同请求
 - 默认使用低延迟的 `gpt-5.3-codex-spark`，最多并发执行 3 个独立翻译 turn；每次完成后回滚该 turn，避免跨批上下文累积
 - 内置只监听 `127.0.0.1` 的浏览器桥接，与扩展共享同一个翻译代理和缓存
-- Chrome 扩展与 Safari Web Extension 均随 `Gloss.app` 打包，共用 WXT 源码
-- 使用每机随机令牌鉴权：Chrome 自动注入 App 管理副本，Safari 通过 App Group 安全配对
+- Chrome 扩展与 Safari Web Extension 共用 WXT 源码；Safari 入口仅在 Apple 签名构建中启用
+- 使用每机随机令牌鉴权：Chrome 自动注入 App 管理副本，Apple 签名构建中的 Safari 通过 App Group 安全配对
 - 提供 `gloss-cli` 作为脚本与诊断入口
 
 ## 运行日志
@@ -70,12 +71,13 @@ tail -f ~/Library/Logs/Gloss/gloss.log
 2. 本地模型：安装 `llama.cpp`（`brew install llama.cpp`），然后在翻译引擎中选择“本地模型”。首次启动会从 Hugging Face 下载约 1.1 GB 的 Q4 模型。
 3. 重新启用选区翻译场景后，首次使用时需在系统设置中允许 Gloss 使用“辅助功能”。
 4. Chrome：在 Gloss 设置中点“显示扩展”，从 `chrome://extensions` 加载这个已自动配对的目录。
-5. Safari：在 Gloss 设置中点“Safari 设置”，启用随 App 内置的 Gloss Extension。
+5. Safari（仅 Apple 签名构建）：在 Gloss 设置中点“Safari 设置”，启用随 App 内置的
+   Gloss Extension。Homebrew 的 ad-hoc 构建不会显示这个入口。
 
 Gloss 的登录状态和 Codex 配置保存在 `~/Library/Application Support/Gloss/Codex/`，不会修改系统 Codex CLI 的数据。
 
-重新启用剪贴板或图片翻译场景后，系统“服务”入口仍由 macOS 管理，可在“系统设置 ›
-键盘 › 键盘快捷键 › 服务”中启用对应入口。
+剪贴板或图片翻译场景的处理代码仍保留，但当前构建不会注册系统“服务”；重新发布这些场景时
+需要同步恢复对应的 `NSServices` 构建配置。
 
 ## 开发
 
@@ -174,7 +176,12 @@ swift run gloss-cli --provider llama 'Hello from local Gloss.'
 open dist/Gloss.app
 ```
 
-构建脚本会按 `CodexRuntime.lock` 下载并校验固定版本的官方 Rust app-server，把它与许可证一起嵌入 App；本地 provider 当前复用系统安装的 `llama-server`。随后脚本在相邻的 `personal-immersive-translator` 仓库中生成 Chrome/Safari 产物，并把 Chrome 资源与 Safari `.appex` 嵌入 App。结果位于 `dist/Gloss.app`。脚本默认使用 `-` 做 ad-hoc codesign；这种签名没有 Apple 开发者身份，Safari 配对不可用。
+构建脚本会按 `CodexRuntime.lock` 下载并校验固定版本的官方 Rust app-server，把它与许可证一起
+嵌入 App；本地 provider 当前复用系统安装的 `llama-server`。随后脚本在相邻的
+`personal-immersive-translator` 仓库中生成 Chrome 产物。只有显式传入 Apple 签名身份以及
+宿主与扩展的 provisioning profile 时，才会同时构建并嵌入 Safari `.appex`。结果位于
+`dist/Gloss.app`。脚本默认使用 `-` 做 ad-hoc codesign，因此不会把无法完成身份配对的
+Safari 扩展放进 App。
 
 如果不希望下载或嵌入固定 Rust app-server，可构建依赖用户 Codex CLI 的轻量版本：
 
@@ -184,10 +191,14 @@ open dist/Gloss.app
 
 该脚本会先确认当前环境中的 `codex app-server` 可用，但不会把 Codex runtime、许可证或版本锁文件放入 App。运行时 Gloss 会查找 `GLOSS_CODEX_BIN`、`PATH`、Homebrew 与常用本地安装路径，并执行 `codex app-server --listen stdio://`。进程与 thread 仍统一经过 `CodexAppServerClient`，因此会复用相同的静态模型目录、隔离工作目录和 MCP/skills/tools 禁用配置，不会退回较慢的默认启动方式。
 
-本机调试 Safari 配对时，可显式传入钥匙串中的 Apple Development 证书：
+本机调试 Safari 配对时，可显式传入钥匙串中的 Apple Development 证书，以及允许
+`group.com.samsoncj.gloss` App Group 的宿主和扩展 provisioning profile：
 
 ```bash
-GLOSS_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./Scripts/build_app.sh
+GLOSS_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" \
+GLOSS_SAFARI_HOST_PROVISIONING_PROFILE="/path/to/Gloss.provisionprofile" \
+GLOSS_SAFARI_EXTENSION_PROVISIONING_PROFILE="/path/to/Gloss-Extension.provisionprofile" \
+./Scripts/build_app.sh
 ```
 
 当前公开 Homebrew 发行也明确使用 ad-hoc 签名，不要求 Developer ID 或 Apple 公证。
@@ -228,6 +239,9 @@ Cask 的 `postflight` 会重新 ad-hoc 签名、移除 quarantine 并验证签�
 Gatekeeper 交互；这也意味着 macOS 无法验证 Apple 开发者身份或公证票据。公开仓库初始化、
 fine-grained token 权限、完整安全取舍、发行顺序与恢复步骤见
 [发行文档](docs/runtime-distribution.md)。
+Homebrew 构建的能力报告会启用 Chrome、关闭 Safari；Safari App Extension 仅在使用 Apple
+Development 或 distribution identity 且 App Group entitlement 可用的构建中进入能力注册表
+和设置页；运行时会以系统返回的 App Group container 作为最终配对条件。
 
 正式版 App 启动后会延迟、静默检查签名 manifest，并以 24 小时为自动检查间隔。只有确认
 当前 `Gloss.app` 由 `sunchj/tap/gloss` 管理时，界面才提供“一键更新并重新启动”；独立 helper

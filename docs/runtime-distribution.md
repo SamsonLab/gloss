@@ -230,16 +230,20 @@ Gloss 的 Actions 页面手工运行 Release，输入原 `release_tag` 并显式
 - Cask 的下载 SHA-256 和公开 Release 的 `SHA256SUMS` 能证明实际下载内容与 tap 固定的内容
   相同，但它们不能替代发布者身份签名；`gloss-releases`、`homebrew-tap` 或跨仓库 token
   同时失守时，攻击者可能替换二进制与 checksum。
-- custom tap 的 `postflight` 按最深层优先顺序分别对 Safari `.appex`、Codex helper、CLI 和
+- custom tap 的 `postflight` 按最深层优先顺序分别对 Codex helper、CLI、更新 helper 和
   最外层 `Gloss.app` 执行 `codesign --force --sign -`，不使用可能覆盖嵌套 entitlement 的
-  `--deep --sign`；每一步都通过
+  `--deep --sign`；Homebrew 资产不会包含无法配对的 Safari `.appex`。每一步都通过
   `--preserve-metadata=identifier,entitlements,requirements,flags,runtime` 保留已有 metadata，
-  并比较签名前后 App 与 `.appex` 的 entitlement bytes。随后只递归删除
+  并比较签名前后 App 的 entitlement bytes。随后只递归删除
   `com.apple.quarantine`、确认该属性已经不存在，最后用
   `codesign --verify --deep --strict` fail closed 验证完整签名。这让正常 Homebrew 安装后的首次
   启动不需要用户绕过 Gatekeeper，但也主动移除了 Gatekeeper 的隔离检查。
-- ad-hoc 签名不能完成 Safari App Extension 与宿主 App 的 Apple 身份配对，因此该发行方式不
-  承诺 Safari extension 可用；需要 Safari 配对时仍应在本地使用 Apple Development 身份构建。
+- ad-hoc 签名不能完成 Safari App Extension 与宿主 App 的 Apple 身份配对，因此构建脚本会
+  完全省略 Safari `.appex` 并把 Safari 标记为不可用；App、设置页与
+  `gloss-cli capabilities --json` 都只声明 Chrome。需要 Safari 配对时仍应在本地使用 Apple
+  Development 或 distribution identity 构建，并确保签名允许
+  `group.com.samsoncj.gloss` App Group。构建脚本要求分别提供宿主与扩展 provisioning
+  profile，并将它们嵌入对应 bundle；运行时只会向系统实际授予的 group container 写入令牌。
 
 因此该 Cask 只适用于用户明确信任 `SunChJ/homebrew-tap` 和
 `SunChJ/gloss-releases` 的自定义分发场景，不应被描述为 Apple 已签名或已公证的软件。
