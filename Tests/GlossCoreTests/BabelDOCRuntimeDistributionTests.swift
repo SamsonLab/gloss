@@ -544,8 +544,42 @@ struct BabelDOCRuntimeDistributionTests {
         #expect(try Data(contentsOf: executable) == firstPayload)
     }
 
-    @Test("update check uses an injected URL and transport")
-    func updateCheckAndInstallUseInjectedURL() async throws {
+    @Test("update fetches signed metadata once and installs it")
+    func updateUsesInjectedURLAndTransport() async throws {
+        let root = try temporaryDirectory()
+        let payload = Data("runtime".utf8)
+        let manifestURL = try #require(URL(string: "https://updates.example.test/custom.json"))
+        let assetURL = try #require(URL(string: "https://updates.example.test/runtime"))
+        let runtimeManifest = manifest(
+            version: "2.0.0",
+            assets: [asset(url: assetURL, payload: payload)]
+        )
+        let manifestData = try JSONEncoder().encode(runtimeManifest)
+        let recorder = URLRecorder()
+        let manager = try BabelDOCRuntimeManager(
+            rootDirectory: root,
+            platform: platform,
+            transport: transport(
+                payloads: [assetURL: payload],
+                manifestData: manifestData,
+                recorder: recorder
+            ),
+            manifestSigningPublicKey: signingPublicKey
+        )
+
+        let installed = try await manager.update(manifestURL: manifestURL)
+        #expect(installed.currentVersion == "2.0.0")
+        #expect(!installed.updateAvailable)
+        #expect(
+            Set(await recorder.fetchedURLs)
+                == Set([manifestURL, signatureURL(for: manifestURL)])
+        )
+        #expect(await recorder.fetchedURLs.count == 2)
+        #expect(await recorder.downloadedURLs == [assetURL])
+    }
+
+    @Test("available update installs without fetching metadata again")
+    func installAvailableUpdateReusesVerifiedManifest() async throws {
         let root = try temporaryDirectory()
         let payload = Data("runtime".utf8)
         let manifestURL = try #require(URL(string: "https://updates.example.test/custom.json"))
@@ -570,14 +604,12 @@ struct BabelDOCRuntimeDistributionTests {
         let checked = try await manager.checkForUpdates(manifestURL: manifestURL)
         #expect(checked.availableVersion == "2.0.0")
         #expect(checked.updateAvailable)
-        #expect(
-            Set(await recorder.fetchedURLs)
-                == Set([manifestURL, signatureURL(for: manifestURL)])
-        )
+        let fetchesAfterCheck = await recorder.fetchedURLs
 
-        let installed = try await manager.update(manifestURL: manifestURL)
+        let installed = try await manager.installAvailableUpdate()
         #expect(installed.currentVersion == "2.0.0")
         #expect(!installed.updateAvailable)
+        #expect(await recorder.fetchedURLs == fetchesAfterCheck)
         #expect(await recorder.downloadedURLs == [assetURL])
     }
 

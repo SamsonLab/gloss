@@ -611,12 +611,25 @@ public actor BabelDOCRuntimeManager {
         signatureURL: URL? = nil,
         progress: ProgressHandler? = nil
     ) async throws -> BabelDOCRuntimeSnapshot {
-        let checked = try await checkForUpdates(
+        _ = try await checkForUpdates(
             manifestURL: manifestURL,
             signatureURL: signatureURL,
             progress: progress
         )
-        guard checked.updateAvailable, let manifest = availableManifest else {
+        return try await installAvailableUpdate(progress: progress)
+    }
+
+    /// Installs the manifest most recently accepted by `checkForUpdates`.
+    ///
+    /// The cached manifest has already passed the detached-signature and policy
+    /// checks. Keeping this operation separate lets launch-time callers wait for
+    /// their in-flight check and install that exact result without fetching
+    /// mutable "latest" metadata a second time.
+    @discardableResult
+    public func installAvailableUpdate(
+        progress: ProgressHandler? = nil
+    ) async throws -> BabelDOCRuntimeSnapshot {
+        guard makeSnapshot().updateAvailable, let manifest = availableManifest else {
             throw BabelDOCRuntimeDistributionError.noUpdateAvailable
         }
         return try await install(manifest, progress: progress)

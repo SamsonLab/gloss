@@ -29,6 +29,9 @@ public enum BabelDOCServiceError: LocalizedError, Equatable, Sendable {
 /// tied to the Gloss process identity.
 public actor BabelDOCServiceSession: BabelDOCExecutorManaging {
     public static let shared = BabelDOCServiceSession()
+    /// A cold packaged runtime can spend close to two minutes loading the
+    /// DocLayout model on first launch.
+    public static let defaultStartupTimeout: Duration = .seconds(180)
 
     static let readyPrefix = "__GLOSS_BABELDOC_LAYOUT_READY__"
     static let executorReadyPrefix = "__GLOSS_BABELDOC_SERVICE_READY__"
@@ -232,7 +235,7 @@ public actor BabelDOCServiceSession: BabelDOCExecutorManaging {
 
     public func start(
         runtime: BabelDOCRuntimeLaunch,
-        timeout: Duration = .seconds(90)
+        timeout: Duration = defaultStartupTimeout
     ) async throws -> URL {
         await acquireLifecycleOperation()
         defer { releaseLifecycleOperation() }
@@ -640,7 +643,7 @@ public actor BabelDOCServiceSession: BabelDOCExecutorManaging {
     public func reconnect(
         runtime: BabelDOCRuntimeLaunch,
         force: Bool = false,
-        timeout: Duration = .seconds(90)
+        timeout: Duration = defaultStartupTimeout
     ) async throws -> URL {
         await acquireLifecycleOperation()
         defer { releaseLifecycleOperation() }
