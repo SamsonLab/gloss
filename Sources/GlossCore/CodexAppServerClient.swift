@@ -984,7 +984,8 @@ public actor CodexAppServerClient: TranslationBackend {
                 successfulTurnsByThreadIndex.removeAll()
                 availableThreadIndices = Array(startedThreadIDs.indices)
                 activeThreadPriorities.removeAll()
-                let hedgeMilliseconds = modelWaitHedgeNanoseconds
+                let hedgeMilliseconds =
+                    modelWaitHedgeNanoseconds
                     .map { String($0 / 1_000_000) } ?? "off"
                 runtimeLog.write(
                     "codex",
@@ -1709,7 +1710,8 @@ public actor CodexAppServerClient: TranslationBackend {
 
     static func resolveRuntime(
         environment: [String: String],
-        bundleURL: URL = Bundle.main.bundleURL
+        bundleURL: URL = Bundle.main.bundleURL,
+        executableURL: URL? = Bundle.main.executableURL
     ) -> CodexRuntimeLaunch? {
         if let configured = environment["GLOSS_CODEX_APP_SERVER_BIN"]?.nilIfBlank,
             FileManager.default.isExecutableFile(atPath: configured)
@@ -1730,6 +1732,20 @@ public actor CodexAppServerClient: TranslationBackend {
                 executable: bundled,
                 argumentPrefix: [],
                 source: "bundled-app-server"
+            )
+        }
+
+        if let sibling = executableURL?
+            .resolvingSymlinksInPath()
+            .deletingLastPathComponent()
+            .appendingPathComponent("gloss-codex-app-server")
+            .path,
+            FileManager.default.isExecutableFile(atPath: sibling)
+        {
+            return CodexRuntimeLaunch(
+                executable: sibling,
+                argumentPrefix: [],
+                source: "sibling-app-server"
             )
         }
 
@@ -1785,9 +1801,10 @@ public actor CodexAppServerClient: TranslationBackend {
         _ environment: [String: String],
         configured: CodexReasoningEffort?
     ) -> CodexReasoningEffort? {
-        guard let rawValue = environment["GLOSS_CODEX_DOCUMENT_REASONING_EFFORT"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
+        guard
+            let rawValue = environment["GLOSS_CODEX_DOCUMENT_REASONING_EFFORT"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
             !rawValue.isEmpty
         else { return configured }
         if rawValue == "inherit" { return nil }
@@ -2075,9 +2092,10 @@ public actor CodexAppServerClient: TranslationBackend {
         _ environment: [String: String],
         dispatchAware: Bool = false
     ) -> UInt64? {
-        guard let rawValue = environment["GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
+        guard
+            let rawValue = environment["GLOSS_CODEX_MODEL_WAIT_HEDGE_SECONDS"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
             !rawValue.isEmpty
         else {
             return dispatchAware
@@ -2092,9 +2110,10 @@ public actor CodexAppServerClient: TranslationBackend {
     }
 
     static func readThreadRotationTurns(_ environment: [String: String]) -> Int? {
-        guard let rawValue = environment["GLOSS_CODEX_THREAD_ROTATION_TURNS"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
+        guard
+            let rawValue = environment["GLOSS_CODEX_THREAD_ROTATION_TURNS"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
             !rawValue.isEmpty
         else { return defaultThreadRotationTurns }
         if ["0", "off", "disabled"].contains(rawValue) { return nil }
