@@ -570,6 +570,10 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         refreshInterface()
     }
 
+    var hasActiveTranslation: Bool {
+        batchCoordinator.isActive
+    }
+
     func stop() {
         serviceStartupGeneration &+= 1
         serviceStartupTask?.cancel()

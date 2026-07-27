@@ -15,11 +15,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     var onOpenSafariExtensionSettings: (() -> Void)?
     var onBridgeAction: (() -> Void)?
     var onPDFRuntimeAction: ((PDFRuntimeDashboardAction) -> Void)?
+    var onAppUpdateAction: (() -> Void)?
     var onRevealLogs: (() -> Void)?
     var onOpenServicesSettings: (() -> Void)?
     var onSetLaunchAtLogin: ((Bool) -> Bool)?
     var onSetGlobalShortcut: ((GlobalShortcut) -> Void)?
 
+    private let capabilityRegistry: GlossCapabilityRegistry
     private let window: NSWindow
     private let accessibilityStatus = NSTextField(labelWithString: "")
     private let providerStatus = NSTextField(labelWithString: "正在启动翻译引擎")
@@ -31,6 +33,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         labelWithString: "正在验证已安装版本与残留进程"
     )
     private let pdfRuntimePath = NSTextField(labelWithString: "")
+    private let appUpdateStatus = NSTextField(labelWithString: "自动检查应用更新")
+    private let appUpdateDetail = NSTextField(
+        labelWithString: "每 24 小时后台检查一次"
+    )
     private let browserExtensionStatus = NSTextField(labelWithString: "正在准备浏览器扩展")
     private let shortcutStatus = NSTextField(labelWithString: "手动翻译当前选区")
     private let launchAtLoginStatus = NSTextField(labelWithString: "关闭")
@@ -56,10 +62,27 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     )
     private let pdfRuntimeProgressIndicator = NSProgressIndicator()
     private var pdfRuntimeState = PDFRuntimeDashboardState.checking
+    private let appUpdateActionButton = NSButton(
+        title: "检查更新",
+        target: nil,
+        action: nil
+    )
+    private let appUpdateProgressIndicator = NSProgressIndicator()
+    private var appUpdateState = AppUpdateDashboardState.unavailable(
+        currentVersion: "dev",
+        reason: "开发构建"
+    )
 
-    override init() {
+    init(capabilityRegistry: GlossCapabilityRegistry = .current) {
+        self.capabilityRegistry = capabilityRegistry
+        let windowHeight: CGFloat =
+            capabilityRegistry.isEnabled(.selectionTranslation)
+                || capabilityRegistry.isEnabled(.clipboardTranslation)
+                || capabilityRegistry.isEnabled(.imageTranslation)
+            ? 840
+            : capabilityRegistry.supports(.appUpdates) ? 720 : 640
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 840),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: windowHeight),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: true
@@ -69,7 +92,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     }
 
     func show() {
-        updateAccessibilityStatus()
+        if capabilityRegistry.isEnabled(.selectionTranslation) {
+            updateAccessibilityStatus()
+        }
         window.center()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -130,7 +155,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             launchAtLoginStatus.stringValue = "等待在系统设置中批准"
             launchAtLoginStatus.textColor = .systemOrange
         } else {
-            launchAtLoginStatus.stringValue = "关闭；可让选区翻译随时可用"
+            launchAtLoginStatus.stringValue =
+                capabilityRegistry.isEnabled(.selectionTranslation)
+                ? "关闭；可让选区翻译随时可用"
+                : "关闭；Gloss 仅在手动启动后可用"
             launchAtLoginStatus.textColor = .secondaryLabelColor
         }
     }
@@ -143,7 +171,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         window.title = "Gloss"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.minSize = NSSize(width: 520, height: 810)
+        window.minSize = NSSize(
+            width: 520,
+            height:
+                capabilityRegistry.isEnabled(.selectionTranslation)
+                ? 810
+                : capabilityRegistry.supports(.appUpdates) ? 690 : 610
+        )
 
         let root = NSView()
         let scrollView = NSScrollView()
@@ -181,7 +215,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
 
         let title = NSTextField(labelWithString: "Gloss")
         title.font = .systemFont(ofSize: 28, weight: .bold)
-        let subtitle = NSTextField(labelWithString: "选中，即懂。")
+        let subtitle = NSTextField(
+            labelWithString: productSubtitle
+        )
         subtitle.font = .systemFont(ofSize: 15)
         subtitle.textColor = .secondaryLabelColor
         let heading = NSStackView(views: [title, subtitle])
@@ -196,151 +232,161 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         header.spacing = 14
         header.translatesAutoresizingMaskIntoConstraints = false
 
-        let accessibilityCard = makeStatusCard(
-            symbol: "selection.pin.in.out",
-            title: "系统选区",
-            status: accessibilityStatus,
-            accessory: accessibilityButton
-        )
-        accessibilityButton.target = self
-        accessibilityButton.action = #selector(requestAccessibility)
+        var cards: [NSView] = []
+        if capabilityRegistry.isEnabled(.selectionTranslation) {
+            let accessibilityCard = makeStatusCard(
+                symbol: "selection.pin.in.out",
+                title: "系统选区",
+                status: accessibilityStatus,
+                accessory: accessibilityButton
+            )
+            accessibilityButton.target = self
+            accessibilityButton.action = #selector(requestAccessibility)
+            cards.append(accessibilityCard)
 
-        let shortcutCard = makeStatusCard(
-            symbol: "command",
-            title: "全局快捷键",
-            status: shortcutStatus,
-            accessory: shortcutButton
-        )
-        shortcutButton.onChange = { [weak self] shortcut in
-            self?.onSetGlobalShortcut?(shortcut)
+            let shortcutCard = makeStatusCard(
+                symbol: "command",
+                title: "全局快捷键",
+                status: shortcutStatus,
+                accessory: shortcutButton
+            )
+            shortcutButton.onChange = { [weak self] shortcut in
+                self?.onSetGlobalShortcut?(shortcut)
+            }
+            cards.append(shortcutCard)
         }
 
-        let servicesStatus = NSTextField(
-            labelWithString: "在“键盘快捷键 › 服务”中启用文本与图片入口"
-        )
-        let servicesCard = makeStatusCard(
-            symbol: "keyboard",
-            title: "系统服务",
-            status: servicesStatus,
-            accessory: servicesButton
-        )
-        servicesButton.target = self
-        servicesButton.action = #selector(openServicesSettings)
-
-        let providerCard = makeProviderCard()
-
-        let browserCard = makeBridgeCard()
-        let pdfRuntimeCard = makePDFRuntimeCard()
-
-        let launchAtLoginCard = makeStatusCard(
-            symbol: "power",
-            title: "登录时启动",
-            status: launchAtLoginStatus,
-            accessory: launchAtLoginSwitch
-        )
-        launchAtLoginSwitch.target = self
-        launchAtLoginSwitch.action = #selector(setLaunchAtLogin(_:))
-
-        let clipboardButton = NSButton(title: "翻译文本", target: self, action: #selector(translateClipboard))
-        clipboardButton.bezelStyle = .rounded
-        clipboardButton.controlSize = .large
-        clipboardButton.keyEquivalent = "\r"
-
-        let imageButton = NSButton(
-            title: "翻译图片",
-            target: self,
-            action: #selector(translateClipboardImage)
-        )
-        imageButton.bezelStyle = .rounded
-        imageButton.controlSize = .large
-
-        let screenshotButton = NSButton(
-            title: "截图翻译…",
-            target: self,
-            action: #selector(translateScreenshot)
-        )
-        screenshotButton.bezelStyle = .rounded
-        screenshotButton.controlSize = .large
-
-        let actionButtons = NSStackView(views: [clipboardButton, imageButton, screenshotButton])
-        actionButtons.orientation = .horizontal
-        actionButtons.alignment = .centerY
-        actionButtons.spacing = 8
-        actionButtons.translatesAutoresizingMaskIntoConstraints = false
-
-        let hint = NSTextField(
-            wrappingLabelWithString:
-                "选择文本或长按已有选区后 GlossBar 会自动出现；也可以使用全局快捷键，翻译剪贴板图片或截图。图片始终在本机完成 OCR；使用本地模型时，文字也不会离开设备。"
-        )
-        hint.font = .systemFont(ofSize: 12)
-        hint.textColor = .tertiaryLabelColor
-        hint.alignment = .center
-        hint.translatesAutoresizingMaskIntoConstraints = false
-
-        for view in [
-            header,
-            accessibilityCard,
-            shortcutCard,
-            servicesCard,
-            providerCard,
-            browserCard,
-            pdfRuntimeCard,
-            launchAtLoginCard,
-            actionButtons,
-            hint,
-        ] {
-            content.addSubview(view)
+        if capabilityRegistry.isEnabled(.clipboardTranslation)
+            || capabilityRegistry.isEnabled(.imageTranslation)
+        {
+            let servicesStatus = NSTextField(
+                labelWithString: "在“键盘快捷键 › 服务”中启用文本与图片入口"
+            )
+            let servicesCard = makeStatusCard(
+                symbol: "keyboard",
+                title: "系统服务",
+                status: servicesStatus,
+                accessory: servicesButton
+            )
+            servicesButton.target = self
+            servicesButton.action = #selector(openServicesSettings)
+            cards.append(servicesCard)
         }
 
-        NSLayoutConstraint.activate([
+        if capabilityRegistry.supports(.providerConfiguration) {
+            cards.append(makeProviderCard())
+        }
+        if capabilityRegistry.supports(.translationLoopbackBridge) {
+            cards.append(makeBridgeCard())
+        }
+        if capabilityRegistry.isEnabled(.pdfTranslation) {
+            cards.append(makePDFRuntimeCard())
+        }
+        if capabilityRegistry.supports(.appUpdates) {
+            cards.append(makeAppUpdateCard())
+        }
+        if capabilityRegistry.supports(.launchAtLogin) {
+            let launchAtLoginCard = makeStatusCard(
+                symbol: "power",
+                title: "登录时启动",
+                status: launchAtLoginStatus,
+                accessory: launchAtLoginSwitch
+            )
+            launchAtLoginSwitch.target = self
+            launchAtLoginSwitch.action = #selector(setLaunchAtLogin(_:))
+            cards.append(launchAtLoginCard)
+        }
+
+        let cardsStack = NSStackView(views: cards)
+        cardsStack.orientation = .vertical
+        cardsStack.alignment = .leading
+        cardsStack.spacing = 10
+        cardsStack.translatesAutoresizingMaskIntoConstraints = false
+        for card in cards {
+            card.widthAnchor.constraint(equalTo: cardsStack.widthAnchor).isActive = true
+        }
+
+        var quickActionButtons: [NSButton] = []
+        if capabilityRegistry.isEnabled(.clipboardTranslation) {
+            let clipboardButton = NSButton(
+                title: "翻译文本",
+                target: self,
+                action: #selector(translateClipboard)
+            )
+            clipboardButton.bezelStyle = .rounded
+            clipboardButton.controlSize = .large
+            clipboardButton.keyEquivalent = "\r"
+            quickActionButtons.append(clipboardButton)
+        }
+        if capabilityRegistry.isEnabled(.imageTranslation) {
+            let imageButton = NSButton(
+                title: "翻译图片",
+                target: self,
+                action: #selector(translateClipboardImage)
+            )
+            imageButton.bezelStyle = .rounded
+            imageButton.controlSize = .large
+            quickActionButtons.append(imageButton)
+
+            let screenshotButton = NSButton(
+                title: "截图翻译…",
+                target: self,
+                action: #selector(translateScreenshot)
+            )
+            screenshotButton.bezelStyle = .rounded
+            screenshotButton.controlSize = .large
+            quickActionButtons.append(screenshotButton)
+        }
+
+        content.addSubview(header)
+        content.addSubview(cardsStack)
+
+        var layoutConstraints = [
             header.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
             header.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 32),
             header.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -32),
             icon.widthAnchor.constraint(equalToConstant: 48),
             icon.heightAnchor.constraint(equalToConstant: 48),
+            cardsStack.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 26),
+            cardsStack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
+            cardsStack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+        ]
 
-            accessibilityCard.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 26),
-            accessibilityCard.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
-            accessibilityCard.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+        if quickActionButtons.isEmpty {
+            layoutConstraints.append(
+                cardsStack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24)
+            )
+        } else {
+            let actionButtons = NSStackView(views: quickActionButtons)
+            actionButtons.orientation = .horizontal
+            actionButtons.alignment = .centerY
+            actionButtons.spacing = 8
+            actionButtons.translatesAutoresizingMaskIntoConstraints = false
 
-            shortcutCard.topAnchor.constraint(equalTo: accessibilityCard.bottomAnchor, constant: 10),
-            shortcutCard.leadingAnchor.constraint(equalTo: accessibilityCard.leadingAnchor),
-            shortcutCard.trailingAnchor.constraint(equalTo: accessibilityCard.trailingAnchor),
+            let hint = NSTextField(
+                wrappingLabelWithString:
+                    "辅助翻译入口可随业务场景重新启用；图片始终在本机完成 OCR。"
+            )
+            hint.font = .systemFont(ofSize: 12)
+            hint.textColor = .tertiaryLabelColor
+            hint.alignment = .center
+            hint.translatesAutoresizingMaskIntoConstraints = false
 
-            servicesCard.topAnchor.constraint(equalTo: shortcutCard.bottomAnchor, constant: 10),
-            servicesCard.leadingAnchor.constraint(equalTo: accessibilityCard.leadingAnchor),
-            servicesCard.trailingAnchor.constraint(equalTo: accessibilityCard.trailingAnchor),
-
-            providerCard.topAnchor.constraint(equalTo: servicesCard.bottomAnchor, constant: 10),
-            providerCard.leadingAnchor.constraint(equalTo: servicesCard.leadingAnchor),
-            providerCard.trailingAnchor.constraint(equalTo: servicesCard.trailingAnchor),
-
-            browserCard.topAnchor.constraint(equalTo: providerCard.bottomAnchor, constant: 10),
-            browserCard.leadingAnchor.constraint(equalTo: providerCard.leadingAnchor),
-            browserCard.trailingAnchor.constraint(equalTo: providerCard.trailingAnchor),
-
-            pdfRuntimeCard.topAnchor.constraint(
-                equalTo: browserCard.bottomAnchor,
-                constant: 10
-            ),
-            pdfRuntimeCard.leadingAnchor.constraint(equalTo: browserCard.leadingAnchor),
-            pdfRuntimeCard.trailingAnchor.constraint(equalTo: browserCard.trailingAnchor),
-
-            launchAtLoginCard.topAnchor.constraint(
-                equalTo: pdfRuntimeCard.bottomAnchor,
-                constant: 10
-            ),
-            launchAtLoginCard.leadingAnchor.constraint(equalTo: browserCard.leadingAnchor),
-            launchAtLoginCard.trailingAnchor.constraint(equalTo: browserCard.trailingAnchor),
-
-            actionButtons.topAnchor.constraint(equalTo: launchAtLoginCard.bottomAnchor, constant: 24),
-            actionButtons.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-
-            hint.topAnchor.constraint(equalTo: actionButtons.bottomAnchor, constant: 16),
-            hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 44),
-            hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -44),
-            hint.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-        ])
+            content.addSubview(actionButtons)
+            content.addSubview(hint)
+            layoutConstraints.append(contentsOf: [
+                actionButtons.topAnchor.constraint(
+                    equalTo: cardsStack.bottomAnchor,
+                    constant: 24
+                ),
+                actionButtons.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+                hint.topAnchor.constraint(equalTo: actionButtons.bottomAnchor, constant: 16),
+                hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 44),
+                hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -44),
+                hint.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            ])
+        }
+        NSLayoutConstraint.activate(layoutConstraints)
     }
 
     private func makePDFRuntimeCard() -> NSView {
@@ -441,6 +487,93 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         return card
     }
 
+    private func makeAppUpdateCard() -> NSView {
+        let card = NSVisualEffectView()
+        card.material = .contentBackground
+        card.blendingMode = .withinWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.image = NSImage(
+            systemSymbolName: "arrow.triangle.2.circlepath.circle",
+            accessibilityDescription: "Gloss 更新"
+        )
+        icon.contentTintColor = .secondaryLabelColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: "Gloss 更新")
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        appUpdateProgressIndicator.style = .spinning
+        appUpdateProgressIndicator.controlSize = .small
+        appUpdateProgressIndicator.isHidden = true
+
+        appUpdateStatus.font = .systemFont(ofSize: 12, weight: .medium)
+        appUpdateStatus.lineBreakMode = .byTruncatingTail
+        appUpdateStatus.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        let statusStack = NSStackView(
+            views: [appUpdateProgressIndicator, appUpdateStatus]
+        )
+        statusStack.orientation = .horizontal
+        statusStack.alignment = .centerY
+        statusStack.spacing = 5
+
+        appUpdateActionButton.target = self
+        appUpdateActionButton.action = #selector(performAppUpdateAction)
+        appUpdateActionButton.setContentHuggingPriority(
+            .required,
+            for: .horizontal
+        )
+
+        let topRow = NSStackView(
+            views: [titleLabel, statusStack, appUpdateActionButton]
+        )
+        topRow.orientation = .horizontal
+        topRow.alignment = .centerY
+        topRow.spacing = 10
+        topRow.distribution = .fill
+
+        appUpdateDetail.font = .systemFont(ofSize: 11.5)
+        appUpdateDetail.textColor = .secondaryLabelColor
+        appUpdateDetail.lineBreakMode = .byTruncatingMiddle
+        appUpdateDetail.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        let content = NSStackView(views: [topRow, appUpdateDetail])
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 5
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(icon)
+        card.addSubview(content)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 76),
+            icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            icon.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
+            content.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
+            topRow.widthAnchor.constraint(equalTo: content.widthAnchor),
+            appUpdateDetail.widthAnchor.constraint(equalTo: content.widthAnchor),
+        ])
+        showAppUpdateState(appUpdateState)
+        return card
+    }
+
     private func makeBridgeCard() -> NSView {
         let card = NSVisualEffectView()
         card.material = .contentBackground
@@ -534,6 +667,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         extensionRow.alignment = .centerY
         extensionRow.spacing = 8
         extensionRow.distribution = .fill
+        extensionRow.isHidden = !capabilityRegistry.isEnabled(.browserTranslation)
 
         let content = NSStackView(
             views: [topRow, bridgeDetail, bridgePath, extensionRow]
@@ -546,7 +680,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         card.addSubview(icon)
         card.addSubview(content)
         NSLayoutConstraint.activate([
-            card.heightAnchor.constraint(equalToConstant: 118),
+            card.heightAnchor.constraint(
+                equalToConstant:
+                    capabilityRegistry.isEnabled(.browserTranslation)
+                    ? 118
+                    : 92
+            ),
             icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
             icon.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
             icon.widthAnchor.constraint(equalToConstant: 22),
@@ -562,6 +701,23 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         ])
         bridgeProgressIndicator.startAnimation(nil)
         return card
+    }
+
+    private var productSubtitle: String {
+        let browser = capabilityRegistry.isEnabled(.browserTranslation)
+        let pdf = capabilityRegistry.isEnabled(.pdfTranslation)
+        switch (browser, pdf) {
+        case (true, true):
+            return "浏览器与 PDF 翻译"
+        case (true, false):
+            return "Safari 与 Chrome 翻译"
+        case (false, true):
+            return "批量 PDF 翻译"
+        case (false, false):
+            return capabilityRegistry.isEnabled(.selectionTranslation)
+                ? "选中，即懂。"
+                : "按需组合的翻译工具"
+        }
     }
 
     private func makeProviderCard() -> NSView {
@@ -798,6 +954,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         onPDFRuntimeAction?(action)
     }
 
+    @objc private func performAppUpdateAction() {
+        onAppUpdateAction?()
+    }
+
     @objc private func openServicesSettings() {
         onOpenServicesSettings?()
     }
@@ -856,6 +1016,30 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             pdfRuntimeProgressIndicator.stopAnimation(nil)
         }
         pdfRuntimeStatus.textColor =
+            switch presentation.tone {
+            case .neutral: .secondaryLabelColor
+            case .positive: .systemGreen
+            case .warning: .systemOrange
+            case .negative: .systemRed
+            }
+    }
+
+    func showAppUpdateState(_ state: AppUpdateDashboardState) {
+        appUpdateState = state
+        let presentation = state.presentation
+        appUpdateStatus.stringValue = presentation.headline
+        appUpdateStatus.toolTip = presentation.headline
+        appUpdateDetail.stringValue = presentation.detail
+        appUpdateDetail.toolTip = presentation.detail
+        appUpdateActionButton.title = presentation.actionTitle
+        appUpdateActionButton.isEnabled = presentation.actionEnabled
+        appUpdateProgressIndicator.isHidden = !presentation.showsProgress
+        if presentation.showsProgress {
+            appUpdateProgressIndicator.startAnimation(nil)
+        } else {
+            appUpdateProgressIndicator.stopAnimation(nil)
+        }
+        appUpdateStatus.textColor =
             switch presentation.tone {
             case .neutral: .secondaryLabelColor
             case .positive: .systemGreen
