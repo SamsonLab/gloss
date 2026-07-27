@@ -1,4 +1,5 @@
 import Foundation
+import GlossCore
 import Security
 
 enum PairingTokenStore {
@@ -40,18 +41,24 @@ enum PairingTokenStore {
     }
 
     private static func shareWithSafari(_ token: String) {
-        guard Bundle.main.url(
-            forResource: "embedded",
-            withExtension: "provisionprofile"
-        ) != nil else { return }
+        guard GlossDistributionProfile.current.safariExtensionAvailable else {
+            return
+        }
 
         let fileManager = FileManager.default
-        guard let directory = fileManager.containerURL(
-            forSecurityApplicationGroupIdentifier: safariAppGroup
-        ) else { return }
+        guard
+            let directory = fileManager.containerURL(
+                forSecurityApplicationGroupIdentifier: safariAppGroup
+            )
+        else {
+            return
+        }
         let tokenURL = directory.appendingPathComponent(fileName, isDirectory: false)
         try? Data(token.utf8).write(to: tokenURL, options: .atomic)
-        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenURL.path)
+        try? fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: tokenURL.path
+        )
     }
 
     private static func applicationSupportDirectory() throws -> URL {

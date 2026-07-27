@@ -647,16 +647,24 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             target: self,
             action: #selector(copyBrowserToken)
         )
-        let safariButton = NSButton(
-            title: "Safari 设置",
-            target: self,
-            action: #selector(openSafariExtensionSettings)
-        )
-        for button in [safariButton, revealExtensionButton, tokenButton] {
+        for button in [revealExtensionButton, tokenButton] {
             button.controlSize = .small
         }
+        var browserButtonViews: [NSView] = [
+            revealExtensionButton,
+            tokenButton,
+        ]
+        if capabilityRegistry.supports(.safariExtension) {
+            let safariButton = NSButton(
+                title: "Safari 设置",
+                target: self,
+                action: #selector(openSafariExtensionSettings)
+            )
+            safariButton.controlSize = .small
+            browserButtonViews.insert(safariButton, at: 0)
+        }
         let browserButtons = NSStackView(
-            views: [safariButton, revealExtensionButton, tokenButton]
+            views: browserButtonViews
         )
         browserButtons.orientation = .horizontal
         browserButtons.alignment = .centerY
@@ -710,7 +718,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         case (true, true):
             return "浏览器与 PDF 翻译"
         case (true, false):
-            return "Safari 与 Chrome 翻译"
+            return capabilityRegistry.supports(.safariExtension)
+                ? "Safari 与 Chrome 翻译"
+                : "Chrome 翻译"
         case (false, true):
             return "批量 PDF 翻译"
         case (false, false):

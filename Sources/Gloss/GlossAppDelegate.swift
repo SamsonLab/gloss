@@ -325,8 +325,10 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.onRevealBrowserExtension = { [weak self] in
             self?.revealBrowserExtension()
         }
-        controller.onOpenSafariExtensionSettings = { [weak self] in
-            self?.openSafariExtensionSettings()
+        if capabilityRegistry.supports(.safariExtension) {
+            controller.onOpenSafariExtensionSettings = { [weak self] in
+                self?.openSafariExtensionSettings()
+            }
         }
         controller.onBridgeAction = { [weak self] in
             self?.performBridgeDashboardAction()
@@ -1844,9 +1846,13 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showAbout() {
+        let browserSupport =
+            capabilityRegistry.supports(.safariExtension)
+            ? "Safari、Chrome 页面翻译"
+            : "Chrome 页面翻译"
         showAlert(
             title: "Gloss",
-            message: "浏览器与 PDF 翻译\n\n支持 Safari、Chrome 页面翻译与批量 PDF 翻译。"
+            message: "浏览器与 PDF 翻译\n\n支持 \(browserSupport)与批量 PDF 翻译。"
         )
     }
 

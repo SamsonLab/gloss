@@ -83,8 +83,7 @@ cask "gloss" do
 
   postflight do
     app_path = "#{appdir}/Gloss.app"
-    extension_path = "#{app_path}/Contents/PlugIns/Gloss Extension.appex"
-    entitlement_paths = [extension_path, app_path]
+    entitlement_paths = [app_path]
     entitlements_before = entitlement_paths.map do |code_path|
       system_command("/usr/bin/codesign",
                      args:         ["--display", "--entitlements", "-", code_path],
@@ -93,7 +92,6 @@ cask "gloss" do
                      print_stderr: false).stdout
     end
     code_paths = [
-      extension_path,
       "#{app_path}/Contents/Helpers/gloss-codex-app-server",
       "#{app_path}/Contents/Helpers/gloss-cli",
       "#{app_path}/Contents/Helpers/gloss-update-helper",
