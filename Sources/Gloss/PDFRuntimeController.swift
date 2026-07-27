@@ -3,15 +3,26 @@ import GlossCore
 
 @MainActor
 final class PDFRuntimeController {
+    nonisolated static let minimumCompatibleManagedRuntimeVersion =
+        BabelDOCRuntimeCompatibility.minimumManagedVersion
+
     struct PreparedRuntime {
         let launch: BabelDOCRuntimeLaunch
         let layoutServiceBaseURL: URL
         let layoutCacheDirectoryURL: URL?
     }
 
+    enum ManagedRuntimePreparation: Equatable {
+        case install
+        case installAvailableUpdate
+        case startCurrent
+        case updateRequired(currentVersion: String)
+    }
+
     private enum ControllerError: LocalizedError {
         case runtimeManagerUnavailable
         case runtimeUnavailable
+        case runtimeUpdateRequired(current: String, minimum: String)
 
         var errorDescription: String? {
             switch self {
@@ -19,6 +30,8 @@ final class PDFRuntimeController {
                 "无法初始化 BabelDOC 运行时管理器。"
             case .runtimeUnavailable:
                 "没有可用的 BabelDOC 运行时。"
+            case .runtimeUpdateRequired(let current, let minimum):
+                "当前 BabelDOC 运行时 \(current) 已知不兼容。请联网更新到 \(minimum) 或更高版本后再使用 PDF 翻译。"
             }
         }
     }
@@ -96,13 +109,7 @@ final class PDFRuntimeController {
     }
 
     var currentRuntimeLaunch: BabelDOCRuntimeLaunch? {
-        if let executable = runtimeSnapshot?.currentExecutableURL {
-            return Self.managedLaunch(
-                executable: executable,
-                version: runtimeSnapshot?.currentVersion
-            )
-        }
-        return BabelDOCExternalEngine.resolveRuntime()
+        Self.compatibleManagedRuntimeLaunch(for: runtimeSnapshot)
     }
 
     func prepareAtLaunch() {
@@ -350,68 +357,82 @@ final class PDFRuntimeController {
     ) async throws -> PreparedRuntime {
         try await waitForLaunchPreparation()
         try Task.checkCancellation()
+        guard let runtimeManager else {
+            throw ControllerError.runtimeManagerUnavailable
+        }
+
         var changedManagedVersion = false
-        if let runtimeManager {
-            var snapshot = await runtimeManager.snapshot()
+        var snapshot = await runtimeManager.snapshot()
+        runtimeSnapshot = snapshot
+
+        // A verified local runtime is sufficient to start the resident service.
+        // Launch-time update discovery remains advisory and must not put the
+        // network on the critical path or replace a runtime already in use.
+        if let launch = Self.compatibleManagedRuntimeLaunch(for: snapshot) {
+            return try await start(launch)
+        }
+
+        if snapshot.currentExecutableURL != nil, !forceUpdateCheck {
+            await waitForBackgroundUpdateCheck()
             try Task.checkCancellation()
-            runtimeSnapshot = snapshot
-
-            if snapshot.currentExecutableURL == nil {
-                do {
-                    snapshot = try await runtimeManager.update()
-                    try Task.checkCancellation()
-                    changedManagedVersion = true
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    runtimeSnapshot = await runtimeManager.snapshot()
-                    if BabelDOCExternalEngine.resolveRuntime() == nil {
-                        throw error
-                    }
-                    logNonfatalUpdateFailure(error)
-                }
-            } else if forceUpdateCheck {
-                do {
-                    snapshot = try await runtimeManager.checkForUpdates()
-                    try Task.checkCancellation()
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    snapshot = await runtimeManager.snapshot()
-                    logNonfatalUpdateFailure(error)
-                }
-            }
-
-            if forceUpdateCheck, snapshot.updateAvailable {
-                try await stopServiceForRuntimeReplacement()
-                try Task.checkCancellation()
-                do {
-                    snapshot = try await runtimeManager.update()
-                    try Task.checkCancellation()
-                    changedManagedVersion = true
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    snapshot = await runtimeManager.snapshot()
-                    guard snapshot.currentExecutableURL != nil else {
-                        throw error
-                    }
-                    logNonfatalUpdateFailure(error)
-                }
-            }
+            snapshot = await runtimeManager.snapshot()
             runtimeSnapshot = snapshot
         }
 
+        if snapshot.currentExecutableURL == nil {
+            do {
+                snapshot = try await runtimeManager.update()
+                try Task.checkCancellation()
+                changedManagedVersion = true
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                runtimeSnapshot = await runtimeManager.snapshot()
+                throw error
+            }
+        } else if forceUpdateCheck {
+            do {
+                snapshot = try await runtimeManager.checkForUpdates()
+                try Task.checkCancellation()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                snapshot = await runtimeManager.snapshot()
+                runtimeSnapshot = snapshot
+                throw error
+            }
+        }
+
+        if Self.managedRuntimePreparation(for: snapshot) == .installAvailableUpdate {
+            try await stopServiceForRuntimeReplacement()
+            try Task.checkCancellation()
+            do {
+                snapshot = try await runtimeManager.installAvailableUpdate()
+                try Task.checkCancellation()
+                changedManagedVersion = true
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                runtimeSnapshot = await runtimeManager.snapshot()
+                throw error
+            }
+        }
+        if case .updateRequired = Self.managedRuntimePreparation(for: snapshot) {
+            runtimeSnapshot = snapshot
+            throw Self.runtimeUpdateRequiredError(for: snapshot)
+        }
+        runtimeSnapshot = snapshot
+
         guard let launch = currentRuntimeLaunch else {
-            throw ControllerError.runtimeUnavailable
+            throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
         }
         do {
             return try await start(launch)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            logNonfatalUpdateFailure(error)
             guard changedManagedVersion,
-                let runtimeManager,
                 (await runtimeManager.snapshot()).previousVersion != nil
             else {
                 throw error
@@ -420,8 +441,11 @@ final class PDFRuntimeController {
             try Task.checkCancellation()
             runtimeSnapshot = try await runtimeManager.rollback()
             try Task.checkCancellation()
+            if case .updateRequired = Self.managedRuntimePreparation(for: runtimeSnapshot) {
+                throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
+            }
             guard let rollbackLaunch = currentRuntimeLaunch else {
-                throw ControllerError.runtimeUnavailable
+                throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
             }
             return try await start(rollbackLaunch)
         }
@@ -437,17 +461,26 @@ final class PDFRuntimeController {
         try await stopServiceForRuntimeReplacement()
         try Task.checkCancellation()
         do {
-            runtimeSnapshot = try await runtimeManager.update()
+            let checkedSnapshot = await runtimeManager.snapshot()
+            if checkedSnapshot.updateAvailable {
+                runtimeSnapshot = try await runtimeManager.installAvailableUpdate()
+            } else {
+                runtimeSnapshot = try await runtimeManager.update()
+            }
             try Task.checkCancellation()
             changedManagedVersion =
                 runtimeSnapshot?.currentVersion != versionBeforeUpdate
+            if case .updateRequired = Self.managedRuntimePreparation(for: runtimeSnapshot) {
+                throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
+            }
             guard let launch = currentRuntimeLaunch else {
-                throw ControllerError.runtimeUnavailable
+                throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
             }
             return try await start(launch)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            logNonfatalUpdateFailure(error)
             let snapshot = await runtimeManager.snapshot()
             if changedManagedVersion, snapshot.previousVersion != nil {
                 try await stopServiceForRuntimeReplacement()
@@ -456,6 +489,9 @@ final class PDFRuntimeController {
             } else {
                 runtimeSnapshot = snapshot
                 logNonfatalUpdateFailure(error)
+            }
+            if case .updateRequired = Self.managedRuntimePreparation(for: runtimeSnapshot) {
+                throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
             }
             guard let launch = currentRuntimeLaunch else {
                 throw error
@@ -473,14 +509,14 @@ final class PDFRuntimeController {
         runtimeSnapshot = try await runtimeManager.rollback()
         try Task.checkCancellation()
         guard let launch = currentRuntimeLaunch else {
-            throw ControllerError.runtimeUnavailable
+            throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
         }
         return try await start(launch)
     }
 
     private func reconnect() async throws -> PreparedRuntime {
         guard let launch = currentRuntimeLaunch else {
-            throw ControllerError.runtimeUnavailable
+            throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
         }
         let baseURL = try await service.reconnect(runtime: launch, force: true)
         let cacheURL = await service.layoutCacheDirectoryURL
@@ -551,6 +587,11 @@ final class PDFRuntimeController {
         backgroundUpdateID = nil
     }
 
+    private func waitForBackgroundUpdateCheck() async {
+        let task = backgroundUpdateTask
+        await task?.value
+    }
+
     private func takeAndCancelModulePreparation() -> Task<PreparedRuntime, Error>? {
         let task = modulePreparationTask
         task?.cancel()
@@ -574,11 +615,14 @@ final class PDFRuntimeController {
     private func logNonfatalUpdateFailure(_ error: Error) {
         GlossRuntimeLog.shared.write(
             "pdf-runtime",
-            "continuing_with_current_runtime update_error=\(error.localizedDescription)"
+            "runtime_update_or_start_failed error=\(error.localizedDescription)"
         )
     }
 
     private func start(_ launch: BabelDOCRuntimeLaunch) async throws -> PreparedRuntime {
+        guard launch == Self.compatibleManagedRuntimeLaunch(for: runtimeSnapshot) else {
+            throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
+        }
         let baseURL = try await service.start(runtime: launch)
         let cacheURL = await service.layoutCacheDirectoryURL
         return PreparedRuntime(
@@ -630,8 +674,7 @@ final class PDFRuntimeController {
         runtime: BabelDOCRuntimeSnapshot?,
         service: BabelDOCExecutorServiceSnapshot,
         activeDocumentName: String?,
-        fallbackRuntimeAvailable: Bool =
-            BabelDOCExternalEngine.resolveRuntime() != nil
+        fallbackRuntimeAvailable: Bool = false
     ) -> PDFRuntimeDashboardState {
         if service.lifecycleState != .ready, let runtime {
             switch runtime.operation {
@@ -718,7 +761,7 @@ final class PDFRuntimeController {
         }
     }
 
-    private static func managedLaunch(
+    private nonisolated static func managedLaunch(
         executable: URL,
         version: String?
     ) -> BabelDOCRuntimeLaunch {
@@ -726,6 +769,57 @@ final class PDFRuntimeController {
             executable: executable.path,
             source: version.map { "Gloss runtime \($0)" } ?? "Gloss runtime",
             executorExecutable: executable.path
+        )
+    }
+
+    nonisolated static func compatibleManagedRuntimeLaunch(
+        for snapshot: BabelDOCRuntimeSnapshot?
+    ) -> BabelDOCRuntimeLaunch? {
+        guard let snapshot,
+            let executable = snapshot.currentExecutableURL,
+            isCompatibleManagedRuntimeVersion(snapshot.currentVersion)
+        else {
+            return nil
+        }
+        return managedLaunch(
+            executable: executable,
+            version: snapshot.currentVersion
+        )
+    }
+
+    nonisolated static func managedRuntimePreparation(
+        for snapshot: BabelDOCRuntimeSnapshot?
+    ) -> ManagedRuntimePreparation {
+        switch BabelDOCRuntimeCompatibility.preparation(
+            for: snapshot
+        ) {
+        case .install:
+            return .install
+        case .installAvailableUpdate:
+            return .installAvailableUpdate
+        case .useCurrent:
+            return .startCurrent
+        case .updateRequired(let currentVersion):
+            return .updateRequired(
+                currentVersion: currentVersion == "unknown"
+                    ? "未知版本"
+                    : currentVersion
+            )
+        }
+    }
+
+    nonisolated static func isCompatibleManagedRuntimeVersion(
+        _ version: String?
+    ) -> Bool {
+        BabelDOCRuntimeCompatibility.isCompatible(version)
+    }
+
+    private nonisolated static func runtimeUpdateRequiredError(
+        for snapshot: BabelDOCRuntimeSnapshot?
+    ) -> ControllerError {
+        ControllerError.runtimeUpdateRequired(
+            current: snapshot?.currentVersion ?? "未知版本",
+            minimum: minimumCompatibleManagedRuntimeVersion
         )
     }
 }

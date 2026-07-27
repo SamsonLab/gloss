@@ -168,4 +168,141 @@ final class PDFRuntimeLifecycleTests: XCTestCase {
             )
         )
     }
+
+    func testIncompatibleManagedRuntimeConsumesVerifiedUpdateBeforeStarting() {
+        let checked = runtimeSnapshot(
+            currentVersion: "0.6.4+gloss.4",
+            availableVersion: "0.6.4+gloss.5",
+            updateAvailable: true,
+            operation: .ready
+        )
+
+        XCTAssertEqual(
+            PDFRuntimeController.managedRuntimePreparation(for: checked),
+            .installAvailableUpdate
+        )
+    }
+
+    func testCompatibleManagedRuntimeStartsWhileUpdateCheckRemainsAdvisory() {
+        let checked = runtimeSnapshot(
+            currentVersion: "0.6.4+gloss.5",
+            availableVersion: "0.6.4+gloss.6",
+            updateAvailable: true,
+            operation: .ready
+        )
+
+        XCTAssertEqual(
+            PDFRuntimeController.managedRuntimePreparation(for: checked),
+            .startCurrent
+        )
+        XCTAssertEqual(
+            PDFRuntimeController.compatibleManagedRuntimeLaunch(
+                for: checked
+            )?.source,
+            "Gloss runtime 0.6.4+gloss.5"
+        )
+    }
+
+    func testCompatibleManagedRuntimeRemainsAvailableOffline() {
+        let offline = runtimeSnapshot(
+            currentVersion: "0.6.4+gloss.5",
+            availableVersion: nil,
+            updateAvailable: false,
+            operation: .failed
+        )
+
+        XCTAssertEqual(
+            PDFRuntimeController.managedRuntimePreparation(for: offline),
+            .startCurrent
+        )
+        XCTAssertTrue(
+            PDFRuntimeController.isCompatibleManagedRuntimeVersion(
+                "0.6.4+gloss.10"
+            )
+        )
+    }
+
+    func testMissingAndUnversionedManagedRuntimesCannotLaunch() {
+        let missing = runtimeSnapshot(
+            currentVersion: nil,
+            availableVersion: nil,
+            updateAvailable: false,
+            operation: .idle,
+            executableURL: nil
+        )
+        let unversioned = runtimeSnapshot(
+            currentVersion: nil,
+            availableVersion: nil,
+            updateAvailable: false,
+            operation: .ready
+        )
+
+        XCTAssertEqual(
+            PDFRuntimeController.managedRuntimePreparation(for: missing),
+            .install
+        )
+        XCTAssertEqual(
+            PDFRuntimeController.managedRuntimePreparation(for: unversioned),
+            .updateRequired(currentVersion: "未知版本")
+        )
+        XCTAssertNil(
+            PDFRuntimeController.compatibleManagedRuntimeLaunch(for: missing)
+        )
+        XCTAssertNil(
+            PDFRuntimeController.compatibleManagedRuntimeLaunch(for: unversioned)
+        )
+    }
+
+    func testControllerDoesNotFallBackToUnverifiedExternalRuntime() {
+        let controller = PDFRuntimeController(
+            service: BabelDOCServiceSession(
+                persistedStateDirectoryURL: FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            ),
+            runtimeManager: nil
+        )
+
+        XCTAssertNil(controller.currentRuntimeLaunch)
+    }
+
+    func testIncompatibleManagedRuntimeRequiresUpdateWhenOffline() {
+        let offline = runtimeSnapshot(
+            currentVersion: "0.6.4+gloss.4",
+            availableVersion: nil,
+            updateAvailable: false,
+            operation: .failed
+        )
+
+        XCTAssertEqual(
+            PDFRuntimeController.managedRuntimePreparation(for: offline),
+            .updateRequired(currentVersion: "0.6.4+gloss.4")
+        )
+        XCTAssertFalse(
+            PDFRuntimeController.isCompatibleManagedRuntimeVersion(
+                "0.6.4+gloss.4"
+            )
+        )
+    }
+
+    private func runtimeSnapshot(
+        currentVersion: String?,
+        availableVersion: String?,
+        updateAvailable: Bool,
+        operation: BabelDOCRuntimeOperation,
+        executableURL: URL? = URL(
+            fileURLWithPath: "/runtime/gloss-babeldoc"
+        )
+    ) -> BabelDOCRuntimeSnapshot {
+        BabelDOCRuntimeSnapshot(
+            channel: .stable,
+            pinnedVersion: nil,
+            currentVersion: currentVersion,
+            previousVersion: nil,
+            availableVersion: availableVersion,
+            currentExecutableURL: executableURL,
+            updateAvailable: updateAvailable,
+            operation: operation,
+            lastError: operation == .failed ? "offline" : nil
+        )
+    }
 }
