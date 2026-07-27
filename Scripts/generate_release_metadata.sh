@@ -32,6 +32,10 @@ if [[ ! "$RELEASE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z.+_-]*$ ]]; then
   echo "Invalid release tag: $RELEASE_TAG" >&2
   exit 65
 fi
+if [[ "$RELEASE_TAG" != "v$VERSION" ]]; then
+  echo "Release tag $RELEASE_TAG does not match version $VERSION." >&2
+  exit 65
+fi
 ASSET_URL_PATTERN='^https://[^[:space:]"\\]+$'
 if [[ ! "$ASSET_BASE_URL" =~ $ASSET_URL_PATTERN ]]; then
   echo "Invalid HTTPS asset base URL: $ASSET_BASE_URL" >&2
@@ -77,6 +81,23 @@ MANIFEST_PATH="$OUTPUT_DIRECTORY/gloss-release-manifest.json"
 CHECKSUMS_PATH="$OUTPUT_DIRECTORY/SHA256SUMS"
 
 ASSET_BASE_URL="${ASSET_BASE_URL%/}"
+GLOSS_CASK_DOWNLOAD_BASE_URL="$ASSET_BASE_URL" \
+  bash "$(dirname "$0")/generate_homebrew_cask.sh" \
+  "$VERSION" \
+  "$ARM64_SHA256" \
+  "$X86_64_SHA256" \
+  "$OUTPUT_DIRECTORY/gloss.rb" \
+  "$RELEASE_TAG" \
+  "$REPOSITORY" \
+  "$ARM64_NAME" \
+  "$X86_64_NAME"
+bash "$(dirname "$0")/validate_homebrew_cask.sh" \
+  "$OUTPUT_DIRECTORY/gloss.rb"
+CASK_PATH="$OUTPUT_DIRECTORY/gloss.rb"
+CASK_SHA256="$(shasum -a 256 "$CASK_PATH" | awk '{print $1}')"
+CASK_SIZE="$(stat -f '%z' "$CASK_PATH")"
+CASK_URL="$ASSET_BASE_URL/gloss.rb"
+
 python3 - \
   "$MANIFEST_PATH" \
   "$VERSION" \
@@ -88,7 +109,10 @@ python3 - \
   "$ARM64_SIZE" \
   "$X86_64_NAME" \
   "$X86_64_SHA256" \
-  "$X86_64_SIZE" <<'PY'
+  "$X86_64_SIZE" \
+  "$CASK_URL" \
+  "$CASK_SHA256" \
+  "$CASK_SIZE" <<'PY'
 import json
 import pathlib
 import sys
@@ -105,9 +129,12 @@ import sys
     x86_64_name,
     x86_64_sha256,
     x86_64_size,
+    cask_url,
+    cask_sha256,
+    cask_size,
 ) = sys.argv[1:]
 manifest = {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "channel": "stable",
     "version": version,
     "releaseTag": release_tag,
@@ -129,6 +156,12 @@ manifest = {
             "size": int(x86_64_size),
         },
     ],
+    "homebrewCask": {
+        "token": "sunchj/tap/gloss",
+        "url": cask_url,
+        "sha256": cask_sha256,
+        "size": int(cask_size),
+    },
 }
 pathlib.Path(output).write_text(
     json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -140,21 +173,9 @@ MANIFEST_SHA256="$(shasum -a 256 "$MANIFEST_PATH" | awk '{print $1}')"
 {
   printf '%s  %s\n' "$ARM64_SHA256" "$ARM64_NAME"
   printf '%s  %s\n' "$X86_64_SHA256" "$X86_64_NAME"
+  printf '%s  %s\n' "$CASK_SHA256" "gloss.rb"
   printf '%s  %s\n' "$MANIFEST_SHA256" "$(basename "$MANIFEST_PATH")"
 } >"$CHECKSUMS_PATH"
-
-GLOSS_CASK_DOWNLOAD_BASE_URL="$ASSET_BASE_URL" \
-  bash "$(dirname "$0")/generate_homebrew_cask.sh" \
-  "$VERSION" \
-  "$ARM64_SHA256" \
-  "$X86_64_SHA256" \
-  "$OUTPUT_DIRECTORY/Casks/gloss.rb" \
-  "$RELEASE_TAG" \
-  "$REPOSITORY" \
-  "$ARM64_NAME" \
-  "$X86_64_NAME"
-bash "$(dirname "$0")/validate_homebrew_cask.sh" \
-  "$OUTPUT_DIRECTORY/Casks/gloss.rb"
 
 echo "$MANIFEST_PATH"
 echo "$CHECKSUMS_PATH"

@@ -72,6 +72,7 @@ fi
 install -d "$MACOS_DIR" "$HELPERS_DIR" "$RESOURCES_DIR" "$PLUGINS_DIR"
 install -m 755 "$BIN_DIR/Gloss" "$MACOS_DIR/Gloss"
 install -m 755 "$BIN_DIR/gloss-cli" "$HELPERS_DIR/gloss-cli"
+install -m 755 "$BIN_DIR/gloss-update-helper" "$HELPERS_DIR/gloss-update-helper"
 install -m 644 "$ROOT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
 install -m 644 "$ROOT_DIR/Resources/Gloss.icns" "$RESOURCES_DIR/Gloss.icns"
 if [[ "$CODEX_RUNTIME_MODE" == "bundled" ]]; then
@@ -94,9 +95,11 @@ if [[ "$CODEX_RUNTIME_MODE" == "bundled" ]]; then
   codesign "${SIGN_ARGS[@]}" "$HELPERS_DIR/gloss-codex-app-server"
 fi
 codesign "${SIGN_ARGS[@]}" "$HELPERS_DIR/gloss-cli"
+codesign "${SIGN_ARGS[@]}" "$HELPERS_DIR/gloss-update-helper"
 codesign "${SIGN_ARGS[@]}" --entitlements "$APP_ENTITLEMENTS" "$APP_DIR"
 if [[ "$CODEX_RUNTIME_MODE" == "bundled" ]]; then
   codesign --verify --strict "$HELPERS_DIR/gloss-codex-app-server"
 fi
+codesign --verify --strict "$HELPERS_DIR/gloss-update-helper"
 codesign --verify --deep --strict "$APP_DIR"
 echo "$APP_DIR"

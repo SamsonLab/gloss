@@ -25,12 +25,14 @@ required = [
   %r{^    url "https://[^"]+/Gloss-macos-arm64\.zip"$},
   %r{^    url "https://[^"]+/Gloss-macos-x86_64\.zip"$},
   /^  app "Gloss\.app"$/,
+  %r{^  binary "#\{appdir\}/Gloss\.app/Contents/Helpers/gloss-cli", target: "gloss-cli"$},
   /^  postflight do$/,
   %r{^    system_command "/usr/bin/codesign",$},
   %r{^      system_command "/usr/bin/codesign",$},
   %r{#\{app_path\}/Contents/PlugIns/Gloss Extension\.appex},
   %r{#\{app_path\}/Contents/Helpers/gloss-codex-app-server},
   %r{#\{app_path\}/Contents/Helpers/gloss-cli},
+  %r{#\{app_path\}/Contents/Helpers/gloss-update-helper},
   /^    code_paths\.each do \|code_path\|$/,
   /entitlements_before = entitlement_paths\.map/,
   /entitlements_after = entitlement_paths\.map/,
@@ -53,6 +55,7 @@ expected_order = [
   "extension_path,",
   '"#{app_path}/Contents/Helpers/gloss-codex-app-server",',
   '"#{app_path}/Contents/Helpers/gloss-cli",',
+  '"#{app_path}/Contents/Helpers/gloss-update-helper",',
   "app_path,",
 ]
 cursor = -1
