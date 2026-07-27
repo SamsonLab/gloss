@@ -10,7 +10,11 @@ let package = Package(
     products: [
         .library(name: "GlossCore", targets: ["GlossCore"]),
         .executable(name: "Gloss", targets: ["Gloss"]),
-        .executable(name: "gloss-cli", targets: ["GlossCLI"])
+        .executable(name: "gloss-cli", targets: ["GlossCLI"]),
+        .executable(
+            name: "gloss-update-helper",
+            targets: ["GlossUpdateHelper"]
+        ),
     ],
     targets: [
         .target(name: "GlossCore"),
@@ -21,6 +25,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "GlossCLI",
+            dependencies: ["GlossCore"]
+        ),
+        .executableTarget(
+            name: "GlossUpdateHelper",
             dependencies: ["GlossCore"]
         ),
         .testTarget(
@@ -34,6 +42,6 @@ let package = Package(
         .testTarget(
             name: "GlossAppTests",
             dependencies: ["Gloss"]
-        )
+        ),
     ]
 )

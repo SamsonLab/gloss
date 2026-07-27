@@ -90,11 +90,13 @@ active runtime。
    证书，也不执行 notarization 或 stapling。
 2. 生成 `Gloss-macos-arm64.zip`、`Gloss-macos-x86_64.zip`、`SHA256SUMS` 和包含两个
    architecture asset 的 `gloss-release-manifest.json`。
-3. 生成并校验使用 `on_arm` / `on_intel` URL 与 SHA-256 的 `Casks/gloss.rb`。Manifest 和
+3. 生成并校验使用 `on_arm` / `on_intel` URL 与 SHA-256 的根级 Release asset
+   `gloss.rb`。Manifest 还会签名绑定其固定 token、URL、SHA-256 与 size；tap workflow
+   再将它落到 `Casks/gloss.rb`。Manifest 和
    Cask 中的下载地址固定指向公开仓库
    `https://github.com/SunChJ/gloss-releases/releases/download/<tag>/`。
 4. 始终上传私有主仓中的 Actions artifact，便于内部验证。
-5. 仅在 tag 事件中使用跨仓库 token，把 app zip、校验和、manifest 与生成的 Cask 发布到
+5. 仅在 tag 事件中使用跨仓库 token，把 app zip、校验和、manifest 与根级 `gloss.rb` 发布到
    公开的 `SunChJ/gloss-releases` GitHub Release。
 6. Release 上传成功后，dispatch `SunChJ/homebrew-tap` 的 `update-cask.yml`，由公开 tap
    下载并二次校验 Release，再更新 `Casks/gloss.rb`。
@@ -180,7 +182,7 @@ gh workflow run update-cask.yml \
   -f release_repository=SunChJ/gloss-releases
 ```
 
-公开 tap 合并生成的 Cask 更新后，用户使用标准 tap 名称安装和升级：
+公开 tap 的校验全部通过后会自动合并生成的 Cask 更新，用户使用标准 tap 名称安装和升级：
 
 ```bash
 brew tap sunchj/tap
@@ -199,9 +201,11 @@ brew upgrade --cask sunchj/tap/gloss
 5. 等待 Gloss Release workflow 完成 ad-hoc 签名；workflow 会先创建 draft Release，上传全部
    资产后再发布，最后 dispatch tap 更新。
 6. 在 `SunChJ/gloss-releases` 验证两种架构 zip、`SHA256SUMS`、
-   `gloss-release-manifest.json` 与 `Casks/gloss.rb` 均存在且 URL 指向该公开 Release。
-7. 审阅并合并 `SunChJ/homebrew-tap` 生成的 Cask PR，然后在 arm64 与 x86_64 Mac 上分别执行
-   `brew install --cask sunchj/tap/gloss` smoke test。
+   `gloss-release-manifest.json`、签名文件与根级 `gloss.rb` 均存在且 URL 指向该公开 Release；
+   tap 会把同一份 `gloss.rb` 落到 `Casks/gloss.rb`。
+7. 等待 `SunChJ/homebrew-tap` 生成的 Cask PR 在 required checks 通过后自动合并；workflow
+   会在 arm64 与 x86_64 Mac 上分别执行 `brew install --cask sunchj/tap/gloss` smoke test，
+   不要求人工批准。
 
 `SunChJ/gloss-releases` 必须启用 GitHub release immutability。已发布 Release 的 tag 与资产
 不可覆盖；相同 tag 的 workflow 重跑会 fail closed。上传中断时 Release 仍保持 draft，

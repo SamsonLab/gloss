@@ -37,6 +37,10 @@ if [[ ! "$RELEASE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z.+_-]*$ ]]; then
   echo "Invalid release tag: $RELEASE_TAG" >&2
   exit 65
 fi
+if [[ "$RELEASE_TAG" != "v$VERSION" ]]; then
+  echo "Release tag $RELEASE_TAG does not match version $VERSION." >&2
+  exit 65
+fi
 for archive in "$ARM64_ARCHIVE" "$X86_64_ARCHIVE"; do
   if [[ "$archive" == *"/"* || -z "$archive" ]]; then
     echo "Invalid archive name: $archive" >&2
@@ -75,6 +79,7 @@ cask "gloss" do
   depends_on macos: :sonoma
 
   app "Gloss.app"
+  binary "#{appdir}/Gloss.app/Contents/Helpers/gloss-cli", target: "gloss-cli"
 
   postflight do
     app_path = "#{appdir}/Gloss.app"
@@ -91,6 +96,7 @@ cask "gloss" do
       extension_path,
       "#{app_path}/Contents/Helpers/gloss-codex-app-server",
       "#{app_path}/Contents/Helpers/gloss-cli",
+      "#{app_path}/Contents/Helpers/gloss-update-helper",
       app_path,
     ]
     code_paths.each do |code_path|
