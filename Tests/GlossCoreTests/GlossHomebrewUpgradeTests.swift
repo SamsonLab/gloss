@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Testing
 
@@ -750,6 +751,218 @@ struct GlossHomebrewUpgradeTests {
         }
     }
 
+    @Test(
+        "command timeout kills descendants that ignore TERM and hold output"
+    )
+    func commandTimeoutKillsProcessGroup() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let processIdentifierURL = directory.appendingPathComponent(
+            "timeout-child.pid"
+        )
+        var fixtureIdentity: ProcessGroupFixtureIdentity?
+        defer {
+            if let fixtureIdentity {
+                cleanup(fixtureIdentity)
+            }
+        }
+
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        let command = Task {
+            try await GlossCommandRunner.live.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                arguments: [
+                    "-c",
+                    Self.processGroupFixture,
+                    processIdentifierURL.path,
+                    "wait",
+                ],
+                timeout: .seconds(1)
+            )
+        }
+        defer { command.cancel() }
+        fixtureIdentity = try await waitForProcessIdentity(
+            at: processIdentifierURL
+        )
+        await #expect(throws: GlossCommandRunnerError.self) {
+            try await command.value
+        }
+        let elapsed = startedAt.duration(to: clock.now)
+
+        #expect(elapsed < .seconds(3))
+        let childExited = await waitForProcessToExit(
+            fixtureIdentity!
+        )
+        #expect(childExited)
+        if childExited {
+            fixtureIdentity = nil
+        }
+    }
+
+    @Test(
+        "normal leader exit cleans descendants that keep output handles open"
+    )
+    func commandCompletionCleansOutputHoldingDescendants() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let processIdentifierURL = directory.appendingPathComponent(
+            "completed-child.pid"
+        )
+        var fixtureIdentity: ProcessGroupFixtureIdentity?
+        defer {
+            if let fixtureIdentity {
+                cleanup(fixtureIdentity)
+            }
+        }
+
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        let command = Task {
+            try await GlossCommandRunner.live.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                arguments: [
+                    "-c",
+                    Self.processGroupFixture,
+                    processIdentifierURL.path,
+                    "exit",
+                ],
+                timeout: .seconds(3)
+            )
+        }
+        defer { command.cancel() }
+        fixtureIdentity = try await waitForProcessIdentity(
+            at: processIdentifierURL
+        )
+        let output = try await command.value
+        let elapsed = startedAt.duration(to: clock.now)
+        #expect(output.terminationStatus == 0)
+        #expect(
+            String(decoding: output.standardOutput, as: UTF8.self)
+                .contains("child-ready")
+        )
+        #expect(elapsed < .seconds(2))
+        let childExited = await waitForProcessToExit(
+            fixtureIdentity!
+        )
+        #expect(childExited)
+        if childExited {
+            fixtureIdentity = nil
+        }
+    }
+
+    @Test("command cancellation kills its entire process group")
+    func commandCancellationKillsProcessGroup() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let processIdentifierURL = directory.appendingPathComponent(
+            "cancelled-child.pid"
+        )
+        var fixtureIdentity: ProcessGroupFixtureIdentity?
+        defer {
+            if let fixtureIdentity {
+                cleanup(fixtureIdentity)
+            }
+        }
+
+        let command = Task {
+            try await GlossCommandRunner.live.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                arguments: [
+                    "-c",
+                    Self.processGroupFixture,
+                    processIdentifierURL.path,
+                    "wait",
+                ]
+            )
+        }
+        fixtureIdentity = try await waitForProcessIdentity(
+            at: processIdentifierURL
+        )
+        command.cancel()
+
+        await #expect(throws: CancellationError.self) {
+            try await command.value
+        }
+        let childExited = await waitForProcessToExit(
+            fixtureIdentity!
+        )
+        #expect(childExited)
+        if childExited {
+            fixtureIdentity = nil
+        }
+    }
+
+    @Test("continuous output still observes the command timeout")
+    func continuousOutputStillTimesOut() async {
+        await #expect(
+            throws: GlossCommandRunnerError.timedOut(
+                executablePath: "/usr/bin/python3"
+            )
+        ) {
+            try await GlossCommandRunner.live.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                arguments: [
+                    "-c",
+                    """
+                    import os
+                    import time
+                    while True:
+                        os.write(1, b"x" * 1024)
+                        time.sleep(0.005)
+                    """,
+                ],
+                timeout: .milliseconds(100)
+            )
+        }
+    }
+
+    @Test("unbounded command output fails at the capture limit")
+    func commandOutputLimitIsEnforced() async {
+        await #expect(
+            throws: GlossCommandRunnerError.outputLimitExceeded(
+                executablePath: "/usr/bin/python3",
+                maximumByteCount:
+                    GlossCommandRunner.maximumCapturedOutputByteCount
+            )
+        ) {
+            try await GlossCommandRunner.live.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                arguments: [
+                    "-c",
+                    """
+                    import os
+                    chunk = b"x" * 65536
+                    while True:
+                        os.write(1, chunk)
+                    """,
+                ],
+                timeout: .seconds(5)
+            )
+        }
+    }
+
+    @Test("short commands complete without process-group cleanup delay")
+    func shortCommandsCompleteWithoutCleanupDelay() async throws {
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+
+        for value in 0..<64 {
+            let output = try await GlossCommandRunner.live.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/printf"),
+                arguments: ["%d", String(value)],
+                timeout: .seconds(1)
+            )
+            #expect(output.terminationStatus == 0)
+            #expect(
+                String(decoding: output.standardOutput, as: UTF8.self)
+                    == String(value)
+            )
+        }
+
+        #expect(startedAt.duration(to: clock.now) < .seconds(3))
+    }
+
     @Test("launcher stages an independent helper and canonical request")
     func launcherStagesHelper() async throws {
         let directory = temporaryDirectory()
@@ -957,6 +1170,102 @@ struct GlossHomebrewUpgradeTests {
             withIntermediateDirectories: true
         )
         return url
+    }
+
+    private static let processGroupFixture = """
+        import os
+        import signal
+        import sys
+        import time
+
+        pid_path = sys.argv[1]
+        child = os.fork()
+        if child == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            with open(pid_path, "w") as pid_file:
+                pid_file.write(f"{os.getpid()} {os.getpgrp()}")
+            print("child-ready", flush=True)
+            while True:
+                time.sleep(1)
+
+        while not os.path.exists(pid_path):
+            time.sleep(0.01)
+        if sys.argv[2] == "exit":
+            os._exit(0)
+        while True:
+            time.sleep(1)
+        """
+
+    private enum ProcessGroupFixtureError: Error {
+        case didNotStart
+    }
+
+    private struct ProcessGroupFixtureIdentity {
+        let childProcessIdentifier: pid_t
+        let processGroupIdentifier: pid_t
+        let processStartTime: Double
+    }
+
+    private func waitForProcessIdentity(
+        at url: URL,
+        timeout: Duration = .seconds(2)
+    ) async throws -> ProcessGroupFixtureIdentity {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let data = try? Data(contentsOf: url),
+                let value = String(data: data, encoding: .utf8),
+                case let components = value.split(separator: " "),
+                components.count == 2,
+                let childIdentifier = pid_t(components[0]),
+                let groupIdentifier = pid_t(components[1]),
+                let processStartTime =
+                    BabelDOCServiceSession.processStartTime(
+                        childIdentifier
+                    )
+            {
+                return ProcessGroupFixtureIdentity(
+                    childProcessIdentifier: childIdentifier,
+                    processGroupIdentifier: groupIdentifier,
+                    processStartTime: processStartTime
+                )
+            }
+            try await Task<Never, Never>.sleep(for: .milliseconds(20))
+        }
+        throw ProcessGroupFixtureError.didNotStart
+    }
+
+    private func cleanup(_ identity: ProcessGroupFixtureIdentity) {
+        guard
+            Darwin.kill(identity.childProcessIdentifier, 0) == 0,
+            getpgid(identity.childProcessIdentifier)
+                == identity.processGroupIdentifier,
+            BabelDOCServiceSession.processStartTime(
+                identity.childProcessIdentifier
+            ) == identity.processStartTime
+        else {
+            return
+        }
+        _ = Darwin.kill(-identity.processGroupIdentifier, SIGKILL)
+    }
+
+    private func waitForProcessToExit(
+        _ identity: ProcessGroupFixtureIdentity,
+        timeout: Duration = .seconds(2)
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if BabelDOCServiceSession.processStartTime(
+                identity.childProcessIdentifier
+            ) != identity.processStartTime {
+                return true
+            }
+            try? await Task<Never, Never>.sleep(for: .milliseconds(20))
+        }
+        return BabelDOCServiceSession.processStartTime(
+            identity.childProcessIdentifier
+        ) != identity.processStartTime
     }
 
     private static func infoJSON(
