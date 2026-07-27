@@ -1,8 +1,24 @@
 # Gloss
 
-Gloss 是一款 macOS 原生、上下文感知的系统级翻译工具：选中任何文本，原地理解、翻译并继续工作。
+Gloss 是一款 macOS 原生翻译工具。当前默认产品面聚焦两条已经闭环的业务场景：
+Safari/Chrome 浏览器翻译，以及保留版式的 PDF 批量翻译。
 
-当前实现已经打通第一条完整链路：
+## 核心能力与业务场景
+
+Gloss 不再按窗口堆叠功能，而是由可复用核心能力拼装业务场景。App 菜单、后台服务和
+`gloss-cli` 都读取同一份能力注册表；关闭一个场景会同时收起入口并停止它独占的常驻服务，
+不会删除底层实现。
+
+| 默认场景 | 组合的主要能力 | macOS 入口 | CLI 映射 |
+| --- | --- | --- | --- |
+| 浏览器翻译 | 文本翻译、Provider/语言路由、本机回环桥接、Safari/Chrome 适配 | Safari 与 Chrome 扩展 | `gloss-cli browser` |
+| PDF 翻译 | 文档翻译、版面分析、翻译桥接、BabelDOC runtime、批量队列、PDF 导出 | PDF 模块、Finder 打开与拖拽 | `gloss-cli pdf` |
+
+可使用 `gloss-cli capabilities --json` 获取稳定、机器可读的核心能力、启用场景和命令映射。
+剪贴板、OCR/截图、系统选区、术语表和历史记录的实现仍保留在代码中，但默认不启动相关监听，
+也不在主菜单和设置中展示。
+
+底层已经实现的能力包括：
 
 - 监听鼠标选区、已选文本长按和可录制的全局快捷键（默认 `⌃⌥G`）
 - 可全局关闭自动出现，或仅在指定 App 中停用；手动快捷键仍然可用
@@ -52,13 +68,14 @@ tail -f ~/Library/Logs/Gloss/gloss.log
 
 1. GPT 订阅：首次启动时，在 Gloss 设置中点击“登录 ChatGPT”。默认构建不需要单独安装 Codex CLI 或 Node.js；CLI 构建需要用户已安装支持 `app-server` 的 Codex CLI。
 2. 本地模型：安装 `llama.cpp`（`brew install llama.cpp`），然后在翻译引擎中选择“本地模型”。首次启动会从 Hugging Face 下载约 1.1 GB 的 Q4 模型。
-3. 首次使用选区翻译时，在系统设置中允许 Gloss 使用“辅助功能”。
+3. 重新启用选区翻译场景后，首次使用时需在系统设置中允许 Gloss 使用“辅助功能”。
 4. Chrome：在 Gloss 设置中点“显示扩展”，从 `chrome://extensions` 加载这个已自动配对的目录。
 5. Safari：在 Gloss 设置中点“Safari 设置”，启用随 App 内置的 Gloss Extension。
 
 Gloss 的登录状态和 Codex 配置保存在 `~/Library/Application Support/Gloss/Codex/`，不会修改系统 Codex CLI 的数据。
 
-系统“服务”入口默认由 macOS 管理。可在 Gloss 设置中打开“键盘快捷键”，再到“服务”里启用文本或图片翻译入口。
+重新启用剪贴板或图片翻译场景后，系统“服务”入口仍由 macOS 管理，可在“系统设置 ›
+键盘 › 键盘快捷键 › 服务”中启用对应入口。
 
 ## 开发
 
@@ -70,12 +87,31 @@ swift run Gloss
 直接验证翻译后端：
 
 ```bash
+# 查询 App 与 CLI 共用的能力/场景映射
+swift run gloss-cli capabilities --json
+
+# 浏览器翻译场景（默认 content kind 为 webpage）
+swift run gloss-cli browser --target 'Chinese (Simplified)' 'Translate this webpage.'
+
+# PDF 批量翻译场景
+swift run gloss-cli pdf paper-a.pdf paper-b.pdf \
+  --output ./translated \
+  --target 'Chinese (Simplified)' \
+  --mode mono
+
+# 向后兼容的文本翻译入口
+swift run gloss-cli text --target 'Chinese (Simplified)' 'Translate this text.'
 swift run gloss-cli --target 'Chinese (Simplified)' 'Translate this text.'
 swift run gloss-cli --provider llama --target 'Chinese (Simplified)' 'Translate locally.'
 swift run gloss-cli --provider codex --model gpt-5.3-codex-spark --reasoning low 'Translate quickly.'
 printf 'Translate stdin.\n' | swift run gloss-cli --target Japanese
 swift run gloss-cli --kind ocr 'Text recognized from an image.'
 ```
+
+`browser` 可从参数或 stdin 读取已经提取的网页正文，并使用与 Safari/Chrome 扩展相同的
+网页翻译语义；它不会自动操控浏览器 UI。`pdf` 接受一个或多个 PDF，顺序处理并复用同一
+BabelDOC 会话；进度写入 stderr，最终产物路径以 JSON 写入 stdout，适合脚本调用。默认源语言
+为 `en`、目标语言为 `Chinese (Simplified)`，输出方式为仅译文 PDF。
 
 开发时可以覆盖原生 app-server 和独立数据目录：
 
@@ -168,7 +204,7 @@ atomic state file 防止半安装状态。完整 manifest schema、安全边界�
 ### GitHub Release 与 Homebrew
 
 推送与 `Resources/Info.plist` 一致的 `v*` tag 会运行 Release workflow，产出
-arm64 与 x86_64 两套 `Gloss.app` zip、`SHA256SUMS`、release manifest 和带
+arm64 与 x86_64 两套 `Gloss.app` zip、`SHA256SUMS`、Ed25519 签名的 release manifest 和带
 `on_arm` / `on_intel` 校验的 Homebrew cask。私有 `SunChJ/gloss` 只负责构建；ad-hoc
 签名后的资产发布到公开 `SunChJ/gloss-releases`，随后自动 dispatch
 `SunChJ/homebrew-tap` 更新 Cask。下载 URL 不会指向私有主仓。
@@ -182,6 +218,9 @@ brew update
 brew upgrade --cask sunchj/tap/gloss
 ```
 
+Homebrew 同时把 App 内置的 `gloss-cli` 链接到其 `bin` 目录；安装后可直接运行
+`gloss-cli capabilities --json`，无需从 `.app` 包内手工定位可执行文件。
+
 Release workflow 使用只读 `GLOSS_EXTENSION_SSH_KEY` 检出私有浏览器扩展；正式 tag 另外
 要求跨仓库 `GLOSS_DISTRIBUTION_TOKEN`。缺失时 workflow 会在构建和上传前 fail closed。
 手工 workflow 不发布，但仍需要 extension deploy key 才能生成完整 App artifact。
@@ -190,11 +229,20 @@ Gatekeeper 交互；这也意味着 macOS 无法验证 Apple 开发者身份或�
 fine-grained token 权限、完整安全取舍、发行顺序与恢复步骤见
 [发行文档](docs/runtime-distribution.md)。
 
+正式版 App 启动后会延迟、静默检查签名 manifest，并以 24 小时为自动检查间隔。只有确认
+当前 `Gloss.app` 由 `sunchj/tap/gloss` 管理时，界面才提供“一键更新并重新启动”；独立 helper
+会在 App 退出后调用固定的 `brew update` / `brew upgrade --cask --require-sha` 参数。helper
+会独立复验原始 manifest 签名，并在执行升级前确认 tap 中的 `gloss.rb`、Cask 版本及当前架构
+URL/SHA 都与签名 manifest 完全一致；升级命令禁用隐式 auto-update，随后再精确验证安装版本、
+当前架构、ad-hoc 签名与 quarantine 状态。App 只在 helper 完成签名复验和旧版恢复副本校验后
+退出；升级损坏安装时会恢复并重新验证上一版本。任何浏览器或 PDF 翻译任务进行中时都不会启动
+升级。非 Homebrew 安装只会打开官方 release 页面。
+
 ## 代码结构
 
 ```text
 Sources/GlossCore/   Codex/llama 客户端、provider 路由、翻译模型、缓存与并发合并
 Sources/GlossOCR/    本地 Vision OCR 与版面阅读顺序恢复
 Sources/Gloss/       macOS 选区、图片、截图、结果面板、文本替换与浏览器桥接
-Sources/GlossCLI/    薄命令行入口
+Sources/GlossCLI/    浏览器/PDF 场景命令与向后兼容的文本入口
 ```

@@ -11,8 +11,13 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         static let automaticSelection = 10_001
         static let currentApplication = 10_002
         static let launchAtLogin = 10_003
+        static let appUpdate = 10_004
     }
 
+    private let capabilityRegistry = GlossCapabilityRegistry.current
+    private lazy var scenarioActivation = GlossAppScenarioActivation(
+        registry: capabilityRegistry
+    )
     private let languages = TranslationLanguages.common
     private let targetLanguageKey = "targetLanguage"
     private let reverseLanguageKey = "reverseLanguage"
@@ -26,6 +31,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let codexReasoningEffortKey = "codexReasoningEffort"
     private let glossaryRevisionKey = "glossaryRevision"
     private let welcomeVersionKey = "welcomeVersion"
+    private let appUpdateLastCheckKey = "appUpdateLastCheck"
     private let glossaryStore = GlossaryStore()
     private let runtimeLog = GlossRuntimeLog.shared
     private let dispatchState = TranslationDispatchState()
@@ -54,6 +60,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pdfRuntimeActionTask: Task<Void, Never>?
     private var pdfRuntimeActionID: UUID?
     private lazy var pdfRuntimeController = PDFRuntimeController()
+    private var appUpdateActionTask: Task<Void, Never>?
+    private lazy var appUpdateController: AppUpdateController? =
+        makeAppUpdateController()
     private var selectionMonitor: SelectionMonitor?
     private var currentSelection: SelectionSnapshot?
     private var activeTranslationID: UUID?
@@ -88,6 +97,176 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return trimmed.isEmpty ? "dev" : trimmed
     }
 
+    private var currentAppUpdateState: AppUpdateDashboardState {
+        appUpdateController?.state
+            ?? .unavailable(
+                currentVersion: applicationVersion,
+                reason: "仅正式版本支持自动更新"
+            )
+    }
+
+    private var appUpdaterRootURL: URL? {
+        FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first?
+        .appendingPathComponent("Gloss", isDirectory: true)
+        .appendingPathComponent("AppUpdater", isDirectory: true)
+    }
+
+    private func makeAppUpdateController() -> AppUpdateController? {
+        guard capabilityRegistry.supports(.appUpdates),
+            GlossSemanticVersion(applicationVersion) != nil,
+            let updaterRootURL = appUpdaterRootURL
+        else {
+            return nil
+        }
+
+        do {
+            let historyKey = appUpdateLastCheckKey
+            let history = GlossAppUpdateCheckHistory(
+                lastCheck: {
+                    UserDefaults.standard.object(forKey: historyKey) as? Date
+                },
+                recordCheck: { date in
+                    UserDefaults.standard.set(date, forKey: historyKey)
+                }
+            )
+            let discovery = try GlossAppUpdateDiscovery(
+                currentVersion: applicationVersion,
+                fetcher: .live,
+                history: history
+            )
+            let detector = GlossHomebrewInstallationDetector(
+                commandRunner: .live
+            )
+            let currentBundleURL = Bundle.main.bundleURL
+            let bundledHelperURL =
+                currentBundleURL
+                .appendingPathComponent("Contents", isDirectory: true)
+                .appendingPathComponent("Helpers", isDirectory: true)
+                .appendingPathComponent(
+                    GlossAppUpdateHelperLauncher.helperName
+                )
+            let stagingRootURL = updaterRootURL.appendingPathComponent(
+                "staging",
+                isDirectory: true
+            )
+            let resultURL = updaterRootURL.appendingPathComponent(
+                "latest-result.json"
+            )
+            let launcher = GlossAppUpdateHelperLauncher()
+            let initialState = consumeAppUpdateResult(at: resultURL)
+            if initialState != nil {
+                do {
+                    try AppUpdateStagingCleaner.removeStagedHelpers(
+                        at: stagingRootURL
+                    )
+                } catch {
+                    runtimeLog.write(
+                        "app-update",
+                        "staging_cleanup_failed error=\(error.localizedDescription)"
+                    )
+                }
+            }
+
+            let controller = AppUpdateController(
+                currentVersion: applicationVersion,
+                dependencies: AppUpdateController.Dependencies(
+                    check: { mode in
+                        try await discovery.check(mode: mode)
+                    },
+                    detectHomebrewInstallation: {
+                        try await detector.detect(
+                            currentBundleURL: currentBundleURL
+                        )
+                    },
+                    launchHomebrewUpdate: { installation, update in
+                        _ = try await launcher.launch(
+                            bundledHelperURL: bundledHelperURL,
+                            installation: installation,
+                            update: update,
+                            parentProcessIdentifier:
+                                Int32(ProcessInfo.processInfo.processIdentifier),
+                            currentBundleURL: currentBundleURL,
+                            cacheRootURL: stagingRootURL,
+                            resultURL: resultURL
+                        )
+                    },
+                    openReleasePage: { url in
+                        NSWorkspace.shared.open(url)
+                    },
+                    isBusinessTaskActive: { [weak self] in
+                        guard let self else { return false }
+                        if pdfTranslationWindowController?
+                            .hasActiveTranslation == true
+                        {
+                            return true
+                        }
+                        if case .translating =
+                            pdfRuntimeController.dashboardState
+                        {
+                            return true
+                        }
+                        let dispatch = await dispatchState.snapshot()
+                        return dispatch.pendingInteractiveJobs > 0
+                            || dispatch.pendingVisibleJobs > 0
+                            || dispatch.pendingBackgroundJobs > 0
+                            || dispatch.activeInteractiveJobs > 0
+                            || dispatch.activeVisibleJobs > 0
+                            || dispatch.activeBackgroundJobs > 0
+                            || dispatch.upstreamBackgroundItems > 0
+                    },
+                    requestApplicationTermination: {
+                        NSApp.terminate(nil)
+                    },
+                    operatingSystemVersion: {
+                        ProcessInfo.processInfo.operatingSystemVersion
+                    }
+                ),
+                initialState: initialState
+            )
+            controller.onStateChange = { [weak self] state in
+                self?.showAppUpdateState(state)
+            }
+            return controller
+        } catch {
+            runtimeLog.write(
+                "app-update",
+                "initialization_failed error=\(error.localizedDescription)"
+            )
+            return nil
+        }
+    }
+
+    private func consumeAppUpdateResult(
+        at resultURL: URL
+    ) -> AppUpdateDashboardState? {
+        guard FileManager.default.fileExists(atPath: resultURL.path) else {
+            return nil
+        }
+        do {
+            let result = try GlossHomebrewUpgradeResultStore.load(
+                from: resultURL
+            )
+            try FileManager.default.removeItem(at: resultURL)
+            return .fromHomebrewResult(
+                result,
+                currentVersion: applicationVersion
+            )
+        } catch {
+            runtimeLog.write(
+                "app-update",
+                "result_read_failed error=\(error.localizedDescription)"
+            )
+            try? FileManager.default.removeItem(at: resultURL)
+            return .failed(
+                currentVersion: applicationVersion,
+                message: "无法读取上一次更新结果。"
+            )
+        }
+    }
+
     private var glossBar: GlossBarController {
         if let glossBarController { return glossBarController }
         let controller = GlossBarController()
@@ -118,7 +297,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var settingsWindow: SettingsWindowController {
         if let settingsWindowController { return settingsWindowController }
-        let controller = SettingsWindowController()
+        let controller = SettingsWindowController(capabilityRegistry: capabilityRegistry)
         controller.onRequestAccessibility = { [weak self] in
             self?.requestAccessibility()
         }
@@ -155,6 +334,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.onPDFRuntimeAction = { [weak self] action in
             self?.performPDFRuntimeAction(action)
         }
+        controller.onAppUpdateAction = { [weak self] in
+            self?.performAppUpdateAction()
+        }
         controller.onRevealLogs = { [weak self] in
             self?.revealLogs()
         }
@@ -167,12 +349,21 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.onSetGlobalShortcut = { [weak self] shortcut in
             self?.setGlobalShortcut(shortcut)
         }
-        controller.showBridgeState(bridgeDashboardState)
-        controller.showPDFRuntimeState(pdfRuntimeController.dashboardState)
-        controller.showBrowserExtensionStatus(
-            browserExtensionStatus.message,
-            succeeded: browserExtensionStatus.succeeded
-        )
+        if scenarioActivation.startsTranslationBridge {
+            controller.showBridgeState(bridgeDashboardState)
+        }
+        if scenarioActivation.preparesPDFRuntime {
+            controller.showPDFRuntimeState(pdfRuntimeController.dashboardState)
+        }
+        if capabilityRegistry.supports(.appUpdates) {
+            controller.showAppUpdateState(currentAppUpdateState)
+        }
+        if capabilityRegistry.isEnabled(.browserTranslation) {
+            controller.showBrowserExtensionStatus(
+                browserExtensionStatus.message,
+                succeeded: browserExtensionStatus.succeeded
+            )
+        }
         controller.showProviderConfiguration(providerConfiguration)
         if let succeeded = engineStatus.succeeded {
             controller.showProviderResult(engineStatus.message, succeeded: succeeded)
@@ -340,19 +531,36 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? runtimeLog.prepare()
         runtimeLog.write("app", "started version=\(applicationVersion)")
-        startObservingPDFRuntime()
-        pdfRuntimeController.prepareAtLaunch()
+        if scenarioActivation.preparesPDFRuntime {
+            startObservingPDFRuntime()
+            pdfRuntimeController.prepareAtLaunch()
+        }
         NSApp.setActivationPolicy(.accessory)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
             self?.configureStatusItem()
         }
-        configureServices()
-        configureSelectionMonitor()
-        configureWorkspaceObservation()
-        startBrowserBridge()
-        prewarmProvider()
+        if scenarioActivation.configuresSystemServices {
+            configureServices()
+        }
+        if capabilityRegistry.isEnabled(.selectionTranslation) {
+            configureSelectionMonitor()
+        }
+        if scenarioActivation.observesWorkspaceApplications {
+            configureWorkspaceObservation()
+        }
+        if scenarioActivation.startsTranslationBridge {
+            startBrowserBridge()
+        }
+        if scenarioActivation.prewarmsTranslationProvider {
+            prewarmProvider()
+        }
+        if capabilityRegistry.supports(.appUpdates) {
+            appUpdateController?.startAutomaticCheck()
+        }
 
-        if !reconcileAccessibility() {
+        if capabilityRegistry.isEnabled(.selectionTranslation),
+            !reconcileAccessibility()
+        {
             startAccessibilityPolling()
         }
 
@@ -365,38 +573,51 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return URL(fileURLWithPath: rawArguments[index + 1])
         }
         if !pdfURLs.isEmpty {
-            let requestedPage =
-                rawArguments.firstIndex(of: "--pdf-page")
-                .flatMap { index in
-                    rawArguments.indices.contains(index + 1)
-                        ? Int(rawArguments[index + 1])
-                        : nil
-                }
-                .map { max(0, $0 - 1) } ?? 0
-            DispatchQueue.main.async { [weak self] in
-                for (index, url) in pdfURLs.enumerated() {
-                    do {
-                        try self?.pdfTranslationWindow.open(
-                            url,
-                            pageIndex: index == 0 ? requestedPage : 0
-                        )
-                    } catch {
-                        self?.showAlert(
-                            title: "无法打开 \(url.lastPathComponent)",
-                            message: error.localizedDescription
-                        )
+            if scenarioActivation.acceptsPDFOpenRequests {
+                let requestedPage =
+                    rawArguments.firstIndex(of: "--pdf-page")
+                    .flatMap { index in
+                        rawArguments.indices.contains(index + 1)
+                            ? Int(rawArguments[index + 1])
+                            : nil
+                    }
+                    .map { max(0, $0 - 1) } ?? 0
+                DispatchQueue.main.async { [weak self] in
+                    for (index, url) in pdfURLs.enumerated() {
+                        do {
+                            try self?.pdfTranslationWindow.open(
+                                url,
+                                pageIndex: index == 0 ? requestedPage : 0
+                            )
+                        } catch {
+                            self?.showAlert(
+                                title: "无法打开 \(url.lastPathComponent)",
+                                message: error.localizedDescription
+                            )
+                        }
                     }
                 }
+            } else {
+                runtimeLog.write(
+                    "app",
+                    "ignored_pdf_open count=\(pdfURLs.count) reason=scenario_disabled"
+                )
             }
-        } else if arguments.contains("--show-history") {
+        } else if capabilityRegistry.isEnabled(.translationHistory),
+            arguments.contains("--show-history")
+        {
             DispatchQueue.main.async { [weak self] in
                 self?.historyWindow.show()
             }
-        } else if arguments.contains("--show-glossary") {
+        } else if capabilityRegistry.isEnabled(.glossaryManagement),
+            arguments.contains("--show-glossary")
+        {
             DispatchQueue.main.async { [weak self] in
                 self?.glossaryWindow.show()
             }
-        } else if arguments.contains("--show-exclusions") {
+        } else if capabilityRegistry.isEnabled(.selectionTranslation),
+            arguments.contains("--show-exclusions")
+        {
             DispatchQueue.main.async { [weak self] in
                 self?.showAppExclusions()
             }
@@ -442,6 +663,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         activeOCRTask?.cancel()
         pdfRuntimeObservationTask?.cancel()
         pdfRuntimeActionTask?.cancel()
+        appUpdateActionTask?.cancel()
+        appUpdateController?.cancel()
         stopAccessibilityPolling()
         selectionMonitor?.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -449,6 +672,14 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        guard scenarioActivation.acceptsPDFOpenRequests else {
+            runtimeLog.write(
+                "app",
+                "ignored_pdf_open count=\(filenames.count) reason=scenario_disabled"
+            )
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
         let pdfURLs =
             filenames
             .map(URL.init(fileURLWithPath:))
@@ -484,14 +715,35 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pendingPDFRuntimeAction?.cancel()
         pdfRuntimeActionTask = nil
         pdfRuntimeActionID = nil
-        let pdfWindow = pdfTranslationWindowController
-        let pdfRuntime = pdfRuntimeController
-        Task { [codex, llama, pendingPDFRuntimeAction, pdfWindow, pdfRuntime] in
+        let pdfWindow =
+            scenarioActivation.preparesPDFRuntime
+            ? pdfTranslationWindowController
+            : nil
+        let pdfRuntime =
+            scenarioActivation.preparesPDFRuntime
+            ? pdfRuntimeController
+            : nil
+        let codexBackend =
+            scenarioActivation.prewarmsTranslationProvider
+            ? codex
+            : nil
+        let llamaBackend =
+            scenarioActivation.prewarmsTranslationProvider
+            ? llama
+            : nil
+        Task {
+            [
+                codexBackend,
+                llamaBackend,
+                pendingPDFRuntimeAction,
+                pdfWindow,
+                pdfRuntime,
+            ] in
             await pendingPDFRuntimeAction?.value
             await pdfWindow?.stopAndWait()
-            await pdfRuntime.shutdown()
-            await codex.stop()
-            await llama.stop()
+            await pdfRuntime?.shutdown()
+            await codexBackend?.stop()
+            await llamaBackend?.stop()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -501,7 +753,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let button = statusItem.button {
             button.image = GlossBrand.markImage(pointSize: 18)
             button.image?.accessibilityDescription = "Gloss"
-            button.toolTip = "Gloss · 选中，即懂"
+            button.toolTip = "Gloss · 浏览器与 PDF 翻译"
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
             guard let self else { return }
@@ -654,76 +906,94 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         title.isEnabled = false
         menu.addItem(title)
 
-        let clipboard = NSMenuItem(
-            title: "翻译剪贴板文本",
-            action: #selector(translateClipboard),
-            keyEquivalent: "t"
-        )
-        clipboard.keyEquivalentModifierMask = [.command, .option]
-        clipboard.target = self
-        menu.addItem(clipboard)
+        if capabilityRegistry.isEnabled(.browserTranslation) {
+            let browser = NSMenuItem(
+                title: "浏览器翻译与扩展…",
+                action: #selector(showSettings),
+                keyEquivalent: ""
+            )
+            browser.target = self
+            menu.addItem(browser)
+        }
 
-        let clipboardImage = NSMenuItem(
-            title: "翻译剪贴板图片",
-            action: #selector(translateClipboardImage),
-            keyEquivalent: "i"
-        )
-        clipboardImage.keyEquivalentModifierMask = [.command, .option]
-        clipboardImage.target = self
-        menu.addItem(clipboardImage)
+        if capabilityRegistry.isEnabled(.pdfTranslation) {
+            let pdf = NSMenuItem(
+                title: "打开 PDF 翻译…",
+                action: #selector(openPDFTranslation),
+                keyEquivalent: "o"
+            )
+            pdf.keyEquivalentModifierMask = [.command, .option]
+            pdf.target = self
+            menu.addItem(pdf)
+        }
 
-        let screenshot = NSMenuItem(
-            title: "截图翻译…",
-            action: #selector(translateScreenshot),
-            keyEquivalent: ""
-        )
-        screenshot.target = self
-        menu.addItem(screenshot)
+        if capabilityRegistry.isEnabled(.clipboardTranslation) {
+            let clipboard = NSMenuItem(
+                title: "翻译剪贴板文本",
+                action: #selector(translateClipboard),
+                keyEquivalent: "t"
+            )
+            clipboard.keyEquivalentModifierMask = [.command, .option]
+            clipboard.target = self
+            menu.addItem(clipboard)
+        }
 
-        let pdf = NSMenuItem(
-            title: "打开 PDF 翻译…",
-            action: #selector(openPDFTranslation),
-            keyEquivalent: "o"
-        )
-        pdf.keyEquivalentModifierMask = [.command, .option]
-        pdf.target = self
-        menu.addItem(pdf)
+        if capabilityRegistry.isEnabled(.imageTranslation) {
+            let clipboardImage = NSMenuItem(
+                title: "翻译剪贴板图片",
+                action: #selector(translateClipboardImage),
+                keyEquivalent: "i"
+            )
+            clipboardImage.keyEquivalentModifierMask = [.command, .option]
+            clipboardImage.target = self
+            menu.addItem(clipboardImage)
 
-        let selectedText = NSMenuItem(
-            title: "翻译当前选区（\(globalShortcut.displayName)）",
-            action: #selector(translateCurrentSelectionFromMenu),
-            keyEquivalent: ""
-        )
-        selectedText.target = self
-        selectedText.isEnabled = SelectionMonitor.isAccessibilityTrusted
-        menu.addItem(selectedText)
+            let screenshot = NSMenuItem(
+                title: "截图翻译…",
+                action: #selector(translateScreenshot),
+                keyEquivalent: ""
+            )
+            screenshot.target = self
+            menu.addItem(screenshot)
+        }
 
-        let automaticSelection = NSMenuItem(
-            title: "选中文字后自动显示",
-            action: #selector(toggleAutomaticSelection(_:)),
-            keyEquivalent: ""
-        )
-        automaticSelection.tag = MenuTag.automaticSelection
-        automaticSelection.target = self
-        menu.addItem(automaticSelection)
+        if capabilityRegistry.isEnabled(.selectionTranslation) {
+            let selectedText = NSMenuItem(
+                title: "翻译当前选区（\(globalShortcut.displayName)）",
+                action: #selector(translateCurrentSelectionFromMenu),
+                keyEquivalent: ""
+            )
+            selectedText.target = self
+            selectedText.isEnabled = SelectionMonitor.isAccessibilityTrusted
+            menu.addItem(selectedText)
 
-        let currentApplication = NSMenuItem(
-            title: "在当前 App 中自动显示",
-            action: #selector(toggleCurrentApplication(_:)),
-            keyEquivalent: ""
-        )
-        currentApplication.tag = MenuTag.currentApplication
-        currentApplication.target = self
-        menu.addItem(currentApplication)
-        let exclusionCount = excludedApplicationBundleIdentifiers.count
-        let manageApplications = NSMenuItem(
-            title: exclusionCount == 0 ? "管理 App 例外…" : "管理 App 例外…（\(exclusionCount)）",
-            action: #selector(showAppExclusions),
-            keyEquivalent: ""
-        )
-        manageApplications.target = self
-        menu.addItem(manageApplications)
-        updateSelectionMenuItems(in: menu)
+            let automaticSelection = NSMenuItem(
+                title: "选中文字后自动显示",
+                action: #selector(toggleAutomaticSelection(_:)),
+                keyEquivalent: ""
+            )
+            automaticSelection.tag = MenuTag.automaticSelection
+            automaticSelection.target = self
+            menu.addItem(automaticSelection)
+
+            let currentApplication = NSMenuItem(
+                title: "在当前 App 中自动显示",
+                action: #selector(toggleCurrentApplication(_:)),
+                keyEquivalent: ""
+            )
+            currentApplication.tag = MenuTag.currentApplication
+            currentApplication.target = self
+            menu.addItem(currentApplication)
+            let exclusionCount = excludedApplicationBundleIdentifiers.count
+            let manageApplications = NSMenuItem(
+                title: exclusionCount == 0 ? "管理 App 例外…" : "管理 App 例外…（\(exclusionCount)）",
+                action: #selector(showAppExclusions),
+                keyEquivalent: ""
+            )
+            manageApplications.target = self
+            menu.addItem(manageApplications)
+            updateSelectionMenuItems(in: menu)
+        }
         menu.addItem(.separator())
 
         let languageItem = NSMenuItem(title: "目标语言", action: nil, keyEquivalent: "")
@@ -812,44 +1082,50 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         profileItem.submenu = profileMenu
         menu.addItem(profileItem)
 
-        let glossary = NSMenuItem(
-            title: "术语表…",
-            action: #selector(showGlossary),
-            keyEquivalent: ""
-        )
-        glossary.target = self
-        menu.addItem(glossary)
-
-        let history = NSMenuItem(
-            title: "翻译历史…",
-            action: #selector(showHistory),
-            keyEquivalent: ""
-        )
-        history.target = self
-        menu.addItem(history)
-
-        let saveHistory = NSMenuItem(
-            title: "保存本地翻译历史",
-            action: #selector(toggleHistory(_:)),
-            keyEquivalent: ""
-        )
-        saveHistory.target = self
-        saveHistory.state = historyEnabled ? .on : .off
-        menu.addItem(saveHistory)
-        menu.addItem(.separator())
-
-        if SelectionMonitor.isAccessibilityTrusted {
-            let access = NSMenuItem(title: "选区访问已启用", action: nil, keyEquivalent: "")
-            access.isEnabled = false
-            menu.addItem(access)
-        } else {
-            let access = NSMenuItem(
-                title: "启用选区翻译…",
-                action: #selector(requestAccessibility),
+        if capabilityRegistry.isEnabled(.glossaryManagement) {
+            let glossary = NSMenuItem(
+                title: "术语表…",
+                action: #selector(showGlossary),
                 keyEquivalent: ""
             )
-            access.target = self
-            menu.addItem(access)
+            glossary.target = self
+            menu.addItem(glossary)
+        }
+
+        if capabilityRegistry.isEnabled(.translationHistory) {
+            let history = NSMenuItem(
+                title: "翻译历史…",
+                action: #selector(showHistory),
+                keyEquivalent: ""
+            )
+            history.target = self
+            menu.addItem(history)
+
+            let saveHistory = NSMenuItem(
+                title: "保存本地翻译历史",
+                action: #selector(toggleHistory(_:)),
+                keyEquivalent: ""
+            )
+            saveHistory.target = self
+            saveHistory.state = historyEnabled ? .on : .off
+            menu.addItem(saveHistory)
+        }
+        menu.addItem(.separator())
+
+        if capabilityRegistry.isEnabled(.selectionTranslation) {
+            if SelectionMonitor.isAccessibilityTrusted {
+                let access = NSMenuItem(title: "选区访问已启用", action: nil, keyEquivalent: "")
+                access.isEnabled = false
+                menu.addItem(access)
+            } else {
+                let access = NSMenuItem(
+                    title: "启用选区翻译…",
+                    action: #selector(requestAccessibility),
+                    keyEquivalent: ""
+                )
+                access.target = self
+                menu.addItem(access)
+            }
         }
 
         let loginItem = NSMenuItem(
@@ -895,6 +1171,18 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.target = self
         menu.addItem(settings)
 
+        if capabilityRegistry.supports(.appUpdates) {
+            let update = NSMenuItem(
+                title: "",
+                action: #selector(performAppUpdateAction),
+                keyEquivalent: ""
+            )
+            update.tag = MenuTag.appUpdate
+            update.target = self
+            updateAppUpdateMenuItem(update)
+            menu.addItem(update)
+        }
+
         let logs = NSMenuItem(
             title: "查看运行日志…",
             action: #selector(revealLogs),
@@ -920,6 +1208,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateSelectionMenuItems(in: menu)
         if let item = menu.item(withTag: MenuTag.launchAtLogin) {
             updateLaunchAtLoginMenuItem(item)
+        }
+        if let item = menu.item(withTag: MenuTag.appUpdate) {
+            updateAppUpdateMenuItem(item)
         }
         updateLaunchAtLoginStatus()
     }
@@ -1555,13 +1846,38 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showAbout() {
         showAlert(
             title: "Gloss",
-            message: "选中，即懂。\n\n系统级、上下文感知的 macOS 翻译工具。"
+            message: "浏览器与 PDF 翻译\n\n支持 Safari、Chrome 页面翻译与批量 PDF 翻译。"
         )
     }
 
     @objc private func showSettings() {
         updateLaunchAtLoginStatus()
+        settingsWindowController?.showAppUpdateState(currentAppUpdateState)
         settingsWindow.show()
+    }
+
+    @objc private func performAppUpdateAction() {
+        guard appUpdateActionTask == nil,
+            let controller = appUpdateController
+        else { return }
+        appUpdateActionTask = Task { @MainActor [weak self, controller] in
+            await controller.performPrimaryAction()
+            self?.appUpdateActionTask = nil
+        }
+    }
+
+    private func updateAppUpdateMenuItem(_ item: NSMenuItem) {
+        let presentation = currentAppUpdateState.menuPresentation
+        item.title = presentation.title
+        item.isEnabled = presentation.isEnabled
+    }
+
+    private func showAppUpdateState(_ state: AppUpdateDashboardState) {
+        settingsWindowController?.showAppUpdateState(state)
+        if let item = statusItem.menu?.item(withTag: MenuTag.appUpdate) {
+            updateAppUpdateMenuItem(item)
+        }
+        runtimeLog.write("app-update", "state=\(state)")
     }
 
     @objc private func revealLogs() {
@@ -1648,7 +1964,9 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             let token = try PairingTokenStore.loadOrCreate()
             pairingToken = token
-            prepareBrowserExtension(pairingToken: token)
+            if scenarioActivation.preparesBrowserExtensions {
+                prepareBrowserExtension(pairingToken: token)
+            }
             try Task.checkCancellation()
 
             occupant = try await bridgePortManager.inspect(token: token)
