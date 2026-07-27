@@ -196,6 +196,47 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(launch.source, "external-cli")
     }
 
+    func testHelperExecutableFindsSiblingBundledAppServer() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let helpers = root.appendingPathComponent(
+            "Gloss.app/Contents/Helpers",
+            isDirectory: true
+        )
+        let cli = helpers.appendingPathComponent("gloss-cli")
+        let runtime = helpers.appendingPathComponent(
+            "gloss-codex-app-server"
+        )
+        try makeExecutable(at: cli)
+        try makeExecutable(at: runtime)
+        let homebrewBin = root.appendingPathComponent(
+            "homebrew-bin",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: homebrewBin,
+            withIntermediateDirectories: true
+        )
+        let symlink = homebrewBin.appendingPathComponent("gloss-cli")
+        try FileManager.default.createSymbolicLink(
+            at: symlink,
+            withDestinationURL: cli
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let launch = try XCTUnwrap(
+            CodexAppServerClient.resolveRuntime(
+                environment: ["GLOSS_CODEX_BIN": "/unavailable/codex"],
+                bundleURL: root.appendingPathComponent("NotAnApp"),
+                executableURL: symlink
+            )
+        )
+
+        XCTAssertEqual(launch.executable, runtime.path)
+        XCTAssertEqual(launch.argumentPrefix, [])
+        XCTAssertEqual(launch.source, "sibling-app-server")
+    }
+
     func testFastLaunchArgumentsDisableUnusedCodexSubsystems() {
         let arguments = CodexAppServerClient.fastLaunchArguments(
             reasoningEffort: .low,
