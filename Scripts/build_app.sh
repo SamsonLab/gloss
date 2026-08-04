@@ -8,14 +8,16 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 HELPERS_DIR="$CONTENTS_DIR/Helpers"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 PLUGINS_DIR="$CONTENTS_DIR/PlugIns"
-PLUGIN_DIR="$ROOT_DIR/../personal-immersive-translator"
+PLUGIN_DIR="${GLOSS_BROWSER_EXTENSION_SOURCE:-$ROOT_DIR/../personal-immersive-translator}"
 BROWSER_EXTENSION_DIR="$PLUGIN_DIR/.output/chrome-mv3"
 SAFARI_PROJECT="$PLUGIN_DIR/safari/Gloss/Gloss.xcodeproj"
 SAFARI_BUILD_DIR="$PLUGIN_DIR/safari/build"
 SAFARI_EXTENSION="$SAFARI_BUILD_DIR/Build/Products/Release/Gloss Extension.appex"
 SAFARI_ENTITLEMENTS="$PLUGIN_DIR/safari/Gloss/Gloss Extension/Gloss Extension.entitlements"
 APP_ENTITLEMENTS="$ROOT_DIR/Resources/Gloss.entitlements"
-CODEX_RUNTIME_MODE="${GLOSS_CODEX_RUNTIME_MODE:-bundled}"
+# Release builds are intentionally lightweight: Gloss uses an already installed
+# Codex CLI instead of embedding the roughly 206 MB app-server runtime.
+CODEX_RUNTIME_MODE="${GLOSS_CODEX_RUNTIME_MODE:-cli}"
 CODEX_RUNTIME=""
 CODEX_LICENSE=""
 case "$CODEX_RUNTIME_MODE" in
@@ -25,15 +27,16 @@ case "$CODEX_RUNTIME_MODE" in
     ;;
   cli)
     CODEX_CLI="${GLOSS_CODEX_BIN:-$(command -v codex || true)}"
-    if [[ -z "$CODEX_CLI" || ! -x "$CODEX_CLI" ]]; then
-      echo "Codex CLI not found. Install it or set GLOSS_CODEX_BIN." >&2
-      exit 1
-    fi
-    if ! "$CODEX_CLI" app-server --help >/dev/null 2>&1; then
+    if [[ -n "$CODEX_CLI" && -x "$CODEX_CLI" ]] \
+      && ! "$CODEX_CLI" app-server --help >/dev/null 2>&1; then
       echo "Installed Codex CLI does not provide 'codex app-server'." >&2
       exit 1
     fi
-    echo "Using external Codex CLI at runtime: $CODEX_CLI"
+    if [[ -n "$CODEX_CLI" && -x "$CODEX_CLI" ]]; then
+      echo "Building without bundled Codex; verified runtime CLI: $CODEX_CLI"
+    else
+      echo "Building without bundled Codex; users must install Codex CLI at runtime."
+    fi
     ;;
   *)
     echo "Unsupported GLOSS_CODEX_RUNTIME_MODE: $CODEX_RUNTIME_MODE" >&2
@@ -43,6 +46,12 @@ esac
 SIGN_IDENTITY="${GLOSS_SIGN_IDENTITY:--}"
 SAFARI_HOST_PROFILE="${GLOSS_SAFARI_HOST_PROVISIONING_PROFILE:-}"
 SAFARI_EXTENSION_PROFILE="${GLOSS_SAFARI_EXTENSION_PROVISIONING_PROFILE:-}"
+
+if [[ ! -f "$PLUGIN_DIR/package.json" ]]; then
+  echo "Gloss browser-extension source not found: $PLUGIN_DIR" >&2
+  echo "Set GLOSS_BROWSER_EXTENSION_SOURCE to its checkout." >&2
+  exit 66
+fi
 
 if [[ "$SIGN_IDENTITY" != "-" ]]; then
   if [[ ! -f "$SAFARI_HOST_PROFILE" || ! -f "$SAFARI_EXTENSION_PROFILE" ]]; then

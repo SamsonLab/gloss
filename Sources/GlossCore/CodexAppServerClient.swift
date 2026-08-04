@@ -845,7 +845,7 @@ public actor CodexAppServerClient: TranslationBackend {
         let startedAt = DispatchTime.now().uptimeNanoseconds
         guard let runtime = Self.resolveRuntime(environment: environment) else {
             throw TranslationError.backendUnavailable(
-                "Gloss 内置翻译引擎不可用。请重新安装 Gloss，或为开发环境配置 Codex CLI。"
+                "未找到 Codex CLI。请先安装 Codex，或在 GLOSS_CODEX_BIN 中指定其位置。"
             )
         }
         runtimeLog.write(

@@ -67,6 +67,9 @@ active runtime。
 - `pin(version:)`：固定 runtime 版本；其他版本的 manifest 会被拒绝。
 - `setChannel(_:)`：切换到已发布通道并清除旧 pin；当前仅允许 stable。
 - `rollback()`：原子交换 current/previous，保留一次快速回滚能力。
+- `reclaimableBytes()`：在确认卸载前计算运行时、历史版本与残留缓存占用。
+- `uninstall()`：先停止服务，再将组件内容隔离并原子提交未安装状态；保留通道与 pin 偏好，
+  不触碰源 PDF、翻译结果或输出目录，之后仍可重新安装。
 
 默认数据目录是：
 

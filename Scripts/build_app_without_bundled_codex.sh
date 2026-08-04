@@ -2,4 +2,5 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$SCRIPT_DIR/build_app_without_bundled_codex.sh" "$@"
+export GLOSS_CODEX_RUNTIME_MODE=cli
+exec "$SCRIPT_DIR/build_app.sh" "$@"

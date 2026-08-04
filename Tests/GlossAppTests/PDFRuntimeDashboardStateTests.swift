@@ -84,6 +84,29 @@ final class PDFRuntimeDashboardStateTests: XCTestCase {
         XCTAssertTrue(state.presentation.showsProgress)
     }
 
+    func testInstalledRuntimeCanBeUninstalledOnlyFromStableStates() {
+        let info = PDFRuntimeReadyInfo(
+            endpoint: "http://127.0.0.1:49160",
+            processIdentifier: 42,
+            version: "1.0.0",
+            executablePath: "/runtime/gloss-babeldoc"
+        )
+        XCTAssertTrue(PDFRuntimeDashboardState.ready(info).hasInstalledRuntime)
+        XCTAssertTrue(PDFRuntimeDashboardState.ready(info).canRequestUninstall)
+        XCTAssertFalse(
+            PDFRuntimeDashboardState.translating(
+                info,
+                fileName: "paper.pdf",
+                progress: 20
+            ).canRequestUninstall
+        )
+        XCTAssertEqual(
+            PDFRuntimeDashboardState.uninstalling.presentation.actionTitle,
+            "正在卸载…"
+        )
+        XCTAssertFalse(PDFRuntimeDashboardState.notInstalled.hasInstalledRuntime)
+    }
+
     func testControllerMapsMissingRuntimeToAutomaticInstall() {
         let state = PDFRuntimeController.dashboardState(
             runtime: nil,
