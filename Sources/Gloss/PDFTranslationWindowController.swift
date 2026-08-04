@@ -1387,7 +1387,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
         case .ready, .updateAvailable:
             true
         case .checking, .notInstalled, .installing, .starting, .translating,
-            .reconnecting, .stopping, .failed, .stopped:
+            .reconnecting, .stopping, .uninstalling, .failed, .stopped:
             false
         }
     }
@@ -1430,7 +1430,7 @@ final class PDFTranslationWindowController: NSObject, NSWindowDelegate {
             layoutServiceBaseURL = nil
             layoutCacheDirectoryURL = nil
             serviceState = .failed(message)
-        case .stopping:
+        case .stopping, .uninstalling:
             layoutServiceBaseURL = nil
             layoutCacheDirectoryURL = nil
             serviceState = .stopped

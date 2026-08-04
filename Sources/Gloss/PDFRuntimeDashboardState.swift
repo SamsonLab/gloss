@@ -15,6 +15,7 @@ enum PDFRuntimeDashboardAction: Equatable {
     case reconnect
     case retry
     case rollback
+    case uninstall
 }
 
 enum PDFRuntimeDashboardState: Equatable {
@@ -27,6 +28,7 @@ enum PDFRuntimeDashboardState: Equatable {
     case updateAvailable(PDFRuntimeReadyInfo, availableVersion: String)
     case reconnecting(previousProcessIdentifier: Int32?)
     case stopping(previousProcessIdentifier: Int32?)
+    case uninstalling
     case failed(message: String, installedVersion: String?, canRollback: Bool)
     case stopped(installedVersion: String?, canRollback: Bool)
 
@@ -39,9 +41,32 @@ enum PDFRuntimeDashboardState: Equatable {
         }
     }
 
+    var hasInstalledRuntime: Bool {
+        switch self {
+        case .ready, .translating, .updateAvailable, .starting, .reconnecting,
+            .stopping, .uninstalling:
+            true
+        case .failed(_, let installedVersion, _), .stopped(let installedVersion, _):
+            installedVersion != nil
+        case .checking, .notInstalled, .installing:
+            false
+        }
+    }
+
+    var canRequestUninstall: Bool {
+        switch self {
+        case .ready, .updateAvailable:
+            true
+        case .failed(_, let installedVersion, _), .stopped(let installedVersion, _):
+            installedVersion != nil
+        default:
+            false
+        }
+    }
+
     var action: PDFRuntimeDashboardAction? {
         switch self {
-        case .checking, .installing, .starting, .reconnecting, .stopping:
+        case .checking, .installing, .starting, .reconnecting, .stopping, .uninstalling:
             nil
         case .notInstalled:
             .install
@@ -173,6 +198,17 @@ enum PDFRuntimeDashboardState: Equatable {
                 actionTitle: "正在停止…",
                 actionEnabled: false,
                 actionIsDestructive: false,
+                showsProgress: true
+            )
+        case .uninstalling:
+            return PDFRuntimeDashboardPresentation(
+                headline: "正在卸载 PDF 组件…",
+                detail: "正在安全停止服务并清理运行时、历史版本与缓存",
+                path: nil,
+                tone: .warning,
+                actionTitle: "正在卸载…",
+                actionEnabled: false,
+                actionIsDestructive: true,
                 showsProgress: true
             )
         case .failed(let message, let installedVersion, let canRollback):

@@ -97,6 +97,7 @@ cask "gloss" do
       "#{app_path}/Contents/Helpers/gloss-update-helper",
       app_path,
     ]
+    code_paths.select! { |code_path| File.exist?(code_path) }
     code_paths.each do |code_path|
       system_command "/usr/bin/codesign",
                      args:         [
@@ -149,6 +150,8 @@ cask "gloss" do
   caveats <<~EOS
     Gloss uses an ad-hoc code signature and is not Apple-notarized. This custom
     tap re-signs the installed app and removes its quarantine attribute.
+    ChatGPT translation requires a separately installed Codex CLI with
+    the app-server subcommand; Gloss does not bundle Codex.
   EOS
 end
 RUBY

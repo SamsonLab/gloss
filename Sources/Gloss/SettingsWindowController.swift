@@ -3,6 +3,48 @@ import GlossCore
 
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
+    private enum Section: Int, CaseIterable {
+        case general
+        case engine
+        case browser
+        case pdf
+        case shortcuts
+        case updates
+
+        var title: String {
+            switch self {
+            case .general: "通用"
+            case .engine: "翻译引擎"
+            case .browser: "浏览器"
+            case .pdf: "PDF 组件"
+            case .shortcuts: "快捷键与服务"
+            case .updates: "更新与诊断"
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .general: "gearshape"
+            case .engine: "bolt.horizontal.circle"
+            case .browser: "globe"
+            case .pdf: "doc.richtext"
+            case .shortcuts: "command"
+            case .updates: "arrow.triangle.2.circlepath.circle"
+            }
+        }
+
+        var subtitle: String {
+            switch self {
+            case .general: "管理 Gloss 的外观与启动方式。"
+            case .engine: "选择网页与 PDF 翻译使用的模型和账号。"
+            case .browser: "管理浏览器扩展、配对令牌与本地连接。"
+            case .pdf: "按需安装、更新或移除 PDF 翻译组件。"
+            case .shortcuts: "配置系统选区、服务与全局快捷键。"
+            case .updates: "检查 Gloss 更新并查看运行日志。"
+            }
+        }
+    }
+
     var onRequestAccessibility: (() -> Void)?
     var onVerifyProvider: (() -> Void)?
     var onProviderConfigurationChange: ((TranslationProviderConfiguration) -> Void)?
@@ -23,6 +65,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
 
     private let capabilityRegistry: GlossCapabilityRegistry
     private let window: NSWindow
+    private let appearanceController = GlossAppearanceController.shared
+    private let pageContainer = NSView()
+    private var sectionButtons: [Section: NSButton] = [:]
+    private var sectionPages: [Section: NSView] = [:]
+    private var appearanceButtons: [GlossAppearancePreference: NSButton] = [:]
+    private var selectedSection = Section.general
     private let accessibilityStatus = NSTextField(labelWithString: "")
     private let providerStatus = NSTextField(labelWithString: "正在启动翻译引擎")
     private let bridgeStatus = NSTextField(labelWithString: "正在检查本地连接…")
@@ -61,6 +109,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         action: nil
     )
     private let pdfRuntimeProgressIndicator = NSProgressIndicator()
+    private let pdfRuntimeUninstallButton = NSButton(
+        title: "卸载…",
+        target: nil,
+        action: nil
+    )
     private var pdfRuntimeState = PDFRuntimeDashboardState.checking
     private let appUpdateActionButton = NSButton(
         title: "检查更新",
@@ -75,15 +128,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
 
     init(capabilityRegistry: GlossCapabilityRegistry = .current) {
         self.capabilityRegistry = capabilityRegistry
-        let windowHeight: CGFloat =
-            capabilityRegistry.isEnabled(.selectionTranslation)
-                || capabilityRegistry.isEnabled(.clipboardTranslation)
-                || capabilityRegistry.isEnabled(.imageTranslation)
-            ? 840
-            : capabilityRegistry.supports(.appUpdates) ? 720 : 640
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: windowHeight),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 940, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: true
         )
@@ -95,7 +142,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         if capabilityRegistry.isEnabled(.selectionTranslation) {
             updateAccessibilityStatus()
         }
-        window.center()
+        if !window.isVisible, !window.setFrameUsingName("GlossSettingsWindow") {
+            window.center()
+        }
+        selectSection(selectedSection)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
@@ -168,71 +218,119 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
     }
 
     private func configureWindow() {
-        window.title = "Gloss"
+        window.title = "Gloss 设置"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.minSize = NSSize(
-            width: 520,
-            height:
-                capabilityRegistry.isEnabled(.selectionTranslation)
-                ? 810
-                : capabilityRegistry.supports(.appUpdates) ? 690 : 610
-        )
+        window.minSize = NSSize(width: 780, height: 560)
+        window.setFrameAutosaveName("GlossSettingsWindow")
+        window.titlebarAppearsTransparent = true
 
-        let root = NSView()
-        let scrollView = NSScrollView()
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(scrollView)
-        window.contentView = root
+        let splitView = NSSplitView()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
 
-        let content = NSView()
-        content.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = content
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .behindWindow
+        sidebar.state = .active
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
 
+        let brandIcon = NSImageView()
+        brandIcon.image = GlossBrand.markImage(pointSize: 24)
+        brandIcon.contentTintColor = .controlAccentColor
+        brandIcon.translatesAutoresizingMaskIntoConstraints = false
+        let brandTitle = NSTextField(labelWithString: "Gloss")
+        brandTitle.font = .systemFont(ofSize: 17, weight: .semibold)
+        let brand = NSStackView(views: [brandIcon, brandTitle])
+        brand.orientation = .horizontal
+        brand.alignment = .centerY
+        brand.spacing = 10
+        brand.translatesAutoresizingMaskIntoConstraints = false
+
+        var navigationViews: [NSView] = []
+        for section in Section.allCases {
+            if section == .pdf, !capabilityRegistry.isEnabled(.pdfTranslation) {
+                continue
+            }
+            if section == .updates, !capabilityRegistry.supports(.appUpdates) {
+                continue
+            }
+            let button = NSButton(
+                title: section.title,
+                image: NSImage(
+                    systemSymbolName: section.symbol,
+                    accessibilityDescription: section.title
+                ) ?? NSImage(),
+                target: self,
+                action: #selector(selectSectionButton(_:))
+            )
+            button.tag = section.rawValue
+            button.alternateTitle = section.title
+            button.alternateImage = button.image
+            button.imagePosition = .imageLeading
+            button.alignment = .left
+            button.bezelStyle = .rounded
+            button.isBordered = false
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 8
+            button.setButtonType(.toggle)
+            button.controlSize = .large
+            button.font = .systemFont(ofSize: 13, weight: .medium)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.heightAnchor.constraint(equalToConstant: 38).isActive = true
+            sectionButtons[section] = button
+            navigationViews.append(button)
+        }
+        let navigation = NSStackView(views: navigationViews)
+        navigation.orientation = .vertical
+        navigation.alignment = .leading
+        navigation.spacing = 5
+        navigation.translatesAutoresizingMaskIntoConstraints = false
+        for view in navigationViews {
+            view.widthAnchor.constraint(equalTo: navigation.widthAnchor).isActive = true
+        }
+
+        let version =
+            Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String ?? "dev"
+        let versionLabel = NSTextField(labelWithString: "Gloss \(version)")
+        versionLabel.font = .systemFont(ofSize: 10.5, weight: .medium)
+        versionLabel.textColor = .tertiaryLabelColor
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        sidebar.addSubview(brand)
+        sidebar.addSubview(navigation)
+        sidebar.addSubview(versionLabel)
         NSLayoutConstraint.activate([
-            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: root.topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            content.leadingAnchor.constraint(
-                equalTo: scrollView.contentView.leadingAnchor
-            ),
-            content.trailingAnchor.constraint(
-                equalTo: scrollView.contentView.trailingAnchor
-            ),
-            content.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            content.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            brand.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 28),
+            brand.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 22),
+            brandIcon.widthAnchor.constraint(equalToConstant: 30),
+            brandIcon.heightAnchor.constraint(equalToConstant: 30),
+            navigation.topAnchor.constraint(equalTo: brand.bottomAnchor, constant: 28),
+            navigation.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 14),
+            navigation.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -14),
+            versionLabel.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 22),
+            versionLabel.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -18),
         ])
 
-        let icon = NSImageView()
-        icon.image = GlossBrand.markImage(pointSize: 36)
-        icon.contentTintColor = .controlAccentColor
-        icon.translatesAutoresizingMaskIntoConstraints = false
+        pageContainer.translatesAutoresizingMaskIntoConstraints = false
+        splitView.addArrangedSubview(sidebar)
+        splitView.addArrangedSubview(pageContainer)
+        sidebar.widthAnchor.constraint(equalToConstant: 220).isActive = true
 
-        let title = NSTextField(labelWithString: "Gloss")
-        title.font = .systemFont(ofSize: 28, weight: .bold)
-        let subtitle = NSTextField(
-            labelWithString: productSubtitle
-        )
-        subtitle.font = .systemFont(ofSize: 15)
-        subtitle.textColor = .secondaryLabelColor
-        let heading = NSStackView(views: [title, subtitle])
-        heading.orientation = .vertical
-        heading.alignment = .leading
-        heading.spacing = 3
-        heading.translatesAutoresizingMaskIntoConstraints = false
+        let root = NSView()
+        root.addSubview(splitView)
+        window.contentView = root
+        NSLayoutConstraint.activate([
+            splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            splitView.topAnchor.constraint(equalTo: root.topAnchor),
+            splitView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+        ])
 
-        let header = NSStackView(views: [icon, heading])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 14
-        header.translatesAutoresizingMaskIntoConstraints = false
-
-        var cards: [NSView] = []
+        var shortcutCards: [NSView] = []
         if capabilityRegistry.isEnabled(.selectionTranslation) {
             let accessibilityCard = makeStatusCard(
                 symbol: "selection.pin.in.out",
@@ -242,7 +340,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             )
             accessibilityButton.target = self
             accessibilityButton.action = #selector(requestAccessibility)
-            cards.append(accessibilityCard)
+            shortcutCards.append(accessibilityCard)
 
             let shortcutCard = makeStatusCard(
                 symbol: "command",
@@ -253,7 +351,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             shortcutButton.onChange = { [weak self] shortcut in
                 self?.onSetGlobalShortcut?(shortcut)
             }
-            cards.append(shortcutCard)
+            shortcutCards.append(shortcutCard)
         }
 
         if capabilityRegistry.isEnabled(.clipboardTranslation)
@@ -270,21 +368,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             )
             servicesButton.target = self
             servicesButton.action = #selector(openServicesSettings)
-            cards.append(servicesCard)
+            shortcutCards.append(servicesCard)
         }
 
-        if capabilityRegistry.supports(.providerConfiguration) {
-            cards.append(makeProviderCard())
-        }
-        if capabilityRegistry.supports(.translationLoopbackBridge) {
-            cards.append(makeBridgeCard())
-        }
-        if capabilityRegistry.isEnabled(.pdfTranslation) {
-            cards.append(makePDFRuntimeCard())
-        }
-        if capabilityRegistry.supports(.appUpdates) {
-            cards.append(makeAppUpdateCard())
-        }
+        var generalCards: [NSView] = [makeAppearanceCard()]
         if capabilityRegistry.supports(.launchAtLogin) {
             let launchAtLoginCard = makeStatusCard(
                 symbol: "power",
@@ -294,99 +381,214 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             )
             launchAtLoginSwitch.target = self
             launchAtLoginSwitch.action = #selector(setLaunchAtLogin(_:))
-            cards.append(launchAtLoginCard)
+            generalCards.append(launchAtLoginCard)
         }
 
-        let cardsStack = NSStackView(views: cards)
-        cardsStack.orientation = .vertical
-        cardsStack.alignment = .leading
-        cardsStack.spacing = 10
-        cardsStack.translatesAutoresizingMaskIntoConstraints = false
-        for card in cards {
-            card.widthAnchor.constraint(equalTo: cardsStack.widthAnchor).isActive = true
+        installPage(.general, cards: generalCards)
+        installPage(
+            .engine,
+            cards: capabilityRegistry.supports(.providerConfiguration)
+                ? [makeProviderCard()]
+                : []
+        )
+        installPage(
+            .browser,
+            cards: capabilityRegistry.supports(.translationLoopbackBridge)
+                ? [makeBridgeCard()]
+                : []
+        )
+        if capabilityRegistry.isEnabled(.pdfTranslation) {
+            installPage(.pdf, cards: [makePDFRuntimeCard()])
         }
-
-        var quickActionButtons: [NSButton] = []
-        if capabilityRegistry.isEnabled(.clipboardTranslation) {
-            let clipboardButton = NSButton(
-                title: "翻译文本",
-                target: self,
-                action: #selector(translateClipboard)
-            )
-            clipboardButton.bezelStyle = .rounded
-            clipboardButton.controlSize = .large
-            clipboardButton.keyEquivalent = "\r"
-            quickActionButtons.append(clipboardButton)
+        installPage(.shortcuts, cards: shortcutCards)
+        if capabilityRegistry.supports(.appUpdates) {
+            installPage(.updates, cards: [makeAppUpdateCard(), makeDiagnosticsCard()])
         }
-        if capabilityRegistry.isEnabled(.imageTranslation) {
-            let imageButton = NSButton(
-                title: "翻译图片",
-                target: self,
-                action: #selector(translateClipboardImage)
+        selectSection(.general)
+    }
+
+    private func installPage(_ section: Section, cards: [NSView]) {
+        let page = NSView()
+        page.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: section.title)
+        title.font = .systemFont(ofSize: 26, weight: .bold)
+        let subtitle = NSTextField(wrappingLabelWithString: section.subtitle)
+        subtitle.font = .systemFont(ofSize: 13)
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.maximumNumberOfLines = 2
+        let heading = NSStackView(views: [title, subtitle])
+        heading.orientation = .vertical
+        heading.alignment = .leading
+        heading.spacing = 5
+        heading.translatesAutoresizingMaskIntoConstraints = false
+
+        let contentViews: [NSView]
+        if cards.isEmpty {
+            let empty = NSTextField(
+                wrappingLabelWithString: "当前版本没有可配置的项目。"
             )
-            imageButton.bezelStyle = .rounded
-            imageButton.controlSize = .large
-            quickActionButtons.append(imageButton)
-
-            let screenshotButton = NSButton(
-                title: "截图翻译…",
-                target: self,
-                action: #selector(translateScreenshot)
-            )
-            screenshotButton.bezelStyle = .rounded
-            screenshotButton.controlSize = .large
-            quickActionButtons.append(screenshotButton)
-        }
-
-        content.addSubview(header)
-        content.addSubview(cardsStack)
-
-        var layoutConstraints = [
-            header.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
-            header.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 32),
-            header.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -32),
-            icon.widthAnchor.constraint(equalToConstant: 48),
-            icon.heightAnchor.constraint(equalToConstant: 48),
-            cardsStack.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 26),
-            cardsStack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
-            cardsStack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
-        ]
-
-        if quickActionButtons.isEmpty {
-            layoutConstraints.append(
-                cardsStack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24)
-            )
+            empty.font = .systemFont(ofSize: 13)
+            empty.textColor = .secondaryLabelColor
+            contentViews = [empty]
         } else {
-            let actionButtons = NSStackView(views: quickActionButtons)
-            actionButtons.orientation = .horizontal
-            actionButtons.alignment = .centerY
-            actionButtons.spacing = 8
-            actionButtons.translatesAutoresizingMaskIntoConstraints = false
-
-            let hint = NSTextField(
-                wrappingLabelWithString:
-                    "辅助翻译入口可随业务场景重新启用；图片始终在本机完成 OCR。"
-            )
-            hint.font = .systemFont(ofSize: 12)
-            hint.textColor = .tertiaryLabelColor
-            hint.alignment = .center
-            hint.translatesAutoresizingMaskIntoConstraints = false
-
-            content.addSubview(actionButtons)
-            content.addSubview(hint)
-            layoutConstraints.append(contentsOf: [
-                actionButtons.topAnchor.constraint(
-                    equalTo: cardsStack.bottomAnchor,
-                    constant: 24
-                ),
-                actionButtons.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-                hint.topAnchor.constraint(equalTo: actionButtons.bottomAnchor, constant: 16),
-                hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 44),
-                hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -44),
-                hint.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-            ])
+            contentViews = cards
         }
-        NSLayoutConstraint.activate(layoutConstraints)
+        let stack = NSStackView(views: contentViews)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for card in cards {
+            card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        page.addSubview(heading)
+        page.addSubview(stack)
+        NSLayoutConstraint.activate([
+            heading.topAnchor.constraint(equalTo: page.topAnchor, constant: 42),
+            heading.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 38),
+            heading.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -38),
+            stack.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 28),
+            stack.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 38),
+            stack.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -38),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: page.bottomAnchor, constant: -30),
+        ])
+
+        pageContainer.addSubview(page)
+        NSLayoutConstraint.activate([
+            page.leadingAnchor.constraint(equalTo: pageContainer.leadingAnchor),
+            page.trailingAnchor.constraint(equalTo: pageContainer.trailingAnchor),
+            page.topAnchor.constraint(equalTo: pageContainer.topAnchor),
+            page.bottomAnchor.constraint(equalTo: pageContainer.bottomAnchor),
+        ])
+        page.isHidden = true
+        sectionPages[section] = page
+    }
+
+    private func makeAppearanceCard() -> NSView {
+        let card = NSVisualEffectView()
+        card.material = .contentBackground
+        card.blendingMode = .withinWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 12
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: "外观")
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        let preferences: [GlossAppearancePreference] = [.system, .light, .dark]
+        let buttons = preferences.map { preference in
+            let button = NSButton(
+                title: preference.displayName,
+                image: NSImage(
+                    systemSymbolName: preference.symbolName,
+                    accessibilityDescription: preference.displayName
+                ) ?? NSImage(),
+                target: self,
+                action: #selector(selectAppearance(_:))
+            )
+            button.tag = preferences.firstIndex(of: preference) ?? 0
+            button.imagePosition = .imageAbove
+            button.imageScaling = .scaleProportionallyDown
+            button.isBordered = false
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 9
+            button.setButtonType(.toggle)
+            button.font = .systemFont(ofSize: 12.5, weight: .semibold)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.heightAnchor.constraint(equalToConstant: 110).isActive = true
+            appearanceButtons[preference] = button
+            return button
+        }
+        let choices = NSStackView(views: buttons)
+        choices.orientation = .horizontal
+        choices.alignment = .centerY
+        choices.distribution = .fillEqually
+        choices.spacing = 12
+        choices.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(title)
+        card.addSubview(choices)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 176),
+            title.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
+            title.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 18),
+            choices.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 12),
+            choices.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 18),
+            choices.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -18),
+            choices.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -15),
+        ])
+        updateAppearanceButtons()
+        return card
+    }
+
+    private func makeDiagnosticsCard() -> NSView {
+        let status = NSTextField(
+            labelWithString: "打开诊断目录，查看桥接、翻译引擎与 PDF 组件日志"
+        )
+        let button = NSButton(title: "查看日志", target: self, action: #selector(revealLogs))
+        return makeStatusCard(
+            symbol: "doc.text.magnifyingglass",
+            title: "运行诊断",
+            status: status,
+            accessory: button
+        )
+    }
+
+    @objc private func selectSectionButton(_ sender: NSButton) {
+        guard let section = Section(rawValue: sender.tag) else { return }
+        selectSection(section)
+    }
+
+    private func selectSection(_ section: Section) {
+        guard sectionPages[section] != nil else { return }
+        selectedSection = section
+        for (candidate, page) in sectionPages {
+            page.isHidden = candidate != section
+        }
+        for (candidate, button) in sectionButtons {
+            let isSelected = candidate == section
+            button.state = isSelected ? .on : .off
+            button.isBordered = false
+            button.layer?.backgroundColor =
+                isSelected
+                ? NSColor.controlAccentColor.cgColor
+                : NSColor.clear.cgColor
+            button.contentTintColor = isSelected ? .white : .labelColor
+        }
+        if section == .general {
+            updateAppearanceButtons()
+        }
+    }
+
+    @objc private func selectAppearance(_ sender: NSButton) {
+        let preferences: [GlossAppearancePreference] = [.system, .light, .dark]
+        guard preferences.indices.contains(sender.tag) else { return }
+        appearanceController.select(preferences[sender.tag])
+        updateAppearanceButtons()
+        selectSection(selectedSection)
+    }
+
+    private func updateAppearanceButtons() {
+        let selected = appearanceController.preference
+        for (preference, button) in appearanceButtons {
+            let isSelected = preference == selected
+            button.state = isSelected ? .on : .off
+            button.layer?.borderWidth = isSelected ? 2 : 1
+            button.layer?.borderColor =
+                isSelected
+                ? NSColor.controlAccentColor.cgColor
+                : NSColor.separatorColor.cgColor
+            button.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
+            button.contentTintColor = isSelected ? .controlAccentColor : .labelColor
+            button.toolTip =
+                isSelected
+                ? "当前外观：\(preference.displayName)"
+                : "切换到\(preference.displayName)"
+        }
     }
 
     private func makePDFRuntimeCard() -> NSView {
@@ -433,9 +635,21 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
             .required,
             for: .horizontal
         )
+        pdfRuntimeUninstallButton.target = self
+        pdfRuntimeUninstallButton.action = #selector(uninstallPDFRuntime)
+        pdfRuntimeUninstallButton.contentTintColor = .systemRed
+        pdfRuntimeUninstallButton.setContentHuggingPriority(
+            .required,
+            for: .horizontal
+        )
 
         let topRow = NSStackView(
-            views: [titleLabel, statusStack, pdfRuntimeActionButton]
+            views: [
+                titleLabel,
+                statusStack,
+                pdfRuntimeActionButton,
+                pdfRuntimeUninstallButton,
+            ]
         )
         topRow.orientation = .horizontal
         topRow.alignment = .centerY
@@ -964,6 +1178,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         onPDFRuntimeAction?(action)
     }
 
+    @objc private func uninstallPDFRuntime() {
+        onPDFRuntimeAction?(.uninstall)
+    }
+
     @objc private func performAppUpdateAction() {
         onAppUpdateAction?()
     }
@@ -1019,6 +1237,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSTextFieldDel
         pdfRuntimeActionButton.isEnabled = presentation.actionEnabled
         pdfRuntimeActionButton.contentTintColor =
             presentation.actionIsDestructive ? .systemRed : nil
+        pdfRuntimeUninstallButton.isHidden = !state.hasInstalledRuntime
+        pdfRuntimeUninstallButton.isEnabled = state.canRequestUninstall
         pdfRuntimeProgressIndicator.isHidden = !presentation.showsProgress
         if presentation.showsProgress {
             pdfRuntimeProgressIndicator.startAnimation(nil)

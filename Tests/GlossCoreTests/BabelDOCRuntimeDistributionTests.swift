@@ -544,6 +544,66 @@ struct BabelDOCRuntimeDistributionTests {
         #expect(try Data(contentsOf: executable) == firstPayload)
     }
 
+    @Test("uninstall removes current and rollback runtimes and allows reinstall")
+    func uninstallAndReinstall() async throws {
+        let root = try temporaryDirectory()
+        let firstPayload = Data("first-runtime".utf8)
+        let secondPayload = Data("second-runtime".utf8)
+        let firstURL = try #require(URL(string: "https://example.com/first-runtime"))
+        let secondURL = try #require(URL(string: "https://example.com/second-runtime"))
+        let manager = try BabelDOCRuntimeManager(
+            rootDirectory: root,
+            platform: platform,
+            transport: transport(
+                payloads: [
+                    firstURL: firstPayload,
+                    secondURL: secondPayload,
+                ]
+            ),
+            manifestSigningPublicKey: signingPublicKey
+        )
+
+        _ = try await manager.install(
+            manifest(
+                version: "1.0.0",
+                assets: [asset(url: firstURL, payload: firstPayload)]
+            )
+        )
+        _ = try await manager.install(
+            manifest(
+                version: "1.1.0",
+                assets: [asset(url: secondURL, payload: secondPayload)]
+            )
+        )
+        #expect(await manager.reclaimableBytes() >= Int64(firstPayload.count + secondPayload.count))
+
+        let removed = try await manager.uninstall()
+        #expect(removed.currentVersion == nil)
+        #expect(removed.previousVersion == nil)
+        #expect(removed.currentExecutableURL == nil)
+        #expect(removed.operation == .idle)
+        let versions = root.appendingPathComponent("versions", isDirectory: true)
+        #expect(
+            try FileManager.default.contentsOfDirectory(atPath: versions.path).isEmpty
+        )
+
+        let restoredManager = try BabelDOCRuntimeManager(
+            rootDirectory: root,
+            platform: platform,
+            transport: transport(payloads: [firstURL: firstPayload]),
+            manifestSigningPublicKey: signingPublicKey
+        )
+        #expect(await restoredManager.snapshot().currentVersion == nil)
+        let reinstalled = try await restoredManager.install(
+            manifest(
+                version: "1.0.0",
+                assets: [asset(url: firstURL, payload: firstPayload)]
+            )
+        )
+        #expect(reinstalled.currentVersion == "1.0.0")
+        #expect(reinstalled.currentExecutableURL != nil)
+    }
+
     @Test("update fetches signed metadata once and installs it")
     func updateUsesInjectedURLAndTransport() async throws {
         let root = try temporaryDirectory()

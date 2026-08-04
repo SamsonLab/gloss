@@ -51,6 +51,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let servicesProvider = GlossServicesProvider()
     private var glossBarController: GlossBarController?
     private var resultPanelController: ResultPanelController?
+    private var mainWindowController: MainWindowController?
     private var settingsWindowController: SettingsWindowController?
     private var historyWindowController: HistoryWindowController?
     private var glossaryWindowController: GlossaryWindowController?
@@ -295,6 +296,42 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return controller
     }
 
+    private var mainWindow: MainWindowController {
+        if let mainWindowController { return mainWindowController }
+        let controller = MainWindowController(capabilityRegistry: capabilityRegistry)
+        controller.onOpenSettings = { [weak self] in
+            self?.showSettings()
+        }
+        controller.onOpenPDFTranslation = { [weak self] in
+            self?.openPDFTranslation()
+        }
+        controller.onRevealBrowserExtension = { [weak self] in
+            self?.revealBrowserExtension()
+        }
+        controller.onCopyBrowserToken = { [weak self] in
+            self?.copyBrowserToken()
+        }
+        if capabilityRegistry.supports(.safariExtension) {
+            controller.onOpenSafariExtensionSettings = { [weak self] in
+                self?.openSafariExtensionSettings()
+            }
+        }
+        controller.onBridgeAction = { [weak self] in
+            self?.performBridgeDashboardAction()
+        }
+        controller.onPDFRuntimeAction = { [weak self] action in
+            self?.performPDFRuntimeAction(action)
+        }
+        controller.showBridgeState(bridgeDashboardState)
+        controller.showBrowserExtensionStatus(
+            browserExtensionStatus.message,
+            succeeded: browserExtensionStatus.succeeded
+        )
+        controller.showPDFRuntimeState(pdfRuntimeController.dashboardState)
+        mainWindowController = controller
+        return controller
+    }
+
     private var settingsWindow: SettingsWindowController {
         if let settingsWindowController { return settingsWindowController }
         let controller = SettingsWindowController(capabilityRegistry: capabilityRegistry)
@@ -533,6 +570,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? runtimeLog.prepare()
         runtimeLog.write("app", "started version=\(applicationVersion)")
+        GlossAppearanceController.shared.activate()
+        configureApplicationMenu()
         if scenarioActivation.preparesPDFRuntime {
             startObservingPDFRuntime()
             pdfRuntimeController.prepareAtLaunch()
@@ -649,10 +688,14 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { [weak self] in
                 self?.settingsWindow.show()
             }
-        } else if UserDefaults.standard.string(forKey: welcomeVersionKey) != "0.1" {
-            UserDefaults.standard.set("0.1", forKey: welcomeVersionKey)
+        } else if arguments.contains("--show-dashboard") {
             DispatchQueue.main.async { [weak self] in
-                self?.settingsWindow.show()
+                self?.mainWindow.show()
+            }
+        } else if UserDefaults.standard.string(forKey: welcomeVersionKey) != "1.0" {
+            UserDefaults.standard.set("1.0", forKey: welcomeVersionKey)
+            DispatchQueue.main.async { [weak self] in
+                self?.mainWindow.show()
             }
         }
     }
@@ -910,8 +953,8 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if capabilityRegistry.isEnabled(.browserTranslation) {
             let browser = NSMenuItem(
-                title: "浏览器翻译与扩展…",
-                action: #selector(showSettings),
+                title: "打开 Gloss…",
+                action: #selector(showDashboard),
                 keyEquivalent: ""
             )
             browser.target = self
@@ -1204,6 +1247,40 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         menu.addItem(quit)
         return menu
+    }
+
+    private func configureApplicationMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+
+        let appMenu = NSMenu(title: "Gloss")
+        appMenuItem.submenu = appMenu
+
+        let dashboard = NSMenuItem(
+            title: "打开 Gloss",
+            action: #selector(showDashboard),
+            keyEquivalent: ""
+        )
+        dashboard.target = self
+        appMenu.addItem(dashboard)
+
+        let settings = NSMenuItem(
+            title: "设置…",
+            action: #selector(showSettings),
+            keyEquivalent: ","
+        )
+        settings.target = self
+        appMenu.addItem(settings)
+        appMenu.addItem(.separator())
+
+        let quit = NSMenuItem(
+            title: "退出 Gloss",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        appMenu.addItem(quit)
+        NSApp.mainMenu = mainMenu
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -1862,6 +1939,10 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settingsWindow.show()
     }
 
+    @objc private func showDashboard() {
+        mainWindow.show()
+    }
+
     @objc private func performAppUpdateAction() {
         guard appUpdateActionTask == nil,
             let controller = appUpdateController
@@ -2172,11 +2253,24 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for await state in controller.stateChanges() {
                 guard let self, !Task.isCancelled else { return }
                 settingsWindowController?.showPDFRuntimeState(state)
+                mainWindowController?.showPDFRuntimeState(state)
             }
         }
     }
 
-    private func performPDFRuntimeAction(_ action: PDFRuntimeDashboardAction) {
+    private func performPDFRuntimeAction(
+        _ action: PDFRuntimeDashboardAction,
+        uninstallConfirmed: Bool = false
+    ) {
+        if action == .uninstall, !uninstallConfirmed {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let bytes = await pdfRuntimeController.estimatedReclaimableBytes()
+                guard confirmPDFRuntimeUninstall(reclaimableBytes: bytes) else { return }
+                performPDFRuntimeAction(.uninstall, uninstallConfirmed: true)
+            }
+            return
+        }
         let previousTask = pdfRuntimeActionTask
         previousTask?.cancel()
         let actionID = UUID()
@@ -2205,6 +2299,24 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 pdfRuntimeActionID = nil
             }
         }
+    }
+
+    private func confirmPDFRuntimeUninstall(reclaimableBytes: Int64?) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "卸载 PDF 翻译组件？"
+        let sizeText =
+            reclaimableBytes.map {
+                ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+            } ?? "未知"
+        alert.informativeText = """
+            预计释放空间：\(sizeText)
+
+            将删除 PDF 运行时、历史版本与相关缓存。源 PDF、翻译结果、输出目录以及 Gloss 偏好设置不会被删除。卸载后仍可使用浏览器翻译，也可以随时重新安装 PDF 组件。
+            """
+        alert.addButton(withTitle: "卸载 PDF 组件")
+        alert.addButton(withTitle: "取消")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func performBridgeDashboardAction() {
@@ -2278,11 +2390,16 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "dashboard state=\(String(describing: state)) message=\(presentation.headline) detail=\(presentation.detail)"
         )
         settingsWindowController?.showBridgeState(state)
+        mainWindowController?.showBridgeState(state)
     }
 
     private func updateBrowserExtensionStatus(_ message: String, succeeded: Bool) {
         browserExtensionStatus = (message, succeeded)
         settingsWindowController?.showBrowserExtensionStatus(
+            message,
+            succeeded: succeeded
+        )
+        mainWindowController?.showBrowserExtensionStatus(
             message,
             succeeded: succeeded
         )

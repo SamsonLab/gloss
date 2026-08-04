@@ -351,6 +351,7 @@ public enum BabelDOCRuntimeOperation: String, Codable, Sendable {
     case extracting
     case installing
     case rollingBack
+    case removing
     case ready
     case failed
 }
@@ -516,6 +517,10 @@ public actor BabelDOCRuntimeManager {
 
     public var updateAvailable: Bool {
         makeSnapshot().updateAvailable
+    }
+
+    public func reclaimableBytes() -> Int64 {
+        Self.directorySize(at: rootDirectory, fileManager: fileManager)
     }
 
     public func snapshots() -> AsyncStream<BabelDOCRuntimeSnapshot> {
@@ -798,6 +803,74 @@ public actor BabelDOCRuntimeManager {
         }
         emit(.init(operation: .ready, version: previous.version), progress: progress)
         return publishSnapshot()
+    }
+
+    @discardableResult
+    public func uninstall(
+        progress: ProgressHandler? = nil
+    ) throws -> BabelDOCRuntimeSnapshot {
+        let stateBeforeRemoval = persistedState
+        let manifestBeforeRemoval = availableManifest
+        let quarantineDirectory = rootDirectory.appendingPathComponent(
+            ".removing-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        var movedItems: [(source: URL, destination: URL)] = []
+        var createdReplacementVersionsDirectory = false
+
+        do {
+            emit(.init(operation: .removing, version: persistedState.current?.version), progress: progress)
+            try Self.prepareDirectory(quarantineDirectory, fileManager: fileManager)
+            let contents = try fileManager.contentsOfDirectory(
+                at: rootDirectory,
+                includingPropertiesForKeys: nil,
+                options: []
+            )
+            let preservedNames = Set([
+                stateURL.lastPathComponent,
+                quarantineDirectory.lastPathComponent,
+            ])
+            for source in contents {
+                guard !preservedNames.contains(source.lastPathComponent) else { continue }
+                let destination = quarantineDirectory.appendingPathComponent(
+                    source.lastPathComponent,
+                    isDirectory: source.hasDirectoryPath
+                )
+                try fileManager.moveItem(at: source, to: destination)
+                movedItems.append((source, destination))
+            }
+            try Self.prepareDirectory(versionsDirectory, fileManager: fileManager)
+            createdReplacementVersionsDirectory = true
+
+            persistedState.current = nil
+            persistedState.previous = nil
+            availableManifest = nil
+            lastError = nil
+            operation = .idle
+            try persist()
+
+            // State is already committed as uninstalled. Cleanup is best-effort:
+            // a quarantined remainder is inert and will be included in the next
+            // reclaimable-size calculation instead of risking a half-restored
+            // executable after a partial filesystem deletion.
+            try? fileManager.removeItem(at: quarantineDirectory)
+            emit(.init(operation: .idle), progress: progress)
+            return publishSnapshot()
+        } catch {
+            if createdReplacementVersionsDirectory {
+                try? fileManager.removeItem(at: versionsDirectory)
+            }
+            for item in movedItems.reversed()
+            where fileManager.fileExists(atPath: item.destination.path) {
+                try? fileManager.moveItem(at: item.destination, to: item.source)
+            }
+            try? fileManager.removeItem(at: quarantineDirectory)
+            persistedState = stateBeforeRemoval
+            availableManifest = manifestBeforeRemoval
+            try? persist()
+            record(error, progress: progress)
+            throw error
+        }
     }
 
     private func validate(_ manifest: BabelDOCRuntimeManifest) throws {
@@ -1109,6 +1182,31 @@ public actor BabelDOCRuntimeManager {
         for url in contents where !retained.contains(url.lastPathComponent) {
             try? fileManager.removeItem(at: url)
         }
+    }
+
+    private static func directorySize(
+        at root: URL,
+        fileManager: FileManager
+    ) -> Int64 {
+        guard
+            let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+                options: [],
+                errorHandler: { _, _ in true }
+            )
+        else { return 0 }
+
+        var total: Int64 = 0
+        while let url = enumerator.nextObject() as? URL {
+            guard
+                let values = try? url.resourceValues(
+                    forKeys: [.isRegularFileKey, .fileSizeKey]
+                ), values.isRegularFile == true
+            else { continue }
+            total += Int64(values.fileSize ?? 0)
+        }
+        return total
     }
 
     private static func prepareDirectory(

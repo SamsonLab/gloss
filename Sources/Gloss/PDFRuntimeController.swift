@@ -112,6 +112,11 @@ final class PDFRuntimeController {
         Self.compatibleManagedRuntimeLaunch(for: runtimeSnapshot)
     }
 
+    func estimatedReclaimableBytes() async -> Int64? {
+        guard let runtimeManager else { return nil }
+        return await runtimeManager.reclaimableBytes()
+    }
+
     func prepareAtLaunch() {
         guard !launchPreparationCompleted,
             launchPreparationTask == nil
@@ -309,6 +314,8 @@ final class PDFRuntimeController {
                     _ = try await reconnect()
                 case .rollback:
                     _ = try await rollbackAndRestart()
+                case .uninstall:
+                    try await uninstallAndStop()
                 case .cancel:
                     break
                 }
@@ -514,6 +521,17 @@ final class PDFRuntimeController {
         return try await start(launch)
     }
 
+    private func uninstallAndStop() async throws {
+        guard let runtimeManager else {
+            throw ControllerError.runtimeManagerUnavailable
+        }
+        try await stopServiceForRuntimeReplacement()
+        try Task.checkCancellation()
+        runtimeSnapshot = try await runtimeManager.uninstall()
+        resetLaunchPreparation()
+        refreshDashboard()
+    }
+
     private func reconnect() async throws -> PreparedRuntime {
         guard let launch = currentRuntimeLaunch else {
             throw Self.runtimeUpdateRequiredError(for: runtimeSnapshot)
@@ -685,6 +703,8 @@ final class PDFRuntimeController {
                     version: runtime.availableVersion ?? runtime.currentVersion,
                     progress: nil
                 )
+            case .removing:
+                return .uninstalling
             case .failed where runtime.currentVersion == nil:
                 return .failed(
                     message: runtime.lastError ?? "BabelDOC 运行时操作失败。",
