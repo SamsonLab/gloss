@@ -39,6 +39,42 @@ final class AppUpdateControllerTests: XCTestCase {
         )
     }
 
+    func testAutomaticUpdateDiscoveryRequestsOneUserReminder() async {
+        let expectedInstallation = installation()
+        let controller = makeController(
+            check: { _ in .updateAvailable(self.updateAvailability()) },
+            detect: { expectedInstallation }
+        )
+        var reminders: [(GlossAppUpdateAvailability, AppUpdateDelivery)] = []
+        controller.onAutomaticUpdateAvailable = { update, delivery in
+            reminders.append((update, delivery))
+        }
+
+        await controller.check(mode: .automatic)
+
+        XCTAssertEqual(reminders.count, 1)
+        XCTAssertEqual(reminders.first?.0, updateAvailability())
+        XCTAssertEqual(
+            reminders.first?.1,
+            .homebrew(expectedInstallation)
+        )
+    }
+
+    func testManualUpdateCheckDoesNotRequestAutomaticReminder() async {
+        let controller = makeController(
+            check: { _ in .updateAvailable(self.updateAvailability()) },
+            detect: { self.installation() }
+        )
+        var reminderCount = 0
+        controller.onAutomaticUpdateAvailable = { _, _ in
+            reminderCount += 1
+        }
+
+        await controller.check(mode: .manual)
+
+        XCTAssertEqual(reminderCount, 0)
+    }
+
     func testUnmanagedInstallOnlyOpensOfficialReleasePage() async {
         var openedURL: URL?
         let controller = makeController(
@@ -75,6 +111,36 @@ final class AppUpdateControllerTests: XCTestCase {
         guard case .blockedByBusinessTask = controller.state else {
             return XCTFail("Expected business-task blocked state")
         }
+        controller.cancel()
+    }
+
+    func testDeferredInstallContinuesWhenBusinessTaskFinishes() async {
+        var businessTaskActive = true
+        var helperLaunchCount = 0
+        var terminationCount = 0
+        let helperLaunched = expectation(description: "update helper launched")
+        let controller = makeController(
+            check: { _ in .updateAvailable(self.updateAvailability()) },
+            detect: { self.installation() },
+            launch: { _, _ in
+                helperLaunchCount += 1
+                helperLaunched.fulfill()
+            },
+            isPDFActive: { businessTaskActive },
+            terminate: { terminationCount += 1 }
+        )
+
+        await controller.check(mode: .manual)
+        await controller.performPrimaryAction()
+        businessTaskActive = false
+        await fulfillment(of: [helperLaunched], timeout: 1)
+
+        XCTAssertEqual(helperLaunchCount, 1)
+        XCTAssertEqual(terminationCount, 1)
+        XCTAssertEqual(
+            controller.state,
+            .preparingInstall(version: "0.8.3")
+        )
     }
 
     func testVerifiedHelperLaunchRequestsTermination() async {
@@ -222,6 +288,7 @@ final class AppUpdateControllerTests: XCTestCase {
                 launchHomebrewUpdate: launch,
                 openReleasePage: openReleasePage,
                 isBusinessTaskActive: isPDFActive,
+                deferredInstallPollInterval: .milliseconds(10),
                 requestApplicationTermination: terminate,
                 operatingSystemVersion: { operatingSystemVersion }
             )

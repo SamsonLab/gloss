@@ -42,7 +42,10 @@ Gloss requires **macOS 14 or newer**.
 brew install --cask sunchj/tap/gloss
 ```
 
-Upgrade from the app or with:
+Gloss checks the signed release channel after launch, at most once every 24
+hours. When an update is available it presents an actionable reminder; official
+Homebrew installations can update and restart directly from that prompt. You
+can also update manually with:
 
 ```bash
 brew update

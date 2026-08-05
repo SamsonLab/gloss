@@ -138,10 +138,10 @@ enum AppUpdateDashboardState: Equatable {
         case .blockedByBusinessTask(let update, _):
             AppUpdateDashboardPresentation(
                 headline: "等待当前翻译任务完成",
-                detail: "完成当前任务后即可安装 Gloss \(update.version)",
+                detail: "任务完成后将自动安装 Gloss \(update.version)",
                 tone: .warning,
-                actionTitle: "重试更新",
-                actionEnabled: true,
+                actionTitle: "等待任务完成",
+                actionEnabled: false,
                 showsProgress: false
             )
         case .preparingInstall(let version):
@@ -193,8 +193,8 @@ enum AppUpdateDashboardState: Equatable {
             return AppUpdateMenuPresentation(title: title, isEnabled: true)
         case .blockedByBusinessTask(let update, _):
             return AppUpdateMenuPresentation(
-                title: "完成当前任务后更新到 \(update.version)…",
-                isEnabled: true
+                title: "任务完成后自动更新到 \(update.version)…",
+                isEnabled: false
             )
         case .preparingInstall:
             return AppUpdateMenuPresentation(

@@ -39,7 +39,8 @@ Gloss 要求 **macOS 14 或更高版本**。
 brew install --cask sunchj/tap/gloss
 ```
 
-可以在 App 内升级，也可以运行：
+Gloss 会在启动后检查签名发布通道，每 24 小时最多一次。发现新版本时会主动提醒；
+官方 Homebrew 安装可以直接在提醒中点击“更新并重新启动”。也可以手动运行：
 
 ```bash
 brew update

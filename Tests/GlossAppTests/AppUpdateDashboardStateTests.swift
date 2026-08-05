@@ -38,7 +38,7 @@ final class AppUpdateDashboardStateTests: XCTestCase {
         )
     }
 
-    func testBusinessTaskBlockKeepsVerifiedInstallationForRetry() {
+    func testBusinessTaskBlockKeepsVerifiedInstallationForAutomaticContinuation() {
         let expectedInstallation = installation()
         let state = AppUpdateDashboardState.blockedByBusinessTask(
             updateAvailability(),
@@ -47,6 +47,9 @@ final class AppUpdateDashboardStateTests: XCTestCase {
 
         XCTAssertEqual(state.action, .install)
         XCTAssertEqual(state.presentation.headline, "等待当前翻译任务完成")
+        XCTAssertFalse(state.presentation.actionEnabled)
+        XCTAssertFalse(state.menuPresentation.isEnabled)
+        XCTAssertTrue(state.presentation.detail.contains("自动安装"))
         XCTAssertTrue(state.menuPresentation.title.contains("0.8.3"))
         guard case .blockedByBusinessTask(_, let actualInstallation) = state else {
             return XCTFail("Expected blocked business-task state")
