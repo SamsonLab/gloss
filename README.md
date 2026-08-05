@@ -87,7 +87,11 @@ gloss-cli browser --target 'Chinese (Simplified)' 'Translate this webpage.'
 gloss-cli pdf paper-a.pdf paper-b.pdf \
   --output ./translated \
   --target 'Chinese (Simplified)' \
-  --mode mono
+  --mode bilingual
+
+# Derive reusable reading copies from a bilingual master without translating again
+./Scripts/export_pdf_side_by_side.sh translated/paper-a-gloss-dual.pdf
+./Scripts/export_pdf_translation_only.sh translated/paper-a-gloss-dual.pdf
 
 # Translate plain text locally
 gloss-cli text --provider llama \
@@ -98,6 +102,12 @@ gloss-cli text --provider llama \
 `browser` accepts text from arguments or stdin; it does not automate browser
 UI. `pdf` reports progress on stderr and writes the final artifact paths as
 JSON on stdout, which makes it suitable for scripts.
+
+The bilingual PDF is the reusable master: source and translated pages alternate.
+The two export scripts create a permanent left/right spread or a translation-only
+PDF without another translation pass. They derive output names beside the input;
+pass an explicit output path as the second argument, or `--force` to replace an
+existing derivative.
 
 ## Privacy and security
 

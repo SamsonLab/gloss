@@ -79,7 +79,11 @@ gloss-cli browser --target 'Chinese (Simplified)' 'Translate this webpage.'
 gloss-cli pdf paper-a.pdf paper-b.pdf \
   --output ./translated \
   --target 'Chinese (Simplified)' \
-  --mode mono
+  --mode bilingual
+
+# 无需再次翻译，从双语母版快速派生阅读版本
+./Scripts/export_pdf_side_by_side.sh translated/paper-a-gloss-dual.pdf
+./Scripts/export_pdf_translation_only.sh translated/paper-a-gloss-dual.pdf
 
 # 使用本地引擎翻译文本
 gloss-cli text --provider llama \
@@ -89,6 +93,10 @@ gloss-cli text --provider llama \
 
 `browser` 可以从参数或 stdin 读取正文，但不会操控浏览器 UI。`pdf` 将进度写入 stderr，
 并以 JSON 形式将最终产物路径写入 stdout，适合用于自动化脚本。
+
+双语 PDF 是可复用的母版，其中原文页与译文页交替排列。两个导出脚本无需再次翻译，
+即可生成永久左右并排版或仅译文版。默认输出到输入文件所在目录；第二个参数可以指定
+输出路径，已有派生文件需要使用 `--force` 才会覆盖。
 
 ## 隐私与安全
 
