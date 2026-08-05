@@ -40,6 +40,7 @@ final class AppUpdateController {
             ) async throws -> Void
         var openReleasePage: (URL) -> Bool
         var isBusinessTaskActive: () async -> Bool
+        var deferredInstallPollInterval: Duration
         var requestApplicationTermination: () -> Void
         var operatingSystemVersion: () -> OperatingSystemVersion
     }
@@ -51,10 +52,12 @@ final class AppUpdateController {
     }
 
     var onStateChange: ((AppUpdateDashboardState) -> Void)?
+    var onAutomaticUpdateAvailable: ((GlossAppUpdateAvailability, AppUpdateDelivery) -> Void)?
 
     private let currentVersion: String
     private let dependencies: Dependencies
     private var automaticCheckTask: Task<Void, Never>?
+    private var deferredInstallTask: Task<Void, Never>?
     private var operationInProgress = false
 
     init(
@@ -85,6 +88,8 @@ final class AppUpdateController {
     func cancel() {
         automaticCheckTask?.cancel()
         automaticCheckTask = nil
+        deferredInstallTask?.cancel()
+        deferredInstallTask = nil
     }
 
     func check(mode: GlossAppUpdateCheckMode) async {
@@ -126,11 +131,13 @@ final class AppUpdateController {
 
                 let installation =
                     try await dependencies.detectHomebrewInstallation()
-                state = .updateAvailable(
-                    update,
-                    delivery: installation.map(AppUpdateDelivery.homebrew)
-                        ?? .releasePage
-                )
+                let delivery =
+                    installation.map(AppUpdateDelivery.homebrew)
+                    ?? .releasePage
+                state = .updateAvailable(update, delivery: delivery)
+                if mode == .automatic {
+                    onAutomaticUpdateAvailable?(update, delivery)
+                }
             }
         } catch is CancellationError {
             state = previousState
@@ -222,8 +229,12 @@ final class AppUpdateController {
                 update,
                 installation: installation
             )
+            scheduleDeferredInstall()
             return
         }
+
+        deferredInstallTask?.cancel()
+        deferredInstallTask = nil
 
         operationInProgress = true
         state = .preparingInstall(version: update.version)
@@ -240,6 +251,26 @@ final class AppUpdateController {
                 currentVersion: currentVersion,
                 message: error.localizedDescription
             )
+        }
+    }
+
+    private func scheduleDeferredInstall() {
+        guard deferredInstallTask == nil else { return }
+        let isBusinessTaskActive = dependencies.isBusinessTaskActive
+        let pollInterval = dependencies.deferredInstallPollInterval
+        deferredInstallTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: pollInterval)
+                } catch {
+                    return
+                }
+                guard !(await isBusinessTaskActive()) else { continue }
+                guard let self, !Task.isCancelled else { return }
+                deferredInstallTask = nil
+                await installAvailableUpdate()
+                return
+            }
         }
     }
 }

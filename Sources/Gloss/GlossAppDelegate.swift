@@ -62,6 +62,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pdfRuntimeActionID: UUID?
     private lazy var pdfRuntimeController = PDFRuntimeController()
     private var appUpdateActionTask: Task<Void, Never>?
+    private var remindedAppUpdateVersion: String?
     private lazy var appUpdateController: AppUpdateController? =
         makeAppUpdateController()
     private var selectionMonitor: SelectionMonitor?
@@ -218,6 +219,7 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             || dispatch.activeBackgroundJobs > 0
                             || dispatch.upstreamBackgroundItems > 0
                     },
+                    deferredInstallPollInterval: .seconds(2),
                     requestApplicationTermination: {
                         NSApp.terminate(nil)
                     },
@@ -229,6 +231,15 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             controller.onStateChange = { [weak self] state in
                 self?.showAppUpdateState(state)
+            }
+            controller.onAutomaticUpdateAvailable = {
+                [weak self] update, delivery in
+                DispatchQueue.main.async {
+                    self?.presentAppUpdateReminder(
+                        update: update,
+                        delivery: delivery
+                    )
+                }
             }
             return controller
         } catch {
@@ -1951,6 +1962,39 @@ final class GlossAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             await controller.performPrimaryAction()
             self?.appUpdateActionTask = nil
         }
+    }
+
+    private func presentAppUpdateReminder(
+        update: GlossAppUpdateAvailability,
+        delivery: AppUpdateDelivery
+    ) {
+        guard remindedAppUpdateVersion != update.version,
+            appUpdateActionTask == nil
+        else { return }
+        remindedAppUpdateVersion = update.version
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Gloss \(update.version) 已可用"
+        switch delivery {
+        case .homebrew:
+            alert.informativeText = """
+                新版本已经过签名发行信息校验。
+
+                点击“更新并重新启动”后，Gloss 将退出并由 Homebrew 完成升级；安装验证通过后会自动重新打开。如果当前正在翻译，Gloss 会在任务结束后自动继续更新。
+                """
+            alert.addButton(withTitle: "更新并重新启动")
+        case .releasePage:
+            alert.informativeText = """
+                当前 Gloss 不是由官方 sunchj/tap/gloss Homebrew Cask 管理，无法执行自动安装。可以打开正式发布页面下载安装。
+                """
+            alert.addButton(withTitle: "查看下载")
+        }
+        alert.addButton(withTitle: "稍后")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        performAppUpdateAction()
     }
 
     private func updateAppUpdateMenuItem(_ item: NSMenuItem) {
