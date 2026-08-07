@@ -15,6 +15,8 @@ REPOSITORY="${6:-${GLOSS_RELEASE_REPOSITORY:-SunChJ/gloss-releases}}"
 ARM64_ARCHIVE="${7:-Gloss-macos-arm64.zip}"
 X86_64_ARCHIVE="${8:-Gloss-macos-x86_64.zip}"
 DOWNLOAD_BASE_URL="${GLOSS_CASK_DOWNLOAD_BASE_URL:-}"
+CASK_TOKEN="${GLOSS_CASK_TOKEN:-gloss}"
+BUNDLES_CODEX="${GLOSS_CASK_BUNDLES_CODEX:-false}"
 if [[ -z "$DOWNLOAD_BASE_URL" ]]; then
   DOWNLOAD_BASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
 fi
@@ -23,6 +25,22 @@ if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+){2}([+-][0-9A-Za-z.-]+)?$ ]]; then
   echo "Invalid cask version: $VERSION" >&2
   exit 65
 fi
+case "$CASK_TOKEN:$BUNDLES_CODEX" in
+  gloss:false)
+    CONFLICTING_CASK="gloss-with-codex"
+    CASK_NAME="Gloss"
+    CASK_DESCRIPTION="Context-aware text and document translation"
+    ;;
+  gloss-with-codex:true)
+    CONFLICTING_CASK="gloss"
+    CASK_NAME="Gloss with Codex"
+    CASK_DESCRIPTION="Context-aware translation with a bundled Codex runtime"
+    ;;
+  *)
+    echo "Unsupported Gloss cask variant: $CASK_TOKEN (bundles Codex: $BUNDLES_CODEX)" >&2
+    exit 65
+    ;;
+esac
 for checksum in "$ARM64_SHA256" "$X86_64_SHA256"; do
   if [[ ! "$checksum" =~ ^[0-9a-fA-F]{64}$ ]]; then
     echo "Invalid cask SHA-256: $checksum" >&2
@@ -58,7 +76,7 @@ X86_64_SHA256="$(printf '%s' "$X86_64_SHA256" | tr '[:upper:]' '[:lower:]')"
 DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL%/}"
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 cat >"$OUTPUT_PATH" <<RUBY
-cask "gloss" do
+cask "$CASK_TOKEN" do
   version "$VERSION"
 
   on_arm do
@@ -72,10 +90,11 @@ cask "gloss" do
     url "$DOWNLOAD_BASE_URL/$X86_64_ARCHIVE"
   end
 
-  name "Gloss"
-  desc "Context-aware text and document translation"
+  name "$CASK_NAME"
+  desc "$CASK_DESCRIPTION"
   homepage "https://github.com/$REPOSITORY"
 
+  conflicts_with cask: "$CONFLICTING_CASK"
   depends_on macos: :sonoma
 
   app "Gloss.app"
@@ -150,8 +169,17 @@ cask "gloss" do
   caveats <<~EOS
     Gloss uses an ad-hoc code signature and is not Apple-notarized. This custom
     tap re-signs the installed app and removes its quarantine attribute.
+$(if [[ "$BUNDLES_CODEX" == "true" ]]; then
+    cat <<'EOF'
+    This variant bundles the Codex app-server runtime. Do not install it together
+    with the standard gloss cask.
+EOF
+  else
+    cat <<'EOF'
     ChatGPT translation requires a separately installed Codex CLI with
     the app-server subcommand; Gloss does not bundle Codex.
+EOF
+  fi)
   EOS
 end
 RUBY

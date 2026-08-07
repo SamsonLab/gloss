@@ -12,6 +12,32 @@ if [[ ! -d "$APP_PATH" ]]; then
 fi
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
+VARIANT="${GLOSS_RELEASE_VARIANT:-standard}"
+case "$VARIANT" in
+  standard)
+    ARCHIVE_SUFFIX=""
+    if [[ -e "$APP_PATH/Contents/Helpers/gloss-codex-app-server" ]]; then
+      echo "Standard release must not bundle the Codex app-server." >&2
+      exit 65
+    fi
+    ;;
+  with-codex)
+    ARCHIVE_SUFFIX="-with-codex"
+    for bundled_file in \
+      "$APP_PATH/Contents/Helpers/gloss-codex-app-server" \
+      "$APP_PATH/Contents/Resources/Codex-LICENSE.txt" \
+      "$APP_PATH/Contents/Resources/CodexRuntime.lock"; do
+      if [[ ! -f "$bundled_file" ]]; then
+        echo "Codex release is missing bundled file: $bundled_file" >&2
+        exit 65
+      fi
+    done
+    ;;
+  *)
+    echo "Unsupported release variant: $VARIANT" >&2
+    exit 65
+    ;;
+esac
 ARCHITECTURE="${GLOSS_RELEASE_ARCHITECTURE:-$(uname -m)}"
 case "$ARCHITECTURE" in
   arm64|aarch64)
@@ -25,7 +51,7 @@ case "$ARCHITECTURE" in
     exit 65
     ;;
 esac
-ARCHIVE_PATH="$OUTPUT_DIRECTORY/Gloss-macos-$ARCHITECTURE.zip"
+ARCHIVE_PATH="$OUTPUT_DIRECTORY/Gloss-macos-$ARCHITECTURE$ARCHIVE_SUFFIX.zip"
 
 mkdir -p "$OUTPUT_DIRECTORY"
 rm -f "$ARCHIVE_PATH"

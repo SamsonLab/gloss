@@ -40,9 +40,13 @@ jobs:
           mkdir -p "$temporary_directory/release"
           printf 'arm64 archive' >"$temporary_directory/release/Gloss-macos-arm64.zip"
           printf 'x86_64 archive' >"$temporary_directory/release/Gloss-macos-x86_64.zip"
+          printf 'arm64 Codex archive' >"$temporary_directory/release/Gloss-macos-arm64-with-codex.zip"
+          printf 'x86_64 Codex archive' >"$temporary_directory/release/Gloss-macos-x86_64-with-codex.zip"
           Scripts/generate_release_metadata.sh \
             "$temporary_directory/release/Gloss-macos-arm64.zip" \
             "$temporary_directory/release/Gloss-macos-x86_64.zip" \
+            "$temporary_directory/release/Gloss-macos-arm64-with-codex.zip" \
+            "$temporary_directory/release/Gloss-macos-x86_64-with-codex.zip" \
             0.0.0 \
             "$temporary_directory/release" \
             v0.0.0 \
@@ -53,6 +57,9 @@ jobs:
           grep -F \
             'https://github.com/SunChJ/gloss-releases/releases/download/v0.0.0/' \
             "$temporary_directory/release/gloss.rb"
+          grep -F \
+            'Gloss-macos-arm64-with-codex.zip' \
+            "$temporary_directory/release/gloss-with-codex.rb"
           (
             cd "$temporary_directory/release"
             shasum -a 256 --check SHA256SUMS

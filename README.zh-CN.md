@@ -35,16 +35,28 @@ Gloss 使用 Swift 开发，通过 Apple Vision 在本机执行 OCR；浏览器�
 
 Gloss 要求 **macOS 14 或更高版本**。
 
+默认安装不内置 Codex，运行 GPT 翻译时使用本机另外安装的 Codex CLI：
+
 ```bash
 brew install --cask sunchj/tap/gloss
 ```
+
+也可以选择安装内置 Codex app-server runtime 的完整版本。两种 Cask 会互相冲突，
+不能同时安装：
+
+```bash
+brew install --cask sunchj/tap/gloss-with-codex
+```
+
+GitHub Release 同时提供默认的 `Gloss-macos-<架构>.zip` 和内置 Codex 的
+`Gloss-macos-<架构>-with-codex.zip`。
 
 Gloss 会在启动后检查签名发布通道，每 24 小时最多一次。发现新版本时会主动提醒；
 官方 Homebrew 安装可以直接在提醒中点击“更新并重新启动”。也可以手动运行：
 
 ```bash
 brew update
-brew upgrade --cask sunchj/tap/gloss
+brew upgrade --cask sunchj/tap/gloss # 内置版使用 gloss-with-codex
 ```
 
 Homebrew 版本使用 ad-hoc 签名，并未经过 Apple 公证。Cask 会在本机重新签名、移除
@@ -124,8 +136,13 @@ swift run gloss-cli capabilities --json
 open dist/Gloss.app
 ```
 
-打包脚本要求在相邻目录中提供配套的浏览器扩展源码，并且默认不再内置 Codex。
-请先安装 Codex CLI，或设置 `GLOSS_CODEX_BIN`；
+打包脚本要求在相邻目录中提供配套的浏览器扩展源码。默认不内置 Codex；请先安装
+Codex CLI，或设置 `GLOSS_CODEX_BIN`。如需构建内置 Codex runtime 的版本，可以运行：
+
+```bash
+GLOSS_CODEX_RUNTIME_MODE=bundled ./Scripts/build_app.sh
+```
+
 `./Scripts/build_app_without_bundled_codex.sh` 是默认轻量构建的显式入口。扩展源码不在
 相邻目录时，可通过 `GLOSS_BROWSER_EXTENSION_SOURCE` 指定其位置。
 
