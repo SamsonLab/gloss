@@ -38,9 +38,21 @@ browser bridge on `127.0.0.1` behind a per-device token.
 
 Gloss requires **macOS 14 or newer**.
 
+The default installation does not embed Codex and uses a separately installed Codex CLI for GPT translation:
+
 ```bash
 brew install --cask sunchj/tap/gloss
 ```
+
+Alternatively, install the full variant with a bundled Codex app-server runtime.
+The two casks conflict and cannot be installed together:
+
+```bash
+brew install --cask sunchj/tap/gloss-with-codex
+```
+
+GitHub Releases provide both the default `Gloss-macos-<architecture>.zip` and the
+bundled `Gloss-macos-<architecture>-with-codex.zip` archives.
 
 Gloss checks the signed release channel after launch, at most once every 24
 hours. When an update is available it presents an actionable reminder; official
@@ -49,7 +61,7 @@ can also update manually with:
 
 ```bash
 brew update
-brew upgrade --cask sunchj/tap/gloss
+brew upgrade --cask sunchj/tap/gloss # use gloss-with-codex for the bundled variant
 ```
 
 The Homebrew build is ad-hoc signed rather than Apple-notarized. Its cask
@@ -142,10 +154,16 @@ open dist/Gloss.app
 ```
 
 The packaging script expects the companion browser-extension source in a
-sibling checkout and deliberately does not bundle Codex. Install Codex first,
-or set `GLOSS_CODEX_BIN`; `./Scripts/build_app_without_bundled_codex.sh` is the
-explicit equivalent of the default lightweight build. If the extension is not
-a sibling checkout, set `GLOSS_BROWSER_EXTENSION_SOURCE` to its directory.
+sibling checkout. It does not bundle Codex by default; install Codex first or
+set `GLOSS_CODEX_BIN`. To build the bundled variant, run:
+
+```bash
+GLOSS_CODEX_RUNTIME_MODE=bundled ./Scripts/build_app.sh
+```
+
+`./Scripts/build_app_without_bundled_codex.sh` is the explicit equivalent of
+the default lightweight build. If the extension is not a sibling checkout, set
+`GLOSS_BROWSER_EXTENSION_SOURCE` to its directory.
 
 ## Repository layout
 

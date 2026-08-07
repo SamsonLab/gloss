@@ -1,29 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 <cask.rb>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "Usage: $0 <cask.rb> [standard|with-codex]" >&2
   exit 64
 fi
 
 CASK_PATH="$1"
+VARIANT="${2:-standard}"
 if [[ ! -f "$CASK_PATH" ]]; then
   echo "Cask not found: $CASK_PATH" >&2
   exit 66
 fi
+case "$VARIANT" in
+  standard)
+    CASK_TOKEN="gloss"
+    CONFLICTING_CASK="gloss-with-codex"
+    ARCHIVE_SUFFIX=""
+    ;;
+  with-codex)
+    CASK_TOKEN="gloss-with-codex"
+    CONFLICTING_CASK="gloss"
+    ARCHIVE_SUFFIX="-with-codex"
+    ;;
+  *)
+    echo "Unsupported cask variant: $VARIANT" >&2
+    exit 65
+    ;;
+esac
 
 ruby -c "$CASK_PATH"
-ruby - "$CASK_PATH" <<'RUBY'
-path = ARGV.fetch(0)
+ruby - "$CASK_PATH" "$CASK_TOKEN" "$CONFLICTING_CASK" "$ARCHIVE_SUFFIX" "$VARIANT" <<'RUBY'
+path, cask_token, conflicting_cask, archive_suffix, variant = ARGV
 content = File.read(path, encoding: "UTF-8")
 required = [
-  /^cask "gloss" do$/,
+  /^cask "#{Regexp.escape(cask_token)}" do$/,
   /^  version "[^"]+"$/,
   /^  on_arm do$/,
   /^  on_intel do$/,
   /^    sha256 "[0-9a-f]{64}"$/,
-  %r{^    url "https://[^"]+/Gloss-macos-arm64\.zip"$},
-  %r{^    url "https://[^"]+/Gloss-macos-x86_64\.zip"$},
+  %r{^    url "https://[^"]+/Gloss-macos-arm64#{Regexp.escape(archive_suffix)}\.zip"$},
+  %r{^    url "https://[^"]+/Gloss-macos-x86_64#{Regexp.escape(archive_suffix)}\.zip"$},
+  /^  conflicts_with cask: "#{Regexp.escape(conflicting_cask)}"$/,
   /^  app "Gloss\.app"$/,
   %r{^  binary "#\{appdir\}/Gloss\.app/Contents/Helpers/gloss-cli", target: "gloss-cli"$},
   /^  postflight do$/,
@@ -45,6 +63,11 @@ required = [
   /^\s+must_succeed: true$/,
   /^  caveats <<~EOS$/,
 ]
+required << if variant == "with-codex"
+  /This variant bundles the Codex app-server runtime/
+else
+  /Gloss does not bundle Codex/
+end
 missing = required.reject { |pattern| content.match?(pattern) }
 abort "Cask is missing required declarations: #{missing.join(", ")}" unless missing.empty?
 if content.include?("Gloss Extension.appex")
