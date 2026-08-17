@@ -125,8 +125,7 @@ final class TranslationDispatchCenterTests: XCTestCase {
         let coordinator = BabelDOCBatchCoordinator(
             broker: TranslationBroker(backend: center),
             configuration: .init(
-                maximumBatchItems: 1,
-                maximumBatchCharacters: 100,
+                maximumBatchCharacters: 5,
                 maximumConcurrentBatches: 2,
                 fillDelayNanoseconds: 0
             ),

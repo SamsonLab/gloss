@@ -61,6 +61,14 @@ public actor CodexAppServerClient: TranslationBackend {
     private static let defaultModelWaitHedgeNanoseconds: UInt64 = 8_000_000_000
     private static let dispatchAwareModelWaitHedgeNanoseconds: UInt64 = 3_000_000_000
     private static let defaultThreadRotationTurns = 10
+    private static let defaultSparkStartIntervalNanoseconds: UInt64 = 500_000_000
+    private static let defaultSparkCapacityRetryLimit = 4
+    private static let sparkCapacityBackoffNanoseconds: [UInt64] = [
+        2_000_000_000,
+        5_000_000_000,
+        10_000_000_000,
+        20_000_000_000,
+    ]
     static let disabledCodexFeatures = [
         "shell_tool",
         "unified_exec",
@@ -233,6 +241,8 @@ public actor CodexAppServerClient: TranslationBackend {
     private let threadRotationTurns: Int?
     private let maximumConcurrentTurns: Int
     private let maximumBackgroundConcurrentTurns: Int
+    private let sparkStartIntervalNanoseconds: UInt64
+    private let sparkCapacityRetryLimit: Int
     private let glossaryStore: GlossaryStore
     private let dispatchState: TranslationDispatchState?
     private var process: Process?
@@ -259,6 +269,8 @@ public actor CodexAppServerClient: TranslationBackend {
     private var initialized = false
     private var cachedAccountStatus: CodexAccountStatus?
     private var lastError: String?
+    private var nextSparkBackgroundStartAt: UInt64 = 0
+    private var sparkCapacityCooldownUntil: UInt64 = 0
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -295,6 +307,8 @@ public actor CodexAppServerClient: TranslationBackend {
             environment,
             maximumConcurrentTurns: maximumConcurrentTurns
         )
+        self.sparkStartIntervalNanoseconds = Self.readSparkStartIntervalNanoseconds(environment)
+        self.sparkCapacityRetryLimit = Self.readSparkCapacityRetryLimit(environment)
         self.glossaryStore = glossaryStore
         self.dispatchState = dispatchState
     }
@@ -346,30 +360,16 @@ public actor CodexAppServerClient: TranslationBackend {
             && request.contentKind == .document
             && maximumConcurrentTurns > maximumBackgroundConcurrentTurns
             && modelWaitHedgeNanoseconds != nil
-        let primaryState = TurnAttemptState()
         let result: TurnAttemptResult
 
         do {
-            if hedgeEligible, let modelWaitHedgeNanoseconds {
-                result = try await runHedgedTurn(
-                    request: request,
-                    prompt: prompt,
-                    primaryState: primaryState,
-                    hedgeThresholdNanoseconds: modelWaitHedgeNanoseconds
-                )
-                for output in result.outputs {
-                    onOutput?(output)
-                }
-            } else {
-                result = try await runTurnAttempt(
-                    request: request,
-                    prompt: prompt,
-                    kind: .primary,
-                    attemptState: primaryState,
-                    onOutput: onOutput,
-                    acquisition: .scheduled
-                )
-            }
+            result = try await runTranslationTurn(
+                request: request,
+                prompt: prompt,
+                onOutput: onOutput,
+                hedgeEligible: hedgeEligible,
+                hedgeThresholdNanoseconds: modelWaitHedgeNanoseconds
+            )
         } catch {
             runtimeLog.write(
                 "codex",
@@ -396,6 +396,111 @@ public actor CodexAppServerClient: TranslationBackend {
             "translation_complete items=\(result.outputs.count) duration_ms=\(Self.elapsedMilliseconds(since: startedAt)) priority=\(request.priority.rawValue) turn_id=\(result.turnID) attempt=\(result.kind.rawValue) hedge_won=\(result.kind == .hedge) prepare_ms=\(Self.elapsedMilliseconds(from: startedAt, to: preparedAt)) queue_wait_ms=\(result.queueWaitMilliseconds) turn_start_ms=\(result.turnStartMilliseconds) turn_wait_ms=\(stages.totalMilliseconds) turn_dispatch_ms=\(stages.dispatchMilliseconds) model_wait_ms=\(stages.modelWaitMilliseconds) first_delta_wait_ms=\(stages.firstDeltaWaitMilliseconds) output_stream_ms=\(stages.outputStreamMilliseconds) message_finalize_ms=\(stages.messageFinalizeMilliseconds) turn_finalize_ms=\(stages.turnFinalizeMilliseconds) turn_complete_ms=\(stages.totalMilliseconds) parse_ms=\(result.parseMilliseconds) rollback_ms=\(result.rollbackMilliseconds)"
         )
         return result.outputs
+    }
+
+    private func runTranslationTurn(
+        request: TranslationBatchRequest,
+        prompt: String,
+        onOutput: (@Sendable (TranslationOutput) -> Void)?,
+        hedgeEligible: Bool,
+        hedgeThresholdNanoseconds: UInt64?
+    ) async throws -> TurnAttemptResult {
+        let usesSparkPolicy = Self.shouldUseSparkDocumentPolicy(
+            model: model,
+            request: request
+        )
+        let maximumAttempts = usesSparkPolicy ? sparkCapacityRetryLimit + 1 : 1
+
+        for attempt in 0..<maximumAttempts {
+            if usesSparkPolicy {
+                try await waitForSparkBackgroundAdmission()
+            }
+            let primaryState = TurnAttemptState()
+            do {
+                let result: TurnAttemptResult
+                if hedgeEligible, let hedgeThresholdNanoseconds {
+                    result = try await runHedgedTurn(
+                        request: request,
+                        prompt: prompt,
+                        primaryState: primaryState,
+                        hedgeThresholdNanoseconds: hedgeThresholdNanoseconds
+                    )
+                    for output in result.outputs {
+                        onOutput?(output)
+                    }
+                } else {
+                    result = try await runTurnAttempt(
+                        request: request,
+                        prompt: prompt,
+                        kind: .primary,
+                        attemptState: primaryState,
+                        onOutput: onOutput,
+                        acquisition: .scheduled
+                    )
+                }
+                return result
+            } catch {
+                guard usesSparkPolicy,
+                    attempt + 1 < maximumAttempts,
+                    Self.isCapacityError(error)
+                else { throw error }
+                let backoffNanoseconds = scheduleSparkCapacityCooldown(
+                    retryIndex: attempt
+                )
+                runtimeLog.write(
+                    "codex",
+                    "spark_capacity_retry_scheduled attempt=\(attempt + 1) backoff_ms=\(backoffNanoseconds / 1_000_000)"
+                )
+            }
+        }
+        throw TranslationError.backendUnavailable("Spark capacity retries exhausted.")
+    }
+
+    private func waitForSparkBackgroundAdmission() async throws {
+        while true {
+            try Task.checkCancellation()
+            let now = DispatchTime.now().uptimeNanoseconds
+            let admissionTime = max(
+                nextSparkBackgroundStartAt,
+                sparkCapacityCooldownUntil
+            )
+            guard admissionTime > now else {
+                nextSparkBackgroundStartAt = now + sparkStartIntervalNanoseconds
+                return
+            }
+            try await Task.sleep(nanoseconds: admissionTime - now)
+        }
+    }
+
+    @discardableResult
+    private func scheduleSparkCapacityCooldown(retryIndex: Int) -> UInt64 {
+        let maximumBackoff = Self.sparkCapacityBackoffNanoseconds[
+            min(retryIndex, Self.sparkCapacityBackoffNanoseconds.count - 1)
+        ]
+        let backoff = UInt64.random(in: 0...maximumBackoff)
+        sparkCapacityCooldownUntil = max(
+            sparkCapacityCooldownUntil,
+            DispatchTime.now().uptimeNanoseconds + backoff
+        )
+        return backoff
+    }
+
+    static func shouldUseSparkDocumentPolicy(
+        model: String?,
+        request: TranslationBatchRequest
+    ) -> Bool {
+        model?.localizedCaseInsensitiveContains("spark") == true
+            && request.priority == .background
+            && request.contentKind == .document
+    }
+
+    static func isCapacityError(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        return message.contains("selected model is at capacity")
+            || message.contains("rate limit")
+            || message.contains("too many requests")
+            || message.contains("http 429")
+            || message.contains("status 429")
     }
 
     private enum ThreadAcquisition {
@@ -1688,7 +1793,7 @@ public actor CodexAppServerClient: TranslationBackend {
     }
 
     static func compactModelItemID(for index: Int) -> String {
-        String(index, radix: 36)
+        String(index)
     }
 
     private static func modelJSONData(from output: String) throws -> Data {
@@ -2121,6 +2226,26 @@ public actor CodexAppServerClient: TranslationBackend {
             return defaultThreadRotationTurns
         }
         return turns
+    }
+
+    static func readSparkStartIntervalNanoseconds(
+        _ environment: [String: String]
+    ) -> UInt64 {
+        guard let rawValue = environment["GLOSS_SPARK_START_INTERVAL_MS"],
+            let milliseconds = UInt64(rawValue),
+            milliseconds <= 5_000
+        else { return defaultSparkStartIntervalNanoseconds }
+        return milliseconds * 1_000_000
+    }
+
+    static func readSparkCapacityRetryLimit(
+        _ environment: [String: String]
+    ) -> Int {
+        guard let rawValue = environment["GLOSS_SPARK_CAPACITY_RETRIES"],
+            let retries = Int(rawValue),
+            (0...6).contains(retries)
+        else { return defaultSparkCapacityRetryLimit }
+        return retries
     }
 
     private static func readMaximumBackgroundConcurrentTurns(

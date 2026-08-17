@@ -2,20 +2,17 @@ import Foundation
 
 actor BabelDOCBatchCoordinator {
     struct Configuration: Sendable {
-        let maximumBatchItems: Int
         let maximumBatchCharacters: Int
         let maximumConcurrentBatches: Int
         let fillDelayNanoseconds: UInt64
         let refillDelayNanoseconds: UInt64
 
         init(
-            maximumBatchItems: Int = 12,
-            maximumBatchCharacters: Int = 1_800,
+            maximumBatchCharacters: Int = 3_000,
             maximumConcurrentBatches: Int = 2,
             fillDelayNanoseconds: UInt64 = 25_000_000,
             refillDelayNanoseconds: UInt64 = 0
         ) {
-            self.maximumBatchItems = max(1, maximumBatchItems)
             self.maximumBatchCharacters = max(1, maximumBatchCharacters)
             self.maximumConcurrentBatches = max(1, maximumConcurrentBatches)
             self.fillDelayNanoseconds = fillDelayNanoseconds
@@ -39,15 +36,10 @@ actor BabelDOCBatchCoordinator {
             }
 
             self.init(
-                maximumBatchItems: integer(
-                    "GLOSS_BABELDOC_BATCH_ITEMS",
-                    default: defaults.maximumBatchItems,
-                    range: 1...24
-                ),
                 maximumBatchCharacters: integer(
                     "GLOSS_BABELDOC_BATCH_CHARACTERS",
                     default: defaults.maximumBatchCharacters,
-                    range: 200...4_000
+                    range: 200...12_000
                 ),
                 maximumConcurrentBatches: integer(
                     "GLOSS_BABELDOC_MODEL_CONCURRENCY",
@@ -101,6 +93,9 @@ actor BabelDOCBatchCoordinator {
     private var activeBatchCount = 0
     private var fillTask: Task<Void, Never>?
     private var dispatchStateRevision = 0
+    // Accounts for compact input/output JSON framing so tiny items cannot
+    // create an effectively unbounded model turn.
+    static let estimatedItemFramingCharacters = 32
 
     init(
         broker: TranslationBroker,
@@ -240,30 +235,32 @@ actor BabelDOCBatchCoordinator {
             let batch = takeNextBatch()
             guard !batch.isEmpty else { break }
             activeBatchCount += 1
-            let characterCount = batch.reduce(0) { $0 + $1.brokerItem.text.count }
+            let sourceCharacterCount = batch.reduce(0) {
+                $0 + $1.brokerItem.text.count
+            }
+            let estimatedCharacterCount = batch.reduce(0) {
+                $0 + Self.estimatedCharacterCost(of: $1)
+            }
             let characterUtilization = min(
                 100,
-                characterCount * 100 / configuration.maximumBatchCharacters
+                estimatedCharacterCount * 100 / configuration.maximumBatchCharacters
             )
             runtimeLog.write(
                 "bridge",
-                "babeldoc_batch_dispatched items=\(batch.count) chars=\(characterCount) utilization_pct=\(characterUtilization) requests=\(Set(batch.map(\.requestID)).count) active_batches=\(activeBatchCount) pending_items=\(pendingItems.count)"
+                "babeldoc_batch_dispatched items=\(batch.count) chars=\(sourceCharacterCount) estimated_chars=\(estimatedCharacterCount) utilization_pct=\(characterUtilization) requests=\(Set(batch.map(\.requestID)).count) active_batches=\(activeBatchCount) pending_items=\(pendingItems.count)"
             )
             let broker = self.broker
             let key = batch[0].key
+            let runtimeLog = self.runtimeLog
             Task {
                 let result: Result<[TranslationOutput], Error>
                 do {
                     result = .success(
-                        try await broker.translate(
-                            TranslationBatchRequest(
-                                items: batch.map(\.brokerItem),
-                                targetLanguage: key.targetLanguage,
-                                profile: .academic,
-                                contentKind: .document,
-                                context: key.context,
-                                priority: .background
-                            )
+                        try await Self.translateWithSplitRecovery(
+                            batch: batch,
+                            key: key,
+                            broker: broker,
+                            runtimeLog: runtimeLog
                         )
                     )
                 } catch {
@@ -274,10 +271,70 @@ actor BabelDOCBatchCoordinator {
         }
     }
 
+    private nonisolated static func translateWithSplitRecovery(
+        batch: [PendingItem],
+        key: BatchKey,
+        broker: TranslationBroker,
+        runtimeLog: GlossRuntimeLog,
+        depth: Int = 0
+    ) async throws -> [TranslationOutput] {
+        do {
+            return try await broker.translate(
+                TranslationBatchRequest(
+                    items: batch.map(\.brokerItem),
+                    targetLanguage: key.targetLanguage,
+                    profile: .academic,
+                    contentKind: .document,
+                    context: key.context,
+                    priority: .background
+                )
+            )
+        } catch let error as TranslationError {
+            guard case .invalidResponse = error, batch.count > 1 else { throw error }
+
+            let splitIndex = balancedSplitIndex(for: batch)
+            let left = Array(batch[..<splitIndex])
+            let right = Array(batch[splitIndex...])
+            runtimeLog.write(
+                "bridge",
+                "babeldoc_batch_split_recovery depth=\(depth + 1) items=\(batch.count) left_items=\(left.count) right_items=\(right.count) reason=invalid_response"
+            )
+
+            async let leftOutputs = translateWithSplitRecovery(
+                batch: left,
+                key: key,
+                broker: broker,
+                runtimeLog: runtimeLog,
+                depth: depth + 1
+            )
+            async let rightOutputs = translateWithSplitRecovery(
+                batch: right,
+                key: key,
+                broker: broker,
+                runtimeLog: runtimeLog,
+                depth: depth + 1
+            )
+            return try await leftOutputs + rightOutputs
+        }
+    }
+
+    private nonisolated static func balancedSplitIndex(
+        for batch: [PendingItem]
+    ) -> Int {
+        precondition(batch.count > 1)
+        let targetCost = batch.reduce(0) { $0 + estimatedCharacterCost(of: $1) } / 2
+        var accumulatedCost = 0
+        for index in 1..<batch.count {
+            accumulatedCost += estimatedCharacterCost(of: batch[index - 1])
+            if accumulatedCost >= targetCost { return index }
+        }
+        return batch.count / 2
+    }
+
     private func takeNextBatch() -> [PendingItem] {
         guard let first = pendingItems.first else { return [] }
         var selectedIndices = [0]
-        var characterCount = first.brokerItem.text.count
+        var characterCount = Self.estimatedCharacterCost(of: first)
 
         let candidates = pendingItems.indices.dropFirst()
             .filter { pendingItems[$0].key == first.key }
@@ -289,8 +346,7 @@ actor BabelDOCBatchCoordinator {
             }
 
         for index in candidates {
-            guard selectedIndices.count < configuration.maximumBatchItems else { break }
-            let itemCharacters = pendingItems[index].brokerItem.text.count
+            let itemCharacters = Self.estimatedCharacterCost(of: pendingItems[index])
             guard characterCount + itemCharacters <= configuration.maximumBatchCharacters else {
                 continue
             }
@@ -309,20 +365,22 @@ actor BabelDOCBatchCoordinator {
 
     private func firstPendingBatchIsFull() -> Bool {
         guard let first = pendingItems.first else { return false }
-        var itemCount = 0
         var characterCount = 0
         for pending in pendingItems where pending.key == first.key {
-            if itemCount >= configuration.maximumBatchItems
-                || characterCount + pending.brokerItem.text.count
-                    > configuration.maximumBatchCharacters
+            if characterCount + Self.estimatedCharacterCost(of: pending)
+                > configuration.maximumBatchCharacters
             {
                 return true
             }
-            itemCount += 1
-            characterCount += pending.brokerItem.text.count
+            characterCount += Self.estimatedCharacterCost(of: pending)
         }
-        return itemCount >= configuration.maximumBatchItems
-            || characterCount >= configuration.maximumBatchCharacters
+        return characterCount >= configuration.maximumBatchCharacters
+    }
+
+    private nonisolated static func estimatedCharacterCost(
+        of pending: PendingItem
+    ) -> Int {
+        pending.brokerItem.text.count + estimatedItemFramingCharacters
     }
 
     private func finish(

@@ -193,8 +193,7 @@ package final class LoopbackServer: @unchecked Sendable {
     private static let maximumBabelDOCChunkCharacters = 900
     private static let defaultBabelDOCBatchConfiguration =
         BabelDOCBatchCoordinator.Configuration(
-            maximumBatchItems: 12,
-            maximumBatchCharacters: 1_800,
+            maximumBatchCharacters: 3_000,
             maximumConcurrentBatches: 2,
             fillDelayNanoseconds: 25_000_000,
             refillDelayNanoseconds: 0
@@ -251,7 +250,7 @@ package final class LoopbackServer: @unchecked Sendable {
         self.runtimeLog = runtimeLog
         runtimeLog.write(
             "bridge",
-            "babeldoc_batch_configuration max_items=\(babelDOCConfiguration.maximumBatchItems) max_chars=\(babelDOCConfiguration.maximumBatchCharacters) concurrency=\(babelDOCConfiguration.maximumConcurrentBatches) fill_delay_ms=\(babelDOCConfiguration.fillDelayNanoseconds / 1_000_000) refill_delay_ms=\(babelDOCConfiguration.refillDelayNanoseconds / 1_000_000)"
+            "babeldoc_batch_configuration max_estimated_chars=\(babelDOCConfiguration.maximumBatchCharacters) concurrency=\(babelDOCConfiguration.maximumConcurrentBatches) fill_delay_ms=\(babelDOCConfiguration.fillDelayNanoseconds / 1_000_000) refill_delay_ms=\(babelDOCConfiguration.refillDelayNanoseconds / 1_000_000)"
         )
     }
 
@@ -773,7 +772,7 @@ package final class LoopbackServer: @unchecked Sendable {
         )
         runtimeLog.write(
             "bridge",
-            "babeldoc_translation_plan source_items=\(prompt.items.count) chunks=\(chunks.count) max_chunk_chars=\(Self.maximumBabelDOCChunkCharacters) max_batch_items=\(babelDOCBatchConfiguration.maximumBatchItems) max_batch_chars=\(babelDOCBatchConfiguration.maximumBatchCharacters)"
+            "babeldoc_translation_plan source_items=\(prompt.items.count) chunks=\(chunks.count) max_chunk_chars=\(Self.maximumBabelDOCChunkCharacters) max_batch_estimated_chars=\(babelDOCBatchConfiguration.maximumBatchCharacters)"
         )
 
         let targetLanguage = prompt.targetLanguage

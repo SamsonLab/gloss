@@ -306,10 +306,14 @@ final class LoopbackServerTests: XCTestCase {
         )
         XCTAssertEqual(longCompletion.response.statusCode, 200)
         let chunkRequests = await backend.recordedRequests()
-        XCTAssertGreaterThan(chunkRequests.count, 1)
+        XCTAssertEqual(chunkRequests.count, 1)
+        XCTAssertGreaterThan(chunkRequests.reduce(0) { $0 + $1.items.count }, 1)
         XCTAssertTrue(
             chunkRequests.allSatisfy {
-                $0.items.reduce(0) { $0 + $1.text.count } <= 1_800
+                $0.items.reduce(0) {
+                    $0 + $1.text.count
+                        + BabelDOCBatchCoordinator.estimatedItemFramingCharacters
+                } <= 3_000
             }
         )
         XCTAssertTrue(
@@ -511,19 +515,18 @@ final class LoopbackServerTests: XCTestCase {
         XCTAssertEqual(Set(requests[0].items.map(\.id)).count, 2)
     }
 
-    func testBabelDOCBatchCoordinatorKeepsModelRequestsBounded() async throws {
+    func testBabelDOCBatchCoordinatorUsesEstimatedCharacterBudgetWithoutFixedItemLimit() async throws {
         let backend = BridgeBackend()
         let coordinator = BabelDOCBatchCoordinator(
             broker: TranslationBroker(backend: backend),
             configuration: .init(
-                maximumBatchItems: 2,
-                maximumBatchCharacters: 100,
+                maximumBatchCharacters: 800,
                 maximumConcurrentBatches: 2,
                 fillDelayNanoseconds: 0
             )
         )
-        let items = (0..<5).map {
-            TranslationItem(id: "item-\($0)", text: "Paragraph \($0)")
+        let items = (0..<25).map {
+            TranslationItem(id: "item-\($0)", text: "\($0)")
         }
 
         let outputs = try await coordinator.translate(
@@ -534,8 +537,41 @@ final class LoopbackServerTests: XCTestCase {
 
         XCTAssertEqual(outputs.map(\.id), items.map(\.id))
         let requests = await backend.recordedRequests()
-        XCTAssertEqual(requests.count, 3)
-        XCTAssertTrue(requests.allSatisfy { $0.items.count <= 2 })
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertGreaterThan(requests.map(\.items.count).max() ?? 0, 12)
+        XCTAssertTrue(
+            requests.allSatisfy {
+                $0.items.reduce(0) {
+                    $0 + $1.text.count
+                        + BabelDOCBatchCoordinator.estimatedItemFramingCharacters
+                } <= 800
+            }
+        )
+    }
+
+    func testBabelDOCBatchCoordinatorSplitsInvalidModelOutputUntilItRecovers() async throws {
+        let backend = SplitRecoveryBackend(maximumReliableItems: 2)
+        let coordinator = BabelDOCBatchCoordinator(
+            broker: TranslationBroker(backend: backend),
+            configuration: .init(
+                maximumBatchCharacters: 2_000,
+                maximumConcurrentBatches: 1,
+                fillDelayNanoseconds: 0
+            )
+        )
+        let items = (0..<8).map {
+            TranslationItem(id: "item-\($0)", text: "Paragraph \($0)")
+        }
+
+        let outputs = try await coordinator.translate(
+            items: items,
+            targetLanguage: "Chinese (Simplified)",
+            context: "PDF"
+        )
+
+        XCTAssertEqual(outputs.map(\.id), items.map(\.id))
+        let requestSizes = await backend.requestSizes().sorted()
+        XCTAssertEqual(requestSizes, [2, 2, 2, 2, 4, 4, 8])
     }
 
     func testBabelDOCBatchCoordinatorFillsAroundAnItemThatDoesNotFit() async throws {
@@ -543,8 +579,7 @@ final class LoopbackServerTests: XCTestCase {
         let coordinator = BabelDOCBatchCoordinator(
             broker: TranslationBroker(backend: backend),
             configuration: .init(
-                maximumBatchItems: 4,
-                maximumBatchCharacters: 1_000,
+                maximumBatchCharacters: 1_064,
                 maximumConcurrentBatches: 1,
                 fillDelayNanoseconds: 0
             )
@@ -568,7 +603,10 @@ final class LoopbackServerTests: XCTestCase {
         XCTAssertEqual(requests.map { $0.items.count }, [2, 2])
         XCTAssertTrue(
             requests.allSatisfy {
-                $0.items.reduce(0) { $0 + $1.text.count } == 1_000
+                $0.items.reduce(0) {
+                    $0 + $1.text.count
+                        + BabelDOCBatchCoordinator.estimatedItemFramingCharacters
+                } == 1_064
             }
         )
     }
@@ -576,7 +614,6 @@ final class LoopbackServerTests: XCTestCase {
     func testBabelDOCBatchConfigurationReadsBoundedEnvironmentOverrides() {
         let configuration = BabelDOCBatchCoordinator.Configuration(
             environment: [
-                "GLOSS_BABELDOC_BATCH_ITEMS": "12",
                 "GLOSS_BABELDOC_BATCH_CHARACTERS": "1800",
                 "GLOSS_BABELDOC_MODEL_CONCURRENCY": "3",
                 "GLOSS_BABELDOC_FILL_DELAY_MS": "75",
@@ -584,7 +621,6 @@ final class LoopbackServerTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(configuration.maximumBatchItems, 12)
         XCTAssertEqual(configuration.maximumBatchCharacters, 1_800)
         XCTAssertEqual(configuration.maximumConcurrentBatches, 3)
         XCTAssertEqual(configuration.fillDelayNanoseconds, 75_000_000)
@@ -594,7 +630,6 @@ final class LoopbackServerTests: XCTestCase {
     func testBabelDOCBatchConfigurationRejectsOutOfRangeOverrides() {
         let configuration = BabelDOCBatchCoordinator.Configuration(
             environment: [
-                "GLOSS_BABELDOC_BATCH_ITEMS": "100",
                 "GLOSS_BABELDOC_BATCH_CHARACTERS": "20",
                 "GLOSS_BABELDOC_MODEL_CONCURRENCY": "0",
                 "GLOSS_BABELDOC_FILL_DELAY_MS": "-1",
@@ -602,8 +637,7 @@ final class LoopbackServerTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(configuration.maximumBatchItems, 12)
-        XCTAssertEqual(configuration.maximumBatchCharacters, 1_800)
+        XCTAssertEqual(configuration.maximumBatchCharacters, 3_000)
         XCTAssertEqual(configuration.maximumConcurrentBatches, 2)
         XCTAssertEqual(configuration.fillDelayNanoseconds, 25_000_000)
         XCTAssertEqual(configuration.refillDelayNanoseconds, 0)
@@ -748,6 +782,29 @@ private actor BridgeBackend: TranslationBackend {
             latestRequest.priority,
             latestRequest.targetLanguage
         )
+    }
+}
+
+private actor SplitRecoveryBackend: TranslationBackend {
+    private let maximumReliableItems: Int
+    private var sizes: [Int] = []
+
+    init(maximumReliableItems: Int) {
+        self.maximumReliableItems = maximumReliableItems
+    }
+
+    func translate(_ request: TranslationBatchRequest) async throws -> [TranslationOutput] {
+        sizes.append(request.items.count)
+        guard request.items.count <= maximumReliableItems else {
+            throw TranslationError.invalidResponse("Simulated incomplete structured output.")
+        }
+        return request.items.map {
+            TranslationOutput(id: $0.id, text: "translated:\($0.text)")
+        }
+    }
+
+    func requestSizes() -> [Int] {
+        sizes
     }
 }
 
