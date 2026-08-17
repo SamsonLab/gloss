@@ -95,7 +95,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: SunChJ/personal-immersive-translator
-          ref: c826b6f6ec9fe7100e2745d63fa35378033e4ab2
+          ref: 69138e25bf2e7c938aa3b215ecddec85222366a1
           path: personal-immersive-translator
           ssh-key: ${{ secrets.GLOSS_EXTENSION_SSH_KEY }}
           ssh-strict: true
