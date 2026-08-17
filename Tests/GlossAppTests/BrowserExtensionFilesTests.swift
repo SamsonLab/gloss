@@ -3,6 +3,48 @@ import XCTest
 @testable import Gloss
 
 final class BrowserExtensionFilesTests: XCTestCase {
+    func testRecognizesUnmarkedBundledCopyForMigration() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gloss-extension-migration-\(UUID().uuidString)", isDirectory: true)
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let destination = root.appendingPathComponent("destination", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let manifest = Data(#"{"name":"Gloss","version":"1.0.0"}"#.utf8)
+        try manifest.write(to: source.appendingPathComponent("manifest.json"))
+        try manifest.write(to: destination.appendingPathComponent("manifest.json"))
+        try Data("new".utf8).write(to: source.appendingPathComponent("background.js"))
+        try Data("old".utf8).write(to: destination.appendingPathComponent("background.js"))
+
+        XCTAssertTrue(
+            try BrowserExtensionFiles.isRecognizableLegacyCopy(
+                source: source,
+                destination: destination
+            )
+        )
+
+        try Data(#"{"name":"Other","version":"1.0.0"}"#.utf8).write(
+            to: destination.appendingPathComponent("manifest.json")
+        )
+        XCTAssertFalse(
+            try BrowserExtensionFiles.isRecognizableLegacyCopy(
+                source: source,
+                destination: destination
+            )
+        )
+
+        try manifest.write(to: destination.appendingPathComponent("manifest.json"))
+        try Data("foreign".utf8).write(to: destination.appendingPathComponent("extra.js"))
+        XCTAssertFalse(
+            try BrowserExtensionFiles.isRecognizableLegacyCopy(
+                source: source,
+                destination: destination
+            )
+        )
+    }
+
     func testSynchronizeManagedCopyUpdatesFilesWithoutReplacingDirectory() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("gloss-extension-sync-\(UUID().uuidString)", isDirectory: true)

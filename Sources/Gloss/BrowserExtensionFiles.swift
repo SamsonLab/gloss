@@ -43,7 +43,9 @@ enum BrowserExtensionFiles {
 
         if fileManager.fileExists(atPath: destination.path) {
             let marker = destination.appendingPathComponent(markerName)
-            guard fileManager.fileExists(atPath: marker.path) else {
+            let isManaged = fileManager.fileExists(atPath: marker.path)
+            guard try isManaged || isRecognizableLegacyCopy(source: source, destination: destination)
+            else {
                 throw BrowserExtensionError.unmanagedDestination(destination.path)
             }
         }
@@ -71,6 +73,17 @@ enum BrowserExtensionFiles {
             try fileManager.moveItem(at: staging, to: destination)
         }
         return destination
+    }
+
+    static func isRecognizableLegacyCopy(source: URL, destination: URL) throws -> Bool {
+        let sourceFiles = try relativeFiles(in: source).filter { $0 != markerName }
+        let destinationFiles = try relativeFiles(in: destination).filter { $0 != markerName }
+        guard sourceFiles == destinationFiles else { return false }
+
+        return FileManager.default.contentsEqual(
+            atPath: source.appendingPathComponent("manifest.json").path,
+            andPath: destination.appendingPathComponent("manifest.json").path
+        )
     }
 
     static func synchronizeManagedCopy(source: URL, destination: URL) throws {
