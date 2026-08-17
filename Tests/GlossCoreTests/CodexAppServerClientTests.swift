@@ -116,9 +116,75 @@ final class CodexAppServerClientTests: XCTestCase {
 
     func testModelItemIDsStayCompactWithinLargeBatches() {
         XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 0), "0")
-        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 10), "a")
-        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 35), "z")
-        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 36), "10")
+        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 10), "10")
+        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 35), "35")
+        XCTAssertEqual(CodexAppServerClient.compactModelItemID(for: 36), "36")
+    }
+
+    func testSparkDocumentPolicyDoesNotApplyToLuna() {
+        let document = TranslationBatchRequest(
+            items: [TranslationItem(id: "pdf", text: "Paper")],
+            targetLanguage: "Chinese (Simplified)",
+            contentKind: .document,
+            priority: .background
+        )
+
+        XCTAssertTrue(
+            CodexAppServerClient.shouldUseSparkDocumentPolicy(
+                model: "gpt-5.3-codex-spark",
+                request: document
+            )
+        )
+        XCTAssertFalse(
+            CodexAppServerClient.shouldUseSparkDocumentPolicy(
+                model: "gpt-5.6-luna",
+                request: document
+            )
+        )
+    }
+
+    func testSparkPacingAndCapacityRetryOverridesAreBounded() {
+        XCTAssertEqual(
+            CodexAppServerClient.readSparkStartIntervalNanoseconds([:]),
+            500_000_000
+        )
+        XCTAssertEqual(
+            CodexAppServerClient.readSparkStartIntervalNanoseconds([
+                "GLOSS_SPARK_START_INTERVAL_MS": "750"
+            ]),
+            750_000_000
+        )
+        XCTAssertEqual(CodexAppServerClient.readSparkCapacityRetryLimit([:]), 4)
+        XCTAssertEqual(
+            CodexAppServerClient.readSparkCapacityRetryLimit([
+                "GLOSS_SPARK_CAPACITY_RETRIES": "2"
+            ]),
+            2
+        )
+        XCTAssertEqual(
+            CodexAppServerClient.readSparkCapacityRetryLimit([
+                "GLOSS_SPARK_CAPACITY_RETRIES": "20"
+            ]),
+            4
+        )
+    }
+
+    func testSparkCapacityErrorsAreRecognizedWithoutMatchingUnrelatedFailures() {
+        XCTAssertTrue(
+            CodexAppServerClient.isCapacityError(
+                TranslationError.backendUnavailable("Selected model is at capacity")
+            )
+        )
+        XCTAssertTrue(
+            CodexAppServerClient.isCapacityError(
+                TranslationError.backendUnavailable("HTTP 429 Too Many Requests")
+            )
+        )
+        XCTAssertFalse(
+            CodexAppServerClient.isCapacityError(
+                TranslationError.invalidResponse("Missing translation item")
+            )
+        )
     }
 
     func testThreadRotationDefaultsToTenSuccessfulTurnsAndCanBeDisabled() {
